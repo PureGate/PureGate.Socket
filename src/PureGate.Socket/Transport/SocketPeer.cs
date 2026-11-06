@@ -61,6 +61,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
     Options = options.Normalize();
     Handler = handler ?? EmptySocketPeerHandler.Shared;
     Reader = reader ?? throw new ArgumentNullException(nameof(reader));
+    Reader.MaxFrameSizeBytes = Options.MaxFrameSizeBytes;
     Writer = new SocketFrameWriter(
         stream,
         Options.MaxFrameSizeBytes,
@@ -101,9 +102,10 @@ public sealed partial class SocketPeer : IAsyncDisposable
 
   internal static SocketFrameReader CreateReader(Stream stream, SocketFabricOptions options)
   {
+    // Created for the handshake, so it starts with the pre-authentication frame limit.
     return new SocketFrameReader(
         stream,
-        options.MaxFrameSizeBytes,
+        options.MaxHandshakeFrameBytes,
         options.PayloadCompression,
         options.MaxDecompressedPayloadSizeBytes);
   }

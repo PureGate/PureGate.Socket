@@ -1,0 +1,42 @@
+name: soak
+
+# Run manually from the Actions tab (Soak > Run workflow).
+on:
+  workflow_dispatch:
+    inputs:
+      soak-seconds:
+        description: Soak duration in seconds (at most 4200; the job stops after 90 minutes)
+        default: "3600"
+      os:
+        description: Runner operating system
+        type: choice
+        options: [ubuntu, windows, both]
+        default: ubuntu
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os == 'both' && '["ubuntu-latest", "windows-latest"]' || format('["{0}-latest"]', inputs.os)) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build PureGate.Socket.slnx -c Release
+
+      # Mixed chaotic traffic for the requested time, then checks that connection state and pooled buffers drain.
+      - name: Soak
+        env:
+          PUREGATE_SOAK_SECONDS: ${{ inputs.soak-seconds }}
+        run: >
+          dotnet test src/PureGate.Socket.Test -c Release --no-build
+          --filter Category=Soak
+          --blame-hang-timeout 75m
+          --logger "console;verbosity=detailed"

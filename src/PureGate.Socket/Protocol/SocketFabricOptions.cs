@@ -34,6 +34,14 @@ public sealed class SocketFabricOptions
   public TimeSpan ChunkTimeout { get; init; } = TimeSpan.FromSeconds(30);
   public TimeSpan HandshakeTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
+  // Limits on what a peer can cost before it has authenticated. Frames are capped at
+  // MaxHandshakeFrameBytes until the handshake succeeds. A listener closes new connections while
+  // MaxPendingHandshakes are still handshaking, or while MaxConnections (established plus handshaking)
+  // are open.
+  public int MaxHandshakeFrameBytes { get; init; } = 16 * 1024;
+  public int MaxPendingHandshakes { get; init; } = 256;
+  public int MaxConnections { get; init; } = int.MaxValue;
+
   // Longest gap allowed between two stream chunks once a stream has started. The open timeout only
   // covers the time until the stream starts.
   public TimeSpan StreamIdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
@@ -94,6 +102,9 @@ public sealed class SocketFabricOptions
       IdempotencyTtl = IdempotencyTtl <= TimeSpan.Zero ? TimeSpan.FromMinutes(10) : IdempotencyTtl,
       ChunkTimeout = ChunkTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : ChunkTimeout,
       HandshakeTimeout = HandshakeTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(5) : HandshakeTimeout,
+      MaxHandshakeFrameBytes = Math.Clamp(MaxHandshakeFrameBytes, 1024, Math.Clamp(MaxFrameSizeBytes, 1024, 128 * 1024 * 1024)),
+      MaxPendingHandshakes = Math.Max(1, MaxPendingHandshakes),
+      MaxConnections = Math.Max(1, MaxConnections),
       StreamIdleTimeout = StreamIdleTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : StreamIdleTimeout,
       LivenessProbeTimeout = LivenessProbeTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(5) : LivenessProbeTimeout,
       IncludeExceptionDetails = IncludeExceptionDetails,

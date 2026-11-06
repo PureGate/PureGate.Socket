@@ -1,11 +1,5 @@
 # PureGate.Socket plan: correctness first, then speed
 
-**Assumptions.** No peers are deployed yet, so the plan breaks the wire format and the API wherever that helps. The library itself stays dependency-free; tests and benchmarks may use dev-only tools.
-
-**On "bug free":** no plan can promise that. What it can do is make each known bug impossible by design where possible, and catch the rest with fuzzing, chaos and soak tests.
-
-The order is deliberate. The biggest speed gains come from reworking the connection's core, and that same rework structurally fixes the worst remaining bugs. Every change is judged against the benchmark baseline.
-
 Phases 0 (safety net) and 1 (local bug fixes) are done, and so are flow control, ordered events and the liveness check from Phase 2.
 
 ---
@@ -43,18 +37,10 @@ The wire format is specified in [PROTOCOL.md](PROTOCOL.md). Still to do:
 
 ## Phase 5 — Hardening
 
-- **Fuzzing:** run SharpFuzz on the frame decoder, batch codecs, chunk reassembly and handshake. Add randomized round-trip tests inside NUnit.
-- **Chaos tests** through an in-process proxy: 1-byte fragments, added latency, slow readers, connections reset mid-frame, reconnect storms, duplicate connections.
-- **Nightly one-hour soak test** with leak checks: pending requests, rented pool buffers, credits and queue depths must all return to zero.
+- **Coverage-guided fuzzing:** run SharpFuzz on the frame decoder, batch codecs, chunk reassembly and handshake, and add the crashes it finds to the seeded NUnit fuzz tests.
+- **More chaos scenarios:** duplicate connections from one node ID, and peers that read very slowly at the socket level.
 - **Systematic concurrency testing** with Microsoft Coyote on the request and stream lifecycles (optional).
-- **Resource limits:**
-  - A per-connection memory budget.
-  - A cap on the listener's connections and pending handshakes.
-  - A small frame-size limit before authentication, around 16 KB.
-- **Security:**
-  - With mTLS, require the node ID to match the certificate, so a node can't claim another's identity.
-  - Scope the idempotency cache by the authenticated identity.
-  - Support per-node secrets.
+- **A per-connection memory budget** covering chunk reassembly, queued handlers and stream buffers together.
 - **Metrics** through the built-in `System.Diagnostics.Metrics`.
 - **Gates:** at least 85% line coverage and every decoder branch covered. Add a public-API analyzer and turn on nullable annotations (deferred until Phases 2–4 have reshaped the public API).
 

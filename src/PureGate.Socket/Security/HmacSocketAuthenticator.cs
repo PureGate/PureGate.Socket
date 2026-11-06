@@ -1,21 +1,46 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 using PureGate.Socket.Protocol;
 
 namespace PureGate.Socket.Security;
 
-public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthenticator
+// Mutual challenge-response authentication with HMAC-SHA256.
+//
+// With one shared secret, every node that knows it can claim any node ID. With per-node secrets
+// (a lookup from the remote node ID to the secret this node shares with it), a node can only
+// authenticate as an ID whose secret it holds: C, holding only the C-B secret, cannot pose as A to B.
+// The lookup must be symmetric: A's lookup("B") and B's lookup("A") return the same bytes.
+public sealed class HmacSocketAuthenticator : ISocketAuthenticator
 {
-  readonly byte[] Secret = Encoding.UTF8.GetBytes(sharedSecret ?? string.Empty);
+  readonly Func<string, byte[]> SecretFor;
+  readonly bool HasSecret;
+
+  // Secret used to sign for unknown nodes, so an unknown ID fails exactly like a wrong signature and
+  // the handshake does not reveal which node IDs exist.
+  readonly byte[] DecoySecret = RandomNumberGenerator.GetBytes(32);
+
+  public HmacSocketAuthenticator(string sharedSecret)
+  {
+    var secret = Encoding.UTF8.GetBytes(sharedSecret ?? string.Empty);
+    HasSecret = secret.Length > 0;
+    SecretFor = _ => secret;
+  }
+
+  // secretForRemoteNode returns the secret shared with the given remote node, or null when that node
+  // is unknown (the handshake then fails).
+  public HmacSocketAuthenticator(Func<string, byte[]> secretForRemoteNode)
+  {
+    SecretFor = secretForRemoteNode ?? throw new ArgumentNullException(nameof(secretForRemoteNode));
+    HasSecret = true;
+  }
 
   public ValueTask<SocketHandshakeHello> CreateHelloAsync(
       string localNodeId,
       int protocolVersion,
       CancellationToken cancellationToken)
   {
-    if (Secret.Length == 0)
-      throw new InvalidOperationException("Shared secret is required.");
-
+    EnsureSecret();
     var nonce = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
     return ValueTask.FromResult(new SocketHandshakeHello(
         protocolVersion,
@@ -31,11 +56,12 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
     EnsureSecret();
     ValidateHello(remoteHello);
     var nonce = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+    var secret = Lookup(remoteHello.NodeId) ?? DecoySecret;
     return ValueTask.FromResult(new SocketHandshakeChallenge(
         remoteHello.Version,
         localNodeId ?? string.Empty,
         nonce,
-        SignChallenge(remoteHello.Version, localNodeId, remoteHello.NodeId, remoteHello.Nonce, nonce)));
+        Sign(secret, "challenge", remoteHello.Version, localNodeId, remoteHello.NodeId, remoteHello.Nonce, nonce)));
   }
 
   public ValueTask<SocketAuthenticationResult> AuthenticateChallengeAsync(
@@ -43,7 +69,7 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
       SocketHandshakeChallenge remoteChallenge,
       CancellationToken cancellationToken)
   {
-    if (Secret.Length == 0)
+    if (!HasSecret)
       return ValueTask.FromResult(SocketAuthenticationResult.Failed("Shared secret is required."));
 
     if (!TryValidateHello(localHello, out var helloError))
@@ -51,7 +77,13 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
     if (!TryValidateChallenge(remoteChallenge, out var challengeError))
       return ValueTask.FromResult(SocketAuthenticationResult.Failed(challengeError));
 
-    var expected = SignChallenge(
+    var secret = Lookup(remoteChallenge.NodeId);
+    if (secret is null)
+      return ValueTask.FromResult(SocketAuthenticationResult.Failed("Remote node is not known."));
+
+    var expected = Sign(
+        secret,
+        "challenge",
         localHello.Version,
         remoteChallenge.NodeId,
         localHello.NodeId,
@@ -72,10 +104,14 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
     EnsureSecret();
     ValidateHello(localHello);
     ValidateChallenge(remoteChallenge);
+    var secret = Lookup(remoteChallenge.NodeId)
+        ?? throw new InvalidOperationException("Remote node is not known.");
     return ValueTask.FromResult(new SocketHandshakeProof(
         localHello.Version,
         localNodeId ?? string.Empty,
-        SignProof(
+        Sign(
+            secret,
+            "proof",
             localHello.Version,
             localNodeId,
             remoteChallenge.NodeId,
@@ -89,7 +125,7 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
       SocketHandshakeProof remoteProof,
       CancellationToken cancellationToken)
   {
-    if (Secret.Length == 0)
+    if (!HasSecret)
       return ValueTask.FromResult(SocketAuthenticationResult.Failed("Shared secret is required."));
 
     if (!TryValidateHello(remoteHello, out var helloError))
@@ -105,21 +141,30 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
       return ValueTask.FromResult(SocketAuthenticationResult.Failed("Invalid proof."));
     }
 
-    var expected = SignProof(
+    var secret = Lookup(remoteHello.NodeId) ?? DecoySecret;
+    var expected = Sign(
+        secret,
+        "proof",
         remoteHello.Version,
         remoteHello.NodeId,
         localChallenge.NodeId,
         remoteHello.Nonce,
         localChallenge.Nonce);
-    var ok = SignatureEquals(expected, remoteProof.Signature);
+    var ok = !ReferenceEquals(secret, DecoySecret) && SignatureEquals(expected, remoteProof.Signature);
     return ValueTask.FromResult(ok
         ? SocketAuthenticationResult.Success(remoteProof.NodeId)
         : SocketAuthenticationResult.Failed("Invalid proof signature."));
   }
 
+  byte[] Lookup(string remoteNodeId)
+  {
+    var secret = SecretFor(remoteNodeId);
+    return secret is { Length: > 0 } ? secret : null;
+  }
+
   void EnsureSecret()
   {
-    if (Secret.Length == 0)
+    if (!HasSecret)
       throw new InvalidOperationException("Shared secret is required.");
   }
 
@@ -166,27 +211,10 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
     return true;
   }
 
-  string SignChallenge(
-      int version,
-      string serverNodeId,
-      string clientNodeId,
-      string clientNonce,
-      string serverNonce)
-  {
-    return Sign("challenge", version, serverNodeId, clientNodeId, clientNonce, serverNonce);
-  }
-
-  string SignProof(
-      int version,
-      string clientNodeId,
-      string serverNodeId,
-      string clientNonce,
-      string serverNonce)
-  {
-    return Sign("proof", version, clientNodeId, serverNodeId, clientNonce, serverNonce);
-  }
-
-  string Sign(
+  // Signs a domain tag plus each field length-prefixed, so no choice of node IDs or nonces can make two
+  // different handshakes produce the same signed bytes.
+  static string Sign(
+      byte[] secret,
       string kind,
       int version,
       string signerNodeId,
@@ -194,21 +222,24 @@ public sealed class HmacSocketAuthenticator(string sharedSecret) : ISocketAuthen
       string clientNonce,
       string serverNonce)
   {
-    var data = Encoding.UTF8.GetBytes(string.Concat(
-        "PureGate.Socket.v1\n",
-        kind ?? string.Empty,
-        "\n",
-        version.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        "\n",
-        signerNodeId ?? string.Empty,
-        "\n",
-        peerNodeId ?? string.Empty,
-        "\n",
-        clientNonce ?? string.Empty,
-        "\n",
-        serverNonce ?? string.Empty));
-    using var hmac = new HMACSHA256(Secret);
-    return Convert.ToBase64String(hmac.ComputeHash(data));
+    using var data = new MemoryStream();
+    Append(data, "PureGate.Socket.v1");
+    Append(data, kind);
+    Append(data, version.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    Append(data, signerNodeId);
+    Append(data, peerNodeId);
+    Append(data, clientNonce);
+    Append(data, serverNonce);
+    return Convert.ToBase64String(HMACSHA256.HashData(secret, data.GetBuffer().AsSpan(0, (int)data.Length)));
+  }
+
+  static void Append(MemoryStream data, string value)
+  {
+    var bytes = Encoding.UTF8.GetBytes(value ?? string.Empty);
+    Span<byte> length = stackalloc byte[4];
+    BinaryPrimitives.WriteInt32BigEndian(length, bytes.Length);
+    data.Write(length);
+    data.Write(bytes);
   }
 
   static bool SignatureEquals(string expected, string actual)

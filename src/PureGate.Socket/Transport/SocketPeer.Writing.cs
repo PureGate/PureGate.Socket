@@ -63,7 +63,15 @@ public sealed partial class SocketPeer
     var write = WriteLockedFrameAsync(frame, payloadOverride, lease);
     if (write.IsCompleted || !abandonable)
     {
-      await write;
+      try
+      {
+        await write;
+      }
+      catch (Exception ex) when (IsTransportFailure(ex))
+      {
+        throw ConnectionLost(ex);
+      }
+
       return;
     }
 
@@ -71,6 +79,10 @@ public sealed partial class SocketPeer
     try
     {
       await pending.WaitAsync(cancellationToken);
+    }
+    catch (Exception ex) when (IsTransportFailure(ex))
+    {
+      throw ConnectionLost(ex);
     }
     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
@@ -91,6 +103,21 @@ public sealed partial class SocketPeer
     var text = (long)(frame.Service?.Length ?? 0) + (frame.Operation?.Length ?? 0) + (frame.IdempotencyKey?.Length ?? 0)
         + (frame.ErrorCode?.Length ?? 0) + (frame.ErrorMessage?.Length ?? 0);
     return frame.PayloadLength + 3 * text + 64 > Options.MaxChunkPayloadBytes;
+  }
+
+  // The socket failed under a writer (reset, disposed by a concurrent close, or another I/O error). The
+  // connection is unusable: close it and report the same connection_closed error every other path uses,
+  // so callers never see raw transport exception types.
+  static bool IsTransportFailure(Exception exception)
+  {
+    return exception is IOException or ObjectDisposedException or System.Net.Sockets.SocketException;
+  }
+
+  SocketProtocolException ConnectionLost(Exception exception)
+  {
+    // CloseAsync cancels Lifetime before its first await, so the connection is marked closed on return.
+    _ = CloseAsync(exception).AsTask();
+    return new SocketProtocolException(SocketProtocolError.ConnectionClosed, "Connection closed.");
   }
 
   // Runs with WriteLock held; FinishWriteAsync releases it.

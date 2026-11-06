@@ -102,7 +102,9 @@ All handshake frames are Events with service `socket`, sent with literal names. 
 3. Client → server: `proof`, value = the client's message window, payload `{ version, nodeId, signature }`.
 4. Server → client: `ready`, Ok set, value = the server's message window.
 
-A failure at any step is answered with `ready` without Ok and with an error, then the connection closes. The signatures are produced by the configured authenticator (for example HMAC-SHA256 over both nonces and node ids). The version in `hello` and `challenge` must match the receiver's.
+A failure at any step is answered with `ready` without Ok and with an error, then the connection closes. The version in `hello` and `challenge` must match the receiver's. Until `ready`, frames are limited to `MaxHandshakeFrameBytes` (16 KB by default) in both directions; after it, to `MaxFrameSizeBytes`.
+
+The signatures are produced by the configured authenticator. `HmacSocketAuthenticator` signs, with HMAC-SHA256 and the secret the two nodes share, the concatenation of these fields, each as a 4-byte big-endian length followed by its UTF-8 bytes: `PureGate.Socket.v1`, `challenge` or `proof`, the version in decimal, the signer's node id, the other node's node id, the client nonce, the server nonce. Signatures are base64.
 
 ## Chunking
 

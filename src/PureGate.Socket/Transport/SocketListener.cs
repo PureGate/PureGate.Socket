@@ -16,6 +16,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
   TcpListener Listener;
   CancellationTokenSource Lifetime;
   Task AcceptTask;
+  int PendingHandshakes;
 
   public IPEndPoint EndPoint => (IPEndPoint)Listener?.LocalEndpoint;
 
@@ -49,6 +50,12 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
       {
         client = await Listener.AcceptTcpClientAsync(Lifetime.Token);
         client.NoDelay = true;
+        if (!TryAdmit(client))
+        {
+          client = null;
+          continue;
+        }
+
         var peerTask = Task.Run(() => AcceptPeerAsync(client, handler));
         lock (Sync)
           PeerTasks.Add(peerTask);
@@ -74,9 +81,36 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     }
   }
 
+  // Closes a new connection at once when the listener is at its limits, so unauthenticated peers
+  // cannot hold an unbounded number of handshakes (or connections) open.
+  bool TryAdmit(TcpClient client)
+  {
+    int established;
+    lock (Sync)
+      established = Peers.Count;
+
+    var pending = Volatile.Read(ref PendingHandshakes);
+    string reason = null;
+    if (pending >= Options.MaxPendingHandshakes)
+      reason = "Too many handshakes are in progress.";
+    else if ((long)established + pending >= Options.MaxConnections)
+      reason = "The listener is at its connection limit.";
+
+    if (reason is null)
+    {
+      Interlocked.Increment(ref PendingHandshakes);
+      return true;
+    }
+
+    ObservePeerAcceptFailed(client, new SocketProtocolException(SocketProtocolError.Overloaded, reason));
+    client.Dispose();
+    return false;
+  }
+
   async Task AcceptPeerAsync(TcpClient client, ISocketPeerHandler handler)
   {
     Stream stream = null;
+    var admitted = true;
     try
     {
       using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token);
@@ -90,6 +124,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
       var peer = new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, remoteWindow, Options, handler);
       lock (Sync)
         Peers.Add(peer);
+      Interlocked.Decrement(ref PendingHandshakes);
+      admitted = false;
       _ = Task.Run(async () =>
       {
         await peer.Completion;
@@ -102,6 +138,11 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
       ObservePeerAcceptFailed(client, ex);
       stream?.Dispose();
       client.Dispose();
+    }
+    finally
+    {
+      if (admitted)
+        Interlocked.Decrement(ref PendingHandshakes);
     }
   }
 
@@ -140,7 +181,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
   {
     var writer = new SocketFrameWriter(
         stream,
-        Options.MaxFrameSizeBytes);
+        Options.MaxHandshakeFrameBytes);
     var frame = await reader.ReadAsync(cancellationToken);
     if (frame is null)
       throw new SocketProtocolException(SocketProtocolError.ConnectionClosed, "Connection closed during handshake.");
@@ -189,6 +230,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
           cancellationToken);
       if (!auth.Succeeded)
         throw new SocketProtocolException(SocketProtocolError.Unauthorized, auth.Error);
+      await Options.StreamFilter.VerifyRemoteNodeAsync(stream, auth.RemoteNodeId, cancellationToken);
 
       await writer.WriteAsync(new SocketFrame
       {

@@ -162,6 +162,15 @@ public sealed partial class SocketPeer
         ErrorMessage = "Connection closed."
       };
     }
+    catch (SocketProtocolException ex) when (ex.ErrorCode == SocketProtocolError.ConnectionClosed)
+    {
+      return new SocketRequestResult
+      {
+        Succeeded = false,
+        ErrorCode = SocketProtocolError.ConnectionClosed,
+        ErrorMessage = "Connection closed."
+      };
+    }
     finally
     {
       timeoutRegistration.Dispose();

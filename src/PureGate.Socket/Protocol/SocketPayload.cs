@@ -91,8 +91,14 @@ internal readonly struct SocketPayload : IDisposable
     Owner?.Release();
   }
 
+  // Pooled buffers rented and not yet returned, across the process.
+  internal static long OutstandingPooledBuffers => Interlocked.Read(ref SocketPayloadOwner.Outstanding);
+
   sealed class SocketPayloadOwner
   {
+    // Buffers rented and not yet returned, across the process. Read by the soak tests to catch leaks.
+    internal static long Outstanding;
+
     int ReferenceCount = 1;
 
     SocketPayloadOwner(byte[] buffer)
@@ -104,6 +110,7 @@ internal readonly struct SocketPayload : IDisposable
 
     public static SocketPayloadOwner Rent(int length)
     {
+      Interlocked.Increment(ref Outstanding);
       return new SocketPayloadOwner(ArrayPool<byte>.Shared.Rent(length));
     }
 
@@ -123,7 +130,10 @@ internal readonly struct SocketPayload : IDisposable
     public void Release()
     {
       if (Interlocked.Decrement(ref ReferenceCount) == 0)
+      {
         ArrayPool<byte>.Shared.Return(Buffer);
+        Interlocked.Decrement(ref Outstanding);
+      }
     }
   }
 }

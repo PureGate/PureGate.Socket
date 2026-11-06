@@ -15,7 +15,7 @@ Targets **.NET 10**.
 - **Idempotency**: a built-in cache so retried requests are not executed twice.
 - **Compact wire protocol**: a request costs a few header bytes after its method's first use; see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Chunking and compression**: large payloads are split into frames and can be compressed.
-- **Security**: pluggable authentication and authorization (`ISocketAuthenticator`, `ISocketAuthorizer`), with an HMAC authenticator included. TLS is available through `TlsSocketStreamFilter`.
+- **Security**: pluggable authentication and authorization (`ISocketAuthenticator`, `ISocketAuthorizer`), with an HMAC authenticator that supports per-node secrets. TLS and mTLS are available through `TlsSocketStreamFilter`, which can bind node IDs to certificates. Handshake frame size, pending handshakes and connection counts are limited before a peer authenticates.
 - **Serialization**: JSON codec by default, raw codec for byte payloads, or implement `ISocketMessageCodec`.
 - **Observability**: hook in with `ISocketObserver`; combine several with `CompositeSocketObserver`.
 - **Client fabric**: `SocketClient` with a peer registry and peer selection policies.
@@ -59,6 +59,14 @@ See [SocketFabricTests.cs](src/PureGate.Socket.Test/SocketFabricTests.cs) for wo
 dotnet build PureGate.Socket.slnx
 dotnet test src/PureGate.Socket.Test
 ```
+
+The suite includes seeded fuzz tests and chaos tests through a proxy that fragments, delays and resets connections. A soak test, excluded by default, runs mixed chaotic traffic and then checks that connection state and pooled buffers drain. It runs for `PUREGATE_SOAK_SECONDS` (20 by default):
+
+```
+dotnet test src/PureGate.Socket.Test -c Release --filter Category=Soak
+```
+
+On GitHub, run the `soak` workflow from the Actions tab. It soaks for an hour by default, on Ubuntu, Windows or both.
 
 ## License
 

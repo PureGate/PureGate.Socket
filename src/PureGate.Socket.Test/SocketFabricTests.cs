@@ -1670,6 +1670,7 @@ public sealed partial class SocketFabricTests
   sealed class DelegateSocketObserver : ISocketObserver
   {
     public Action<SocketPeer> OnPeerConnected { get; init; }
+    public Action<SocketPeer, Exception> OnPeerDisconnected { get; init; }
     public Action<IPEndPoint, Exception> OnPeerAcceptFailed { get; init; }
     public Action<IPEndPoint, Exception> OnListenerAcceptFailed { get; init; }
     public Action<EndPoint> OnClientConnectStarted { get; init; }
@@ -1681,6 +1682,11 @@ public sealed partial class SocketFabricTests
     public void PeerConnected(SocketPeer peer)
     {
       OnPeerConnected?.Invoke(peer);
+    }
+
+    public void PeerDisconnected(SocketPeer peer, Exception exception)
+    {
+      OnPeerDisconnected?.Invoke(peer, exception);
     }
 
     public void PeerAcceptFailed(IPEndPoint remoteEndPoint, Exception exception)

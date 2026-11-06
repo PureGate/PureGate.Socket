@@ -93,7 +93,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
   {
     var writer = new SocketFrameWriter(
         stream,
-        Options.MaxFrameSizeBytes);
+        Options.MaxHandshakeFrameBytes);
     var hello = await Options.Authenticator.CreateHelloAsync(
         Options.NodeId,
         SocketFabricOptions.CurrentProtocolVersion,
@@ -126,6 +126,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     var challengeAuth = await Options.Authenticator.AuthenticateChallengeAsync(hello, challenge, cancellationToken);
     if (!challengeAuth.Succeeded)
       throw new SocketProtocolException(SocketProtocolError.Unauthorized, challengeAuth.Error);
+    await Options.StreamFilter.VerifyRemoteNodeAsync(stream, challengeAuth.RemoteNodeId, cancellationToken);
 
     var proof = await Options.Authenticator.CreateProofAsync(
         Options.NodeId,

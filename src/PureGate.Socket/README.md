@@ -65,6 +65,18 @@ The default authenticator is `NoSocketAuthenticator` for local development and t
 
 Production callers should provide an authenticator such as `HmacSocketAuthenticator`, which uses challenge-response transcript signing. Callers can wrap the transport with TLS/mTLS by providing an `ISocketStreamFilter` without changing higher-level protocol services. `TlsSocketStreamFilter` is included for standard `SslStream`-based TLS/mTLS.
 
+Identity:
+
+- **Per-node secrets.** `new HmacSocketAuthenticator(string)` uses one secret for the whole cluster, so any node that holds it can claim any node ID. `new HmacSocketAuthenticator(Func<string, byte[]>)` looks up the secret shared with each remote node (return `null` for unknown nodes). A node can then only authenticate as an ID whose secret it holds. The lookup must be symmetric: A's lookup of `B` and B's lookup of `A` return the same bytes. An unknown node fails exactly like a wrong secret, so the handshake does not reveal which node IDs exist.
+- **Certificate binding.** With `TlsSocketStreamFilter.Create(..., bindNodeIdToCertificate: true)` (or a custom `RemoteNodeValidation`), a connection is accepted only if the remote certificate names the node ID the handshake authenticated, as a DNS subject alternative name. On a listener this needs `requireClientCertificate: true`. Both sides check: a client also refuses a server whose certificate does not name the server's node ID. Other stream filters can check identity by implementing `ISocketStreamFilter.VerifyRemoteNodeAsync`.
+- **Idempotency** keys are scoped by the authenticated remote node ID, so one node's key never returns another node's cached response.
+
+Limits before authentication:
+
+- Handshake frames are limited to `MaxHandshakeFrameBytes` (16 KB by default). The full `MaxFrameSizeBytes` applies only after the handshake succeeds.
+- A listener closes new connections at once while `MaxPendingHandshakes` (256 by default) are still handshaking, or while established plus handshaking connections reach `MaxConnections` (unlimited by default). Each rejection is reported to `ISocketObserver.PeerAcceptFailed` with `overloaded`.
+- A handshake that does not finish within `HandshakeTimeout` is closed.
+
 `ISocketAuthorizer` can reject individual requests, stream requests, or events after the peer is authenticated. Denied requests and stream requests receive an `unauthorized` response; denied events close the peer because events are fire-and-forget.
 
 ## Services

@@ -21,6 +21,10 @@ sealed class SocketFrameReader(
   readonly PipeReader Reader = PipeReader.Create(stream);
   readonly List<(string Service, string Operation)> Methods = [];
 
+  // Starts at the handshake limit; SocketPeer raises it to MaxFrameSizeBytes once the peer has
+  // authenticated.
+  internal int MaxFrameSizeBytes { get; set; } = maxFrameSizeBytes;
+
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketFrame> ReadAsync(CancellationToken cancellationToken)
   {
@@ -71,7 +75,7 @@ sealed class SocketFrameReader(
     if (!reader.TryReadBigEndian(out int length))
       return false;
 
-    if (length < 2 || length > maxFrameSizeBytes)
+    if (length < 2 || length > MaxFrameSizeBytes)
       throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Frame size is invalid.");
 
     if (reader.Remaining < length)
@@ -114,7 +118,7 @@ sealed class SocketFrameReader(
     if ((flags & SocketWire.HasIdempotencyKey) != 0)
       frame.IdempotencyKey = ReadString(ref reader);
     if ((flags & SocketWire.HasValue) != 0)
-      frame.Value = checked((int)SocketWire.UnZigZag(ReadVarint(ref reader)));
+      frame.Value = ReadValue(ref reader);
     if ((flags & SocketWire.HasError) != 0)
     {
       var index = ReadVarint(ref reader);
@@ -247,6 +251,11 @@ sealed class SocketFrameReader(
         output.Write(buffer, 0, read);
       }
     }
+    catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or IOException)
+    {
+      // Corrupt compressed data is the peer's fault, so it is a protocol violation like any other.
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Compressed payload is corrupt.");
+    }
     finally
     {
       ArrayPool<byte>.Shared.Return(buffer);
@@ -274,6 +283,14 @@ sealed class SocketFrameReader(
     }
 
     throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains an invalid varint.");
+  }
+
+  static int ReadValue(ref SequenceReader<byte> reader)
+  {
+    var value = SocketWire.UnZigZag(ReadVarint(ref reader));
+    if (value is < int.MinValue or > int.MaxValue)
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame value is out of range.");
+    return (int)value;
   }
 
   static int ReadInt32(ref SequenceReader<byte> reader)
