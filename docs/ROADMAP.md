@@ -36,9 +36,9 @@ The wire format is specified in [PROTOCOL.md](PROTOCOL.md). Still to do:
 - **Systematic concurrency testing** with Microsoft Coyote on the request and stream lifecycles (optional).
 - **Branch coverage:** cover every decoder branch (branch coverage is 69% today, against 86% of lines), then gate branch coverage in CI as line coverage is.
 
-## Phase 6 — Release
+## Phase 6 — Performance report
 
-Publish a versioned NuGet package and a performance report comparing the new numbers with the baseline. Move the entries of `PublicAPI.Unshipped.txt` into `PublicAPI.Shipped.txt`, so later changes to the released API are reviewed as such.
+A performance report comparing the numbers with the Phase 0 baseline and the raw-socket ceiling, from the repeated-run medians of Phase 2.
 
 ---
 

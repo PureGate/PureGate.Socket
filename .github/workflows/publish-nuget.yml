@@ -1,0 +1,77 @@
+name: Publish Nuget Package
+
+# Manual: Actions > Publish Nuget Package > Run workflow. Publishes the version in VersionPrefix of
+# src/PureGate.Socket/PureGate.Socket.csproj, then tags the commit and creates a GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'When you press run workflow, the nuget package will be published.'
+        default: 'I understand.'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          version=$(dotnet msbuild src/PureGate.Socket/PureGate.Socket.csproj -getProperty:Version)
+          echo "Publishing PureGate.Socket $version"
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
+            echo "::error::v$version is already released. Raise VersionPrefix in src/PureGate.Socket/PureGate.Socket.csproj."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Everything public must be declared as shipped before it is released, so the next release can
+      # tell new API from released API.
+      - name: Public API is shipped
+        shell: bash
+        run: |
+          if grep -qv '^\s*$' src/PureGate.Socket/PublicAPI/PublicAPI.Unshipped.txt; then
+            echo "::error::Move the lines of PublicAPI.Unshipped.txt into PublicAPI.Shipped.txt before publishing."
+            exit 1
+          fi
+
+      - name: Build
+        run: dotnet build PureGate.Socket.slnx -c Release
+
+      - name: Test
+        run: dotnet test src/PureGate.Socket.Test -c Release --no-build --blame-hang-timeout 2m
+
+      - name: Pack
+        run: dotnet pack src/PureGate.Socket -c Release --no-build -o artifacts/packages
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: artifacts/packages/
+
+      # The symbols package (.snupkg) next to it is pushed along with it.
+      - name: Publish the package to nuget.org
+        run: dotnet nuget push "artifacts/packages/*.nupkg" -k "$NUGET_AUTH_TOKEN" -s https://api.nuget.org/v3/index.json --skip-duplicate
+        env:
+          NUGET_AUTH_TOKEN: ${{ secrets.NUGET_TOKEN }}
+
+      - name: Tag and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "v${{ steps.version.outputs.version }}" artifacts/packages/*
+          --target "$GITHUB_SHA"
+          --title "PureGate.Socket ${{ steps.version.outputs.version }}"
+          --generate-notes
+          ${{ contains(steps.version.outputs.version, '-') && '--prerelease' || '' }}

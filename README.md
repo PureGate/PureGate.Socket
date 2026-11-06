@@ -39,6 +39,12 @@ src/
   PureGate.Socket.Benchmarks/  Benchmarks
 ```
 
+## Install
+
+```
+dotnet add package PureGate.Socket
+```
+
 ## Quick start
 
 Implement `ISocketPeerHandler` to serve requests. Only `HandleRequestAsync` is required, and the other members have default implementations.
@@ -64,6 +70,8 @@ dotnet test src/PureGate.Socket.Test
 
 The library builds with warnings as errors. Its public API is recorded in [PublicAPI.Unshipped.txt](src/PureGate.Socket/PublicAPI/PublicAPI.Unshipped.txt) (moved to `PublicAPI.Shipped.txt` at each release): a change to the public surface fails the build until that file is updated, so every API change shows up in review. CI also fails when line coverage of the library drops below 85%.
 
+Releases are published with the manual **Publish Nuget Package** workflow; see [docs/RELEASING.md](docs/RELEASING.md).
+
 The suite includes seeded fuzz tests and chaos tests through a proxy that fragments, delays and resets connections. A soak test, excluded by default, runs mixed chaotic traffic and then checks that connection state and pooled buffers drain. It runs for `PUREGATE_SOAK_SECONDS` (20 by default):
 
 ```
@@ -74,4 +82,4 @@ On GitHub, run the `soak` workflow from the Actions tab. It soaks for an hour by
 
 ## License
 
-PureGate.Socket is licensed under the **[MIT License](https://github.com/PureGate.Socket/PureGate.Socket?tab=MIT-1-ov-file#readme)**.
+PureGate.Socket is licensed under the **[MIT License](https://github.com/PureGate/PureGate.Socket/blob/main/LICENSE)**.
