@@ -4,7 +4,7 @@ Releases are published by hand with the **Publish Nuget Package** workflow ([.gi
 
 ## One-time setup
 
-Add a repository secret named `NUGET_TOKEN`: a nuget.org API key with push rights for `PureGate.*`.
+Publishing uses nuget.org [trusted publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing), so no API key is stored.
 
 ## Each release
 

@@ -11,6 +11,8 @@ on:
 
 permissions:
   contents: write
+  # Trusted publishing: nuget.org trusts this workflow's GitHub OIDC token, so no API key is stored.
+  id-token: write
 
 jobs:
   publish:
@@ -60,11 +62,17 @@ jobs:
           name: packages
           path: artifacts/packages/
 
+      # Exchanges the OIDC token for a temporary API key (valid for an hour), per the trusted publishing
+      # policy on nuget.org. user is the nuget.org profile name of the policy's owner.
+      - name: NuGet login
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: koculu
+
       # The symbols package (.snupkg) next to it is pushed along with it.
       - name: Publish the package to nuget.org
-        run: dotnet nuget push "artifacts/packages/*.nupkg" -k "$NUGET_AUTH_TOKEN" -s https://api.nuget.org/v3/index.json --skip-duplicate
-        env:
-          NUGET_AUTH_TOKEN: ${{ secrets.NUGET_TOKEN }}
+        run: dotnet nuget push "artifacts/packages/*.nupkg" -k "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Tag and GitHub release
         env:
