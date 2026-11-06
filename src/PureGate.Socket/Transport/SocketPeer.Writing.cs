@@ -1,15 +1,47 @@
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
 
 namespace PureGate.Socket.Transport;
 
+// The write path.
+//
+// Writers encode their frame, under a short lock, into an in-memory batch (SocketWriteBuffer). One flusher
+// at a time writes the whole batch to the socket in a single write, outside the lock. A writer that finds
+// a flush already running only appends its frame and returns; its bytes go out with the next batch. So
+// writers never wait for each other's socket writes, and a busy connection sends many frames per system
+// call. (The previous design held one lock across encoding and the socket write, which serialized every
+// frame behind a system call and capped throughput on a shared connection.)
+//
+// - Payloads: a frame is encoded synchronously, so its payload is never read after its write call
+//   returns. A caller may return a pooled payload as soon as the call completes.
+// - Flushing: the writer that starts a flush writes the first batch itself. If more frames arrived
+//   meanwhile, the rest is written from the thread pool, so no caller keeps writing on behalf of others.
+// - Backpressure: when the bytes encoded but not yet written reach WriteHighWaterBytes, writers wait (within
+//   their own token) until the flusher has brought them down to half of that.
+// - Large messages are sent as chunks, each encoded like any frame. Other frames may be sent between the
+//   chunks, so one large message never holds up everything else on the connection.
+// - Cancellation: a caller's token cancels waiting for room only. A frame is encoded whole or not at all,
+//   so the stream never carries a partial frame. A chunked message whose caller gives up between chunks is
+//   left incomplete; the remote discards it when it expires.
+// - Failure: a socket write that fails closes the connection, which fails every outstanding request.
 public sealed partial class SocketPeer
 {
-  // Writers that have asked for WriteLock and not yet left: the holder plus everyone queued behind it.
-  int ActiveWriters;
-  // 1 when encoded bytes may be sitting in the pipe unflushed.
-  int FlushPending;
+  // A spare batch array larger than this goes back to the pool instead of being kept for the next batch.
+  const int MaxSpareBufferBytes = 1024 * 1024;
+
+  readonly Lock WriteSync = new();
+  readonly SocketWriteBuffer Pending = new();
+  byte[] SpareBuffer;
+  bool Flushing;
+  bool WritesClosed;
+  long UnflushedBytes;
+  TaskCompletionSource RoomSignal;
+  TaskCompletionSource IdleSignal;
+  FlushWorkItem FlushWork;
+
+  long WriteHighWaterBytes => Math.Max(1024 * 1024, 2L * Options.MaxFrameSizeBytes);
 
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask WriteFrameAsync(SocketFrame frame, CancellationToken cancellationToken)
@@ -17,92 +49,375 @@ public sealed partial class SocketPeer
     await WriteFrameAsync(frame, payloadOverride: default, cancellationToken);
   }
 
-  // Flush coalescing. A writer encodes its frame while holding WriteLock and then flushes only if no other
-  // writer is queued for the lock. If one is, the bytes stay buffered and that writer sends them together
-  // with its own frame in a single flush, so a busy connection makes one system call for many frames.
-  // An idle connection flushes every frame immediately, exactly as before. If a queued writer gives up
-  // (its token fires while waiting) and it was the last one, it schedules the flush itself, so buffered
-  // bytes are never left behind.
-  //
-  // Cancellation contract. The caller's token only cancels waiting for the write lock. Once a frame has
-  // the lock, every wire frame is encoded whole and flushed with the connection's own token, so the stream
-  // is never left with a partial frame. Two reasons:
-  // - A frame cancelled half way would leave a partial frame on the wire and corrupt the stream.
-  // - The pipe writer is shared by every caller. A token handed to it can trip the next, unrelated write
-  //   (one request's timeout could otherwise fail a different caller's write).
-  //
-  // A caller whose token fires while its frame is being flushed stops waiting and the flush finishes in
-  // the background. The payload is usually the caller's own array (SocketFrame.Payload wraps it without
-  // copying), so the background write must never read it after the caller has returned:
-  // - A single frame is encoded into the pipe synchronously, before its first await, so by the time the
-  //   caller can stop waiting the payload is no longer read.
-  // - A chunked frame encodes the next slice after each flush. A PayloadLease guards those reads: the
-  //   caller revokes it before returning, and the writer checks it before encoding each chunk, then stops.
-  //   The remote discards the partial chunked message when it expires.
-  // A payloadOverride buffer is always awaited to the end; it goes back to its owner when this returns.
+  // Encodes and sends one frame. The payload is payloadOverride when non-empty, otherwise the frame's own.
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask WriteFrameAsync(
       SocketFrame frame,
       ReadOnlyMemory<byte> payloadOverride,
       CancellationToken cancellationToken)
   {
-    Interlocked.Increment(ref ActiveWriters);
-    try
+    var room = WaitForRoomAsync(cancellationToken);
+    if (!room.IsCompletedSuccessfully)
+      await room;
+
+    OversizedFrame oversized;
+    bool flush;
+    lock (WriteSync)
     {
-      await WriteLock.WaitAsync(cancellationToken);
-    }
-    catch
-    {
-      LeaveWithoutWriting();
-      throw;
+      ThrowIfWritesClosed();
+      var before = Pending.Length;
+      oversized = Writer.Encode(frame, payloadOverride);
+      if (oversized is null)
+        frame.WriteStarted = true;
+      flush = CommitLocked(before);
     }
 
-    frame.WriteStarted = true;
-    var abandonable = cancellationToken.CanBeCanceled && payloadOverride.IsEmpty;
-    var lease = abandonable && MayBeChunked(frame) ? new PayloadLease() : null;
-    var write = WriteLockedFrameAsync(frame, payloadOverride, lease);
-    if (write.IsCompleted || !abandonable)
+    if (oversized is not null)
     {
-      try
-      {
-        await write;
-      }
-      catch (Exception ex) when (IsTransportFailure(ex))
-      {
-        throw ConnectionLost(ex);
-      }
-
+      await WriteChunksAsync(frame, oversized, cancellationToken);
       return;
     }
 
-    var pending = write.AsTask();
-    try
+    ObserveFrameSent(frame, payloadOverride.IsEmpty ? frame.PayloadLength : payloadOverride.Length);
+    if (flush)
+      await FlushAsync(inline: true, cancellationToken);
+  }
+
+  // Control frames (credits, pongs, cancels, rejections) are tiny and must never make their sender wait:
+  // they skip backpressure, and a flush they start runs on the thread pool. Safe to call from the read loop.
+  void SendControl(SocketFrame frame)
+  {
+    bool flush;
+    lock (WriteSync)
     {
-      await pending.WaitAsync(cancellationToken);
+      if (WritesClosed || Lifetime.IsCancellationRequested)
+        return;
+
+      var before = Pending.Length;
+      if (Writer.Encode(frame, default) is not null)
+        return;
+      flush = CommitLocked(before);
     }
-    catch (Exception ex) when (IsTransportFailure(ex))
+
+    ObserveFrameSent(frame, frame.PayloadLength);
+    if (flush)
+      QueueBackgroundFlush();
+  }
+
+  // Sends a frame too large for one wire frame as consecutive chunks of its encoded body (the header,
+  // already encoded, followed by the payload). Chunks are equal-sized except the last.
+  async ValueTask WriteChunksAsync(SocketFrame frame, OversizedFrame oversized, CancellationToken cancellationToken)
+  {
+    var header = oversized.Header;
+    var payload = oversized.Payload;
+    var total = oversized.TotalLength;
+    var chunkSize = Options.MaxChunkPayloadBytes;
+    var chunkCount = (int)(((long)total + chunkSize - 1) / chunkSize);
+    for (var index = 0; index < chunkCount; index++)
     {
-      throw ConnectionLost(ex);
-    }
-    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-    {
-      lease?.Revoke();
-      _ = pending.ContinueWith(
-          static task => _ = task.Exception,
-          CancellationToken.None,
-          TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-          TaskScheduler.Default);
-      throw;
+      var room = WaitForRoomAsync(cancellationToken);
+      if (!room.IsCompletedSuccessfully)
+        await room;
+
+      var start = index * chunkSize;
+      var end = (int)Math.Min(total, (long)start + chunkSize);
+      bool flush;
+      lock (WriteSync)
+      {
+        ThrowIfWritesClosed();
+        var headerPart = start < header.Length
+            ? header.AsSpan(start, Math.Min(end, header.Length) - start)
+            : ReadOnlySpan<byte>.Empty;
+        var payloadStart = Math.Max(0, start - header.Length);
+        var payloadEnd = Math.Max(0, end - header.Length);
+        var before = Pending.Length;
+        Writer.EncodeChunk(
+            oversized.MessageId,
+            oversized.Kind,
+            index,
+            chunkCount,
+            total,
+            headerPart,
+            payload.Span.Slice(payloadStart, payloadEnd - payloadStart));
+        frame.WriteStarted = true;
+        flush = CommitLocked(before);
+      }
+
+      ObserveFrameSent(SocketMessageKind.Chunk, end - start);
+      if (flush)
+        await FlushAsync(inline: true, cancellationToken);
     }
   }
 
-  // Conservative: true for any frame whose encoded body could exceed one wire frame (a chunk is at most a
-  // quarter of the frame limit, and a UTF-8 character at most three bytes).
-  bool MayBeChunked(SocketFrame frame)
+  // Under WriteSync, after encoding: counts the new bytes, and returns true when the caller must start the
+  // flusher because none is running.
+  bool CommitLocked(int lengthBefore)
   {
-    var text = (long)(frame.Service?.Length ?? 0) + (frame.Operation?.Length ?? 0) + (frame.IdempotencyKey?.Length ?? 0)
-        + (frame.ErrorCode?.Length ?? 0) + (frame.ErrorMessage?.Length ?? 0);
-    return frame.PayloadLength + 3 * text + 64 > Options.MaxChunkPayloadBytes;
+    var added = Pending.Length - lengthBefore;
+    if (added <= 0)
+      return false;
+
+    UnflushedBytes += added;
+    if (Flushing)
+      return false;
+
+    Flushing = true;
+    return true;
+  }
+
+  void ThrowIfWritesClosed()
+  {
+    if (WritesClosed || Lifetime.IsCancellationRequested)
+      throw new SocketProtocolException(SocketProtocolError.ConnectionClosed, "Connection closed.");
+  }
+
+  ValueTask WaitForRoomAsync(CancellationToken cancellationToken)
+  {
+    return Interlocked.Read(ref UnflushedBytes) < WriteHighWaterBytes
+        ? ValueTask.CompletedTask
+        : WaitForRoomSlowAsync(cancellationToken);
+  }
+
+  async ValueTask WaitForRoomSlowAsync(CancellationToken cancellationToken)
+  {
+    while (true)
+    {
+      Task wait;
+      lock (WriteSync)
+      {
+        ThrowIfWritesClosed();
+        if (UnflushedBytes < WriteHighWaterBytes)
+          return;
+
+        RoomSignal ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        wait = RoomSignal.Task;
+      }
+
+      await wait.WaitAsync(cancellationToken);
+    }
+  }
+
+  // Writes batches until none is left, then stops being the flusher. inline: called by the writer that
+  // started the flush, which writes one batch and hands any further batches to the thread pool. It waits
+  // for its socket write only as long as cancellationToken allows (a remote that stops reading must not
+  // keep it waiting past its own timeout); when the token fires, the write and the flushing after it carry
+  // on in the background, and the caller gets its cancellation.
+  async ValueTask FlushAsync(bool inline, CancellationToken cancellationToken = default)
+  {
+    var written = 0;
+    while (true)
+    {
+      ArraySegment<byte> batch = default;
+      TaskCompletionSource idle = null;
+      byte[] releasedPending = null;
+      byte[] releasedSpare = null;
+      var handOff = false;
+      lock (WriteSync)
+      {
+        if (Pending.Length == 0 || WritesClosed)
+        {
+          // Nothing left to send: an idle connection keeps no write buffers. The next write rents again.
+          Flushing = false;
+          idle = IdleSignal;
+          IdleSignal = null;
+          releasedPending = Pending.Take(null).Array;
+          releasedSpare = SpareBuffer;
+          SpareBuffer = null;
+        }
+        else if (inline && written > 0)
+        {
+          // Stays the flusher, on the thread pool.
+          handOff = true;
+        }
+        else
+        {
+          batch = Pending.Take(SpareBuffer);
+          SpareBuffer = null;
+        }
+      }
+
+      if (batch.Array is null)
+      {
+        if (releasedPending is { Length: > 0 })
+          ArrayPool<byte>.Shared.Return(releasedPending);
+        if (releasedSpare is not null)
+          ArrayPool<byte>.Shared.Return(releasedSpare);
+        if (handOff)
+          QueueBackgroundFlush();
+        idle?.TrySetResult();
+        return;
+      }
+
+      var write = Stream.WriteAsync(batch.AsMemory(), Lifetime.Token);
+      if (!write.IsCompletedSuccessfully)
+      {
+        if (inline && cancellationToken.CanBeCanceled)
+        {
+          var pending = write.AsTask();
+          try
+          {
+            await pending.WaitAsync(cancellationToken);
+          }
+          catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+          {
+            _ = FinishFlushInBackgroundAsync(pending, batch);
+            throw;
+          }
+          catch (Exception ex)
+          {
+            WriteFailed(ex, batch, inline);
+            return;
+          }
+        }
+        else
+        {
+          try
+          {
+            await write;
+          }
+          catch (Exception ex)
+          {
+            WriteFailed(ex, batch, inline);
+            return;
+          }
+        }
+      }
+
+      written++;
+      BatchWritten(batch);
+    }
+  }
+
+  // The rest of a flush whose writer stopped waiting: finish its socket write, then keep flushing.
+  async Task FinishFlushInBackgroundAsync(Task write, ArraySegment<byte> batch)
+  {
+    try
+    {
+      await write;
+    }
+    catch (Exception ex)
+    {
+      WriteFailed(ex, batch, inline: false);
+      return;
+    }
+
+    BatchWritten(batch);
+    await BackgroundFlushAsync();
+  }
+
+  // A socket write failed: the connection cannot be written any more, and closing it fails everything
+  // outstanding. An inline writer gets the failure as connection_closed (or its cancellation).
+  void WriteFailed(Exception exception, ArraySegment<byte> batch, bool inline)
+  {
+    ArrayPool<byte>.Shared.Return(batch.Array);
+    var lost = IsTransportFailure(exception) ? ConnectionLost(exception) : null;
+    if (lost is null && exception is not OperationCanceledException)
+      _ = CloseAsync(exception).AsTask();
+    if (!inline)
+      return;
+    if (lost is not null)
+      throw lost;
+    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(exception);
+  }
+
+  // Bookkeeping after a batch reached the socket: counts it as flushed, keeps its array for the next batch
+  // and wakes writers waiting for room.
+  void BatchWritten(ArraySegment<byte> batch)
+  {
+    TaskCompletionSource room = null;
+    var keep = false;
+    lock (WriteSync)
+    {
+      // CloseWrites already reset the count.
+      if (!WritesClosed)
+        UnflushedBytes -= batch.Count;
+      if (SpareBuffer is null && batch.Array.Length <= MaxSpareBufferBytes && !WritesClosed)
+      {
+        SpareBuffer = batch.Array;
+        keep = true;
+      }
+
+      if (RoomSignal is not null && UnflushedBytes <= WriteHighWaterBytes / 2)
+      {
+        room = RoomSignal;
+        RoomSignal = null;
+      }
+    }
+
+    if (!keep)
+      ArrayPool<byte>.Shared.Return(batch.Array);
+    room?.TrySetResult();
+  }
+
+  void QueueBackgroundFlush()
+  {
+    ThreadPool.UnsafeQueueUserWorkItem(FlushWork ??= new FlushWorkItem(this), preferLocal: false);
+  }
+
+  async Task BackgroundFlushAsync()
+  {
+    try
+    {
+      await FlushAsync(inline: false);
+    }
+    catch
+    {
+      // FlushAsync closes the connection on failure; nothing is waiting for this task.
+    }
+  }
+
+  sealed class FlushWorkItem(SocketPeer peer) : IThreadPoolWorkItem
+  {
+    public void Execute()
+    {
+      _ = peer.BackgroundFlushAsync();
+    }
+  }
+
+  // Completes once everything encoded so far has been written (or the connection closed).
+  async ValueTask WaitForWritesAsync(CancellationToken cancellationToken)
+  {
+    Task wait;
+    lock (WriteSync)
+    {
+      if (!Flushing || WritesClosed)
+        return;
+
+      IdleSignal ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+      wait = IdleSignal.Task;
+    }
+
+    await wait.WaitAsync(cancellationToken);
+  }
+
+  // Called when the connection closes: no frame is encoded after this, waiting writers wake up (and see
+  // the connection closed), and the batch buffers go back to the pool.
+  void CloseWrites()
+  {
+    TaskCompletionSource room;
+    TaskCompletionSource idle;
+    byte[] pending;
+    byte[] spare;
+    lock (WriteSync)
+    {
+      WritesClosed = true;
+      room = RoomSignal;
+      idle = IdleSignal;
+      RoomSignal = null;
+      IdleSignal = null;
+      // A flush in progress still owns its batch; only what is not being written is released here.
+      pending = Flushing ? null : Pending.Take(null).Array;
+      spare = SpareBuffer;
+      SpareBuffer = null;
+      UnflushedBytes = 0;
+    }
+
+    if (pending is { Length: > 0 })
+      ArrayPool<byte>.Shared.Return(pending);
+    if (spare is not null)
+      ArrayPool<byte>.Shared.Return(spare);
+    room?.TrySetResult();
+    idle?.TrySetResult();
   }
 
   // The socket failed under a writer (reset, disposed by a concurrent close, or another I/O error). The
@@ -118,166 +433,5 @@ public sealed partial class SocketPeer
     // CloseAsync cancels Lifetime before its first await, so the connection is marked closed on return.
     _ = CloseAsync(exception).AsTask();
     return new SocketProtocolException(SocketProtocolError.ConnectionClosed, "Connection closed.");
-  }
-
-  // Runs with WriteLock held; FinishWriteAsync releases it.
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-  async ValueTask WriteLockedFrameAsync(SocketFrame frame, ReadOnlyMemory<byte> payloadOverride, PayloadLease lease)
-  {
-    try
-    {
-      var oversized = Writer.Encode(frame, payloadOverride);
-      if (oversized is null)
-        ObserveFrameSent(frame, payloadOverride.IsEmpty ? frame.PayloadLength : payloadOverride.Length);
-      else
-        await WriteChunkedFrameAsync(oversized, lease, Lifetime.Token);
-    }
-    catch
-    {
-      try
-      {
-        await FinishWriteAsync();
-      }
-      catch
-      {
-      }
-
-      throw;
-    }
-
-    await FinishWriteAsync();
-  }
-
-  // Leaves the writer queue while holding WriteLock, flushing if nobody is queued behind, then releases
-  // the lock. FlushPending is raised before leaving so a queued writer that gives up afterwards sees it.
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-  async ValueTask FinishWriteAsync()
-  {
-    try
-    {
-      Volatile.Write(ref FlushPending, 1);
-      if (Interlocked.Decrement(ref ActiveWriters) == 0)
-      {
-        Volatile.Write(ref FlushPending, 0);
-        await Writer.FlushAsync(Lifetime.Token);
-      }
-    }
-    finally
-    {
-      WriteLock.Release();
-    }
-  }
-
-  // A queued writer that gave up before getting the lock. If it was the last writer and bytes are still
-  // buffered, nobody else will flush them, so it does (in the background, so the caller is not delayed).
-  void LeaveWithoutWriting()
-  {
-    if (Interlocked.Decrement(ref ActiveWriters) == 0 && Volatile.Read(ref FlushPending) != 0)
-      _ = FlushPendingAsync();
-  }
-
-  async Task FlushPendingAsync()
-  {
-    Interlocked.Increment(ref ActiveWriters);
-    try
-    {
-      await WriteLock.WaitAsync(Lifetime.Token);
-    }
-    catch
-    {
-      // The connection is closing; buffered bytes no longer matter.
-      Interlocked.Decrement(ref ActiveWriters);
-      return;
-    }
-
-    try
-    {
-      await FinishWriteAsync();
-    }
-    catch
-    {
-    }
-  }
-
-  // Sends a frame too large for one wire frame as consecutive chunks of its encoded body (the header,
-  // already encoded, followed by the payload). Chunks are equal-sized except the last.
-  async ValueTask WriteChunkedFrameAsync(OversizedFrame oversized, PayloadLease lease, CancellationToken cancellationToken)
-  {
-    var header = oversized.Header;
-    var payload = oversized.Payload;
-    var total = oversized.TotalLength;
-    var chunkSize = Options.MaxChunkPayloadBytes;
-    var chunkCount = (int)(((long)total + chunkSize - 1) / chunkSize);
-    for (var index = 0; index < chunkCount; index++)
-    {
-      var start = index * chunkSize;
-      var end = (int)Math.Min(total, (long)start + chunkSize);
-      var headerPart = start < header.Length
-          ? header.AsSpan(start, Math.Min(end, header.Length) - start)
-          : ReadOnlySpan<byte>.Empty;
-      var payloadStart = Math.Max(0, start - header.Length);
-      var payloadEnd = Math.Max(0, end - header.Length);
-
-      // Encoding is synchronous, so the payload is only read while the lease is held.
-      var touchesPayload = payloadEnd > payloadStart;
-      if (touchesPayload && lease is not null && !lease.TryAcquire())
-        throw new OperationCanceledException("The caller cancelled; the rest of the chunked message is not sent.");
-
-      try
-      {
-        Writer.EncodeChunk(
-            oversized.MessageId,
-            oversized.Kind,
-            index,
-            chunkCount,
-            total,
-            headerPart,
-            payload.Span.Slice(payloadStart, payloadEnd - payloadStart));
-      }
-      finally
-      {
-        if (touchesPayload)
-          lease?.Release();
-      }
-
-      ObserveFrameSent(SocketMessageKind.Chunk, end - start);
-
-      // Every chunk but the last is flushed here, so a large message never sits whole in the pipe. The
-      // last one is flushed (or coalesced) by FinishWriteAsync like any other frame.
-      if (index < chunkCount - 1)
-        await Writer.FlushAsync(cancellationToken);
-    }
-  }
-
-  // Lets a background chunked write read the caller's payload only while the caller is still waiting.
-  sealed class PayloadLease
-  {
-    const int Free = 0;
-    const int InUse = 1;
-    const int Revoked = 2;
-    int State;
-
-    public bool TryAcquire()
-    {
-      return Interlocked.CompareExchange(ref State, InUse, Free) == Free;
-    }
-
-    public void Release()
-    {
-      Interlocked.CompareExchange(ref State, Free, InUse);
-    }
-
-    // Waits out an encode in progress (a few microseconds at most), then forbids further reads.
-    public void Revoke()
-    {
-      var spin = new SpinWait();
-      while (true)
-      {
-        var state = Interlocked.CompareExchange(ref State, Revoked, Free);
-        if (state is Free or Revoked)
-          return;
-        spin.SpinOnce();
-      }
-    }
   }
 }

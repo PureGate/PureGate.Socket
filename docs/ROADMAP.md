@@ -4,13 +4,6 @@ What is still worth doing, most valuable first. Items that need measurements wai
 
 ---
 
-## Connection core
-
-- **Priority lanes, on a single writer queue.** Everything sent goes into one queue that a single writer task encodes into the pipe. The queue has lanes: control frames (pong, cancel, close, credits) first, then responses, then requests and events, then stream data and chunks. Large messages are interleaved chunk by chunk.
-  - Why: today a large chunked message holds the connection's writer until it is sent, so small requests, responses and control frames queued behind it wait. Under mixed traffic that shows up as latency spikes, and a delayed pong can make a healthy connection fail its liveness probe.
-  - Watch: a queued frame must keep its payload alive until it is encoded. Today a caller may return a pooled payload as soon as its write returns, which typed sends rely on.
-  - Only worth it when large messages or streams share connections with RPCs.
-
 ## Protocol
 
 The wire format is specified in [PROTOCOL.md](PROTOCOL.md).

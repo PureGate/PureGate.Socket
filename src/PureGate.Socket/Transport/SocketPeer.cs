@@ -22,7 +22,6 @@ public sealed partial class SocketPeer : IAsyncDisposable
   readonly ISocketPeerHandler Handler;
   readonly SocketFrameReader Reader;
   readonly SocketFrameWriter Writer;
-  readonly SemaphoreSlim WriteLock = new(1, 1);
   readonly CancellationTokenSource Lifetime = new();
   readonly ConcurrentDictionary<long, PendingRequest> PendingRequests = new();
   readonly ConcurrentDictionary<long, PendingStream> PendingStreams = new();
@@ -70,7 +69,8 @@ public sealed partial class SocketPeer : IAsyncDisposable
         Options.MaxFrameSizeBytes,
         Options.PayloadCompression,
         Options.CompressionMinPayloadBytes,
-        useMethodTable: true);
+        useMethodTable: true,
+        output: Pending);
     SocketMetrics.Opened(this);
     State = SocketPeerState.Connected;
     ConnectedTask = Task.Run(NotifyConnectedAsync);

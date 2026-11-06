@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.IO.Pipelines;
@@ -10,6 +11,9 @@ namespace PureGate.Socket.Framing;
 // Encodes frames in the wire format (see SocketWire). Not thread-safe: SocketPeer calls it under its write
 // lock, which is also what keeps method-table definitions in the same order as the frames on the wire.
 //
+// Frames go to a pipe over stream (flushed with FlushAsync), or, when output is given, into that buffer;
+// the connection writes its buffer to the socket itself (see SocketPeer.Writing).
+//
 // useMethodTable: when true, the first frame that uses a service/operation pair defines a number for it
 // and later frames send only the number. Only the connection's own writer uses it; the handshake writer
 // (and raw writers in tests) send names literally, so their frames never touch the connection's table.
@@ -18,9 +22,13 @@ sealed class SocketFrameWriter(
     int maxFrameSizeBytes,
     SocketPayloadCompression compression = SocketPayloadCompression.None,
     int compressionMinPayloadBytes = 16 * 1024,
-    bool useMethodTable = false)
+    bool useMethodTable = false,
+    IBufferWriter<byte> output = null)
 {
-  readonly PipeWriter Writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true));
+  readonly PipeWriter Pipe = output is null ? PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true)) : null;
+  readonly IBufferWriter<byte> Output = output;
+
+  IBufferWriter<byte> Target => Output ?? Pipe;
   readonly Dictionary<(string Service, string Operation), int> Methods = useMethodTable ? new() : null;
 
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
@@ -45,7 +53,7 @@ sealed class SocketFrameWriter(
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   public async ValueTask FlushAsync(CancellationToken cancellationToken)
   {
-    var flush = await Writer.FlushAsync(cancellationToken);
+    var flush = await Pipe.FlushAsync(cancellationToken);
     if (flush.IsCanceled)
       throw new OperationCanceledException(cancellationToken);
   }
@@ -81,12 +89,12 @@ sealed class SocketFrameWriter(
     var bodyLength = (long)layout.Length + payload.Length;
     if (bodyLength <= maxFrameSizeBytes)
     {
-      var span = Writer.GetSpan(4 + (int)bodyLength);
+      var span = Target.GetSpan(4 + (int)bodyLength);
       BinaryPrimitives.WriteInt32BigEndian(span, (int)bodyLength);
       var offset = 4;
       layout.Write(span, ref offset, frame);
       payload.Span.CopyTo(span.Slice(offset));
-      Writer.Advance(4 + (int)bodyLength);
+      Target.Advance(4 + (int)bodyLength);
       BytesWritten += 4 + bodyLength;
       if (method.Defines)
         Methods[(frame.Service, frame.Operation)] = method.Id;
@@ -128,7 +136,7 @@ sealed class SocketFrameWriter(
     if (bodyLength > maxFrameSizeBytes)
       throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Chunk exceeds the configured maximum size.");
 
-    var span = Writer.GetSpan(4 + bodyLength);
+    var span = Target.GetSpan(4 + bodyLength);
     BinaryPrimitives.WriteInt32BigEndian(span, bodyLength);
     var offset = 4;
     span[offset++] = (byte)SocketMessageKind.Chunk;
@@ -140,7 +148,7 @@ sealed class SocketFrameWriter(
     SocketWire.WriteVarint(span, ref offset, (ulong)total);
     first.CopyTo(span.Slice(offset));
     second.CopyTo(span.Slice(offset + first.Length));
-    Writer.Advance(4 + bodyLength);
+    Target.Advance(4 + bodyLength);
     BytesWritten += 4 + bodyLength;
   }
 

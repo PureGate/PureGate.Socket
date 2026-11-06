@@ -11,7 +11,7 @@ internal readonly record struct SocketPeerDiagnostics(
     int OutgoingStreams,
     int QueuedHandlers,
     int ActiveHandlerWorkers,
-    int ActiveWriters,
+    long UnflushedBytes,
     int IncomingChunks,
     long IncomingChunkBytes,
     int EventLanes,
@@ -27,7 +27,7 @@ internal readonly record struct SocketPeerDiagnostics(
       && OutgoingStreams == 0
       && QueuedHandlers == 0
       && ActiveHandlerWorkers == 0
-      && ActiveWriters == 0
+      && UnflushedBytes == 0
       && IncomingChunks == 0
       && IncomingChunkBytes == 0
       && EventLanes == 0
@@ -52,7 +52,7 @@ public sealed partial class SocketPeer
           OutgoingStreams.Count,
           Volatile.Read(ref QueuedHandlerFrames),
           Volatile.Read(ref ActiveHandlerWorkers),
-          Volatile.Read(ref ActiveWriters),
+          Interlocked.Read(ref UnflushedBytes),
           IncomingChunks.Count,
           Interlocked.Read(ref IncomingChunkBytes),
           lanes,

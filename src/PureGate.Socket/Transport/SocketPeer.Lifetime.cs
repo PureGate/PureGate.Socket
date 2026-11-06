@@ -12,6 +12,7 @@ public sealed partial class SocketPeer
 
     State = SocketPeerState.Closed;
     Lifetime.Cancel();
+    CloseWrites();
     MessageCredits.Fail(Lifetime.Token);
     DrainHandlerQueue();
     IncomingChunks.Clear();
@@ -66,9 +67,9 @@ public sealed partial class SocketPeer
     {
     }
 
-    // Lifetime and WriteLock are deliberately not disposed: callers that were in flight when the peer
-    // closed still touch them on their way out, and disposing them turned a clean connection_closed
-    // result into an ObjectDisposedException. Neither holds unmanaged resources.
+    // Lifetime is deliberately not disposed: callers that were in flight when the peer closed still touch
+    // it on their way out, and disposing it turned a clean connection_closed result into an
+    // ObjectDisposedException. It holds no unmanaged resources.
     while (RequestCancellationPool.TryDequeue(out var cancellation))
       cancellation.Dispose();
   }

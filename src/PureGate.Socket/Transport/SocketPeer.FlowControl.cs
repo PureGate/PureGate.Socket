@@ -64,34 +64,12 @@ public sealed partial class SocketPeer
   internal void SendCreditInBackground(long messageId, long amount)
   {
     // Grants are capped well below int.MaxValue by the window limits, so this never truncates.
-    SendControlInBackground(new SocketFrame
+    SendControl(new SocketFrame
     {
       MessageId = messageId,
       Kind = SocketMessageKind.Credit,
       Value = (int)amount
     });
-  }
-
-  // Control frames (credits, pongs, rejections) are written in the background, so the thread that
-  // triggers them (often the read loop) never waits on the socket.
-  void SendControlInBackground(SocketFrame frame)
-  {
-    if (Lifetime.IsCancellationRequested)
-      return;
-
-    _ = SendControlAsync(frame);
-  }
-
-  async Task SendControlAsync(SocketFrame frame)
-  {
-    try
-    {
-      await WriteFrameAsync(frame, Lifetime.Token);
-    }
-    catch
-    {
-      // The connection is closing or broken; the read loop reports that.
-    }
   }
 
   // The handshake's proof (client to server) and ready (server to client) frames carry the sender's

@@ -94,8 +94,14 @@ public sealed partial class SocketPeer
     LastChunkPruneTicks = now.UtcTicks;
     foreach (var item in IncomingChunks)
     {
-      if (now - item.Value.LastActivity > Options.ChunkTimeout)
-        RemoveIncomingChunks(item.Key, item.Value);
+      if (now - item.Value.LastActivity <= Options.ChunkTimeout)
+        continue;
+
+      RemoveIncomingChunks(item.Key, item.Value);
+      // Its sender spent a message credit that no handler will return (it gave up part way, typically
+      // because its call was cancelled), so it is returned here.
+      if (item.Key.Kind is SocketMessageKind.Request or SocketMessageKind.Event or SocketMessageKind.StreamRequest)
+        ReturnMessageCredit();
     }
   }
 

@@ -108,7 +108,7 @@ The signatures are produced by the configured authenticator. `HmacSocketAuthenti
 
 ## Chunking
 
-A frame whose body exceeds the receiver's frame limit is sent as consecutive Chunk frames. The sender encodes the frame's body once (header and payload), then splits those bytes into `count` chunks of equal size except the last; `total` is the body's length. Chunks of one frame are sent back to back and in order.
+A frame whose body exceeds the receiver's frame limit is sent as consecutive Chunk frames. The sender encodes the frame's body once (header and payload), then splits those bytes into `count` chunks of equal size except the last; `total` is the body's length. Chunks of one frame are sent in order. Other frames, including chunks of other frames, may be sent between them, so one large message does not hold up the rest of the connection. A frame that uses the method table is never chunked with a definition in it (chunked frames name their method literally), so interleaving cannot reorder definitions.
 
 The receiver concatenates the chunks and decodes the result as an ordinary frame body, whose kind and id must match the chunks. It rejects chunks out of order or inconsistent with the first one, and drops the remaining chunks of a frame that has made no progress for `ChunkTimeout`. The memory held by partly received frames is capped per connection.
 

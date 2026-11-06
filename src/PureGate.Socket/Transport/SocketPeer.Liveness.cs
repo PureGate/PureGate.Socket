@@ -36,7 +36,7 @@ public sealed partial class SocketPeer
   async Task<bool> RunLivenessProbeAsync()
   {
     var started = Environment.TickCount64;
-    SendControlInBackground(new SocketFrame
+    SendControl(new SocketFrame
     {
       MessageId = LivenessProbeMessageId,
       Kind = SocketMessageKind.Ping

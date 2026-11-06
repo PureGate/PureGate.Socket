@@ -496,6 +496,7 @@ public sealed partial class SocketPeer
         {
           Kind = SocketMessageKind.Close
         }, closeTimeout.Token);
+        await WaitForWritesAsync(closeTimeout.Token);
       }
       catch
       {

@@ -86,7 +86,7 @@ public sealed partial class SocketPeer
         DispatchCredit(frame);
         break;
       case SocketMessageKind.Ping:
-        SendControlInBackground(new SocketFrame
+        SendControl(new SocketFrame
         {
           MessageId = frame.MessageId,
           Kind = SocketMessageKind.Pong,
@@ -146,32 +146,15 @@ public sealed partial class SocketPeer
     }
   }
 
-  static readonly TimeSpan CancelFrameTimeout = TimeSpan.FromSeconds(5);
-
-  // A cancel frame is best effort: the caller already has its timeout or cancelled result and should not
-  // wait behind a write lock held by a blocked write.
+  // A cancel frame is best effort and never makes the caller wait: it already has its timeout or cancelled
+  // result.
   void SendCancelInBackground(long messageId)
   {
-    _ = SendCancelAsync(messageId).AsTask();
-  }
-
-  async ValueTask SendCancelAsync(long messageId)
-  {
-    if (State == SocketPeerState.Closed || Lifetime.IsCancellationRequested)
-      return;
-
-    try
+    SendControl(new SocketFrame
     {
-      using var timeout = new CancellationTokenSource(CancelFrameTimeout);
-      await WriteFrameAsync(new SocketFrame
-      {
-        MessageId = messageId,
-        Kind = SocketMessageKind.Cancel
-      }, timeout.Token);
-    }
-    catch
-    {
-    }
+      MessageId = messageId,
+      Kind = SocketMessageKind.Cancel
+    });
   }
 
   // Server-side handler cancellation sources are never pooled and never disposed. The read loop can look

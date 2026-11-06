@@ -44,7 +44,7 @@ public sealed partial class SocketPeer
       case SocketMessageKind.Request:
         if (creditTaken)
           ReturnMessageCredit();
-        SendControlInBackground(new SocketFrame
+        SendControl(new SocketFrame
         {
           MessageId = messageId,
           Kind = SocketMessageKind.Response,
@@ -56,7 +56,7 @@ public sealed partial class SocketPeer
       case SocketMessageKind.StreamRequest:
         if (creditTaken)
           ReturnMessageCredit();
-        SendControlInBackground(new SocketFrame
+        SendControl(new SocketFrame
         {
           MessageId = messageId,
           Kind = SocketMessageKind.StreamStart,
