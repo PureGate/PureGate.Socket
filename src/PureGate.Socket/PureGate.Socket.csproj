@@ -10,8 +10,7 @@
     <NoWarn>$(NoWarn);RS0026;RS0027;RS0037</NoWarn>
   </PropertyGroup>
 
-  <!-- Package. The Publish Nuget Package workflow publishes VersionPrefix; CI builds
-       1.0.0-ci.<run>. Source Link comes with the SDK, so the symbols map back to this repository. -->
+  <!-- Package. The Publish Nuget Package workflow publishes VersionPrefix. Source Link comes with the SDK, so the symbols map back to this repository. -->
   <PropertyGroup>
     <PackageId>PureGate.Socket</PackageId>
     <VersionPrefix>1.0.0</VersionPrefix>

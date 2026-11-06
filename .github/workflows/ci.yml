@@ -45,10 +45,10 @@ jobs:
             echo "::endgroup::"
           done
 
-      # The package every CI run would release, as a prerelease version (1.0.0-ci.<run>).
+      # Checks that the package builds; the artifact is never published.
       - name: Pack
         if: matrix.os == 'ubuntu-latest'
-        run: dotnet pack src/PureGate.Socket -c Release --no-build -o artifacts/packages -p:VersionSuffix=ci.${{ github.run_number }}
+        run: dotnet pack src/PureGate.Socket -c Release --no-build -o artifacts/packages
 
       - uses: actions/upload-artifact@v4
         if: matrix.os == 'ubuntu-latest'

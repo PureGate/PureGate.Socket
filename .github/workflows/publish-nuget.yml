@@ -82,4 +82,3 @@ jobs:
           --target "$GITHUB_SHA"
           --title "PureGate.Socket ${{ steps.version.outputs.version }}"
           --generate-notes
-          ${{ contains(steps.version.outputs.version, '-') && '--prerelease' || '' }}

@@ -13,9 +13,7 @@ Publishing uses nuget.org [trusted publishing](https://learn.microsoft.com/nuget
 3. **Commit and push** to `main`.
 4. **Publish:** Actions > Publish Nuget Package > Run workflow, on `main`.
 
-The workflow builds, runs the tests, packs `PureGate.Socket.<version>.nupkg` with its symbols package (`.snupkg`), publishes both to nuget.org, then tags the commit `v<version>` and creates a GitHub release with the packages attached and generated notes. A version with a suffix, such as `1.1.0-rc.1`, is published as a prerelease.
-
-CI builds prerelease packages of every commit (`<VersionPrefix>-ci.<run>`) as artifacts; they are never published.
+The workflow builds, runs the tests, packs `PureGate.Socket.<version>.nupkg` with its symbols package (`.snupkg`), publishes both to nuget.org, then tags the commit `v<version>` and creates a GitHub release with the packages attached and generated notes.
 
 ## Versioning
 
