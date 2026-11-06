@@ -105,7 +105,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "hello",
-      Payload = JsonSocketMessageCodec.Shared.Serialize(hello)
+      Payload = SocketHandshakeJson.Codec.Serialize(hello)
     }, cancellationToken);
 
     var challengeFrame = await reader.ReadAsync(cancellationToken);
@@ -121,7 +121,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     if (!challengeFrame.Ok)
       throw new SocketProtocolException(challengeFrame.ErrorCode ?? SocketProtocolError.Unauthorized, challengeFrame.ErrorMessage ?? "Handshake rejected.");
 
-    var challenge = JsonSocketMessageCodec.Shared.Deserialize<SocketHandshakeChallenge>(challengeFrame.PayloadMemory.Span);
+    var challenge = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeChallenge>(challengeFrame.PayloadMemory);
     if (challenge.Version != SocketFabricOptions.CurrentProtocolVersion)
       throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
 
@@ -141,7 +141,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
       Service = "socket",
       Operation = "proof",
       Value = Options.MaxQueuedHandlers,
-      Payload = JsonSocketMessageCodec.Shared.Serialize(proof)
+      Payload = SocketHandshakeJson.Codec.Serialize(proof)
     }, cancellationToken);
 
     var ready = await reader.ReadAsync(cancellationToken);

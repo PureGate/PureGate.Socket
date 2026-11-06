@@ -48,6 +48,11 @@ await RunWithContextAsync(
     StartEchoClientAsync,
     context => RpcEchoAsync(context.Client, iterations));
 await RunWithContextAsync(
+    "typed rpc steady",
+    iterations,
+    StartTypedEchoClientAsync,
+    context => TypedRpcAsync(context.Client, iterations));
+await RunWithContextAsync(
     "request batch steady",
     RoundUp(iterations, RequestBatchSize),
     StartEchoClientAsync,
@@ -275,6 +280,32 @@ static async ValueTask<BenchmarkPeer> StartEchoClientAsync()
   return new BenchmarkPeer(listener, client);
 }
 
+// A JSON message of about 1 KB, echoed through the typed API on both sides.
+static async ValueTask<BenchmarkPeer> StartTypedEchoClientAsync()
+{
+  var listener = new SocketListener(BenchmarkOptions("server", JsonSocketMessageCodec.Shared));
+  await listener.StartAsync(
+      new IPEndPoint(IPAddress.Loopback, 0),
+      new BenchmarkHandler
+      {
+        OnRequest = (peer, request, _) => ValueTask.FromResult(
+            SocketResponse.Success(peer.Codec, request.ReadPayload<BenchOrder>(peer.Codec)))
+      });
+  var client = await ConnectClientAsync(listener.EndPoint, JsonSocketMessageCodec.Shared);
+  return new BenchmarkPeer(listener, client);
+}
+
+static async Task TypedRpcAsync(SocketPeer client, int iterations)
+{
+  var order = new BenchOrder(42, "typed", new string('x', 960));
+  for (var i = 0; i < iterations; i++)
+  {
+    var echoed = await client.RequestAsync<BenchOrder, BenchOrder>("bench", "typed", order);
+    if (echoed.Id != order.Id || echoed.Note.Length != order.Note.Length)
+      throw new InvalidOperationException("Typed RPC returned invalid data.");
+  }
+}
+
 static async ValueTask<BenchmarkPeer> StartStreamClientAsync(int streamBytes)
 {
   var listener = new SocketListener(BenchmarkOptions("server"));
@@ -327,18 +358,18 @@ static async ValueTask<SocketListener> StartEchoListenerAsync()
   return listener;
 }
 
-static async ValueTask<SocketPeer> ConnectClientAsync(IPEndPoint endPoint)
+static async ValueTask<SocketPeer> ConnectClientAsync(IPEndPoint endPoint, ISocketMessageCodec codec = null)
 {
-  var connector = new SocketConnector(BenchmarkOptions("client"));
+  var connector = new SocketConnector(BenchmarkOptions("client", codec));
   return await connector.ConnectAsync(endPoint, new BenchmarkHandler());
 }
 
-static SocketFabricOptions BenchmarkOptions(string nodeId)
+static SocketFabricOptions BenchmarkOptions(string nodeId, ISocketMessageCodec codec = null)
 {
   return new SocketFabricOptions
   {
     NodeId = nodeId,
-    Codec = RawSocketMessageCodec.Shared,
+    Codec = codec ?? RawSocketMessageCodec.Shared,
     MaxFrameSizeBytes = 1024 * 1024,
     MaxConcurrentHandlers = Environment.ProcessorCount * 2,
     MaxQueuedHandlers = 100_000,
@@ -374,6 +405,8 @@ static bool IsReleaseBuild()
   return true;
 #endif
 }
+
+sealed record BenchOrder(int Id, string Name, string Note);
 
 sealed class BenchmarkHandler : ISocketPeerHandler
 {

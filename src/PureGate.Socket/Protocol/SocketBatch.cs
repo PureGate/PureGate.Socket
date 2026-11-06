@@ -23,22 +23,26 @@ static class SocketBatchCodec
   const int MinItemBytes = 4 + 4 + 4 + 4;
   const int MinResultBytes = 4 + 1 + 4 + 4 + 4;
 
-  public static byte[] SerializeItems(IReadOnlyList<SocketBatchItem> items)
+  // Encoded once into a pooled buffer of the exact size; the caller disposes it after sending.
+  public static SocketPayload SerializeItems(IReadOnlyList<SocketBatchItem> items)
   {
-    using var output = new MemoryStream();
-    WriteInt32(output, items?.Count ?? 0);
-    if (items is null)
-      return output.ToArray();
+    long length = 4;
+    foreach (var item in items ?? [])
+      length += 4 + StringLength(item.Service) + StringLength(item.Operation) + 4 + (item.Payload?.Length ?? 0);
 
-    foreach (var item in items)
+    var payload = SocketPayload.Rent(CheckedLength(length));
+    var span = System.Runtime.InteropServices.MemoryMarshal.AsMemory(payload.Memory).Span;
+    var offset = 0;
+    WriteInt32(span, ref offset, items?.Count ?? 0);
+    foreach (var item in items ?? [])
     {
-      WriteInt32(output, item.Id);
-      WriteString(output, item.Service);
-      WriteString(output, item.Operation);
-      WriteBytes(output, item.Payload);
+      WriteInt32(span, ref offset, item.Id);
+      WriteString(span, ref offset, item.Service);
+      WriteString(span, ref offset, item.Operation);
+      WriteBytes(span, ref offset, item.Payload);
     }
 
-    return output.ToArray();
+    return payload;
   }
 
   public static IReadOnlyList<SocketBatchItem> DeserializeItems(ReadOnlySpan<byte> payload)
@@ -62,23 +66,27 @@ static class SocketBatchCodec
     return items;
   }
 
+  // Encoded once into an array of the exact size (it becomes a response payload, which may be cached).
   public static byte[] SerializeResults(IReadOnlyList<SocketBatchResult> results)
   {
-    using var output = new MemoryStream();
-    WriteInt32(output, results?.Count ?? 0);
-    if (results is null)
-      return output.ToArray();
+    long length = 4;
+    foreach (var result in results ?? [])
+      length += 4 + 1 + 4 + (result.Payload?.Length ?? 0) + StringLength(result.ErrorCode) + StringLength(result.ErrorMessage);
 
-    foreach (var result in results)
+    var output = GC.AllocateUninitializedArray<byte>(CheckedLength(length));
+    var span = output.AsSpan();
+    var offset = 0;
+    WriteInt32(span, ref offset, results?.Count ?? 0);
+    foreach (var result in results ?? [])
     {
-      WriteInt32(output, result.Id);
-      output.WriteByte(result.Succeeded ? (byte)1 : (byte)0);
-      WriteBytes(output, result.Payload);
-      WriteString(output, result.ErrorCode);
-      WriteString(output, result.ErrorMessage);
+      WriteInt32(span, ref offset, result.Id);
+      span[offset++] = result.Succeeded ? (byte)1 : (byte)0;
+      WriteBytes(span, ref offset, result.Payload);
+      WriteString(span, ref offset, result.ErrorCode);
+      WriteString(span, ref offset, result.ErrorMessage);
     }
 
-    return output.ToArray();
+    return output;
   }
 
   public static IReadOnlyList<SocketBatchResult> DeserializeResults(ReadOnlySpan<byte> payload)
@@ -105,31 +113,43 @@ static class SocketBatchCodec
     return results;
   }
 
-  static void WriteInt32(Stream stream, int value)
+  static int StringLength(string value)
   {
-    Span<byte> buffer = stackalloc byte[4];
-    BinaryPrimitives.WriteInt32BigEndian(buffer, value);
-    stream.Write(buffer);
+    return 4 + (string.IsNullOrEmpty(value) ? 0 : Encoding.UTF8.GetByteCount(value));
   }
 
-  static void WriteString(Stream stream, string value)
+  static int CheckedLength(long length)
+  {
+    if (length > Array.MaxLength)
+      throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Batch is too large to encode.");
+    return (int)length;
+  }
+
+  static void WriteInt32(Span<byte> output, ref int offset, int value)
+  {
+    BinaryPrimitives.WriteInt32BigEndian(output.Slice(offset, 4), value);
+    offset += 4;
+  }
+
+  static void WriteString(Span<byte> output, ref int offset, string value)
   {
     if (string.IsNullOrEmpty(value))
     {
-      WriteInt32(stream, 0);
+      WriteInt32(output, ref offset, 0);
       return;
     }
 
-    var bytes = Encoding.UTF8.GetBytes(value);
-    WriteInt32(stream, bytes.Length);
-    stream.Write(bytes);
+    var length = Encoding.UTF8.GetBytes(value, output.Slice(offset + 4));
+    WriteInt32(output, ref offset, length);
+    offset += length;
   }
 
-  static void WriteBytes(Stream stream, byte[] value)
+  static void WriteBytes(Span<byte> output, ref int offset, byte[] value)
   {
     value ??= [];
-    WriteInt32(stream, value.Length);
-    stream.Write(value);
+    WriteInt32(output, ref offset, value.Length);
+    value.CopyTo(output.Slice(offset));
+    offset += value.Length;
   }
 
   static byte ReadByte(ReadOnlySpan<byte> payload, ref int offset)

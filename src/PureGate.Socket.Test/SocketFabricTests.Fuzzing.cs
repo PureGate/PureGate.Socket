@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
+using PureGate.Socket.Serialization;
 using PureGate.Socket.Transport;
 
 namespace PureGate.Socket.Test;

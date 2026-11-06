@@ -1,3 +1,4 @@
+using PureGate.Socket.Serialization;
 using PureGate.Socket.Observability;
 using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
@@ -7,6 +8,7 @@ namespace PureGate.Socket.Transport;
 
 public sealed partial class SocketPeer
 {
+  // The payload is serialized straight into a pooled buffer, returned once the request has been sent.
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketRequestResult> RequestAsync<TRequest>(
       string service,
@@ -14,13 +16,15 @@ public sealed partial class SocketPeer
       TRequest payload,
       CancellationToken cancellationToken = default)
   {
-    return await RequestAsync(
-        service,
-        operation,
-        Options.Codec.Serialize(payload),
-        Options.RequestTimeout,
-        idempotencyKey: null,
-        cancellationToken);
+    var serialized = SocketPayloadWriter.Serialize(Options.Codec, payload);
+    try
+    {
+      return await RequestPayloadAsync(service, operation, serialized, Options.RequestTimeout, idempotencyKey: null, cancellationToken);
+    }
+    finally
+    {
+      serialized.Dispose();
+    }
   }
 
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
@@ -37,8 +41,7 @@ public sealed partial class SocketPeer
     return result.ReadPayload<TResponse>(Options.Codec);
   }
 
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-  public async ValueTask<SocketRequestResult> RequestAsync(
+  public ValueTask<SocketRequestResult> RequestAsync(
       string service,
       string operation,
       byte[] payload,
@@ -46,14 +49,28 @@ public sealed partial class SocketPeer
       string idempotencyKey = null,
       CancellationToken cancellationToken = default)
   {
-    return await RequestFrameAsync(new SocketFrame
+    return RequestPayloadAsync(service, operation, SocketPayload.Wrap(payload ?? []), timeout, idempotencyKey, cancellationToken);
+  }
+
+  // The caller keeps ownership of payload: it is no longer read once this completes, so a pooled payload
+  // can be returned (or reused for a retry) right after.
+  internal ValueTask<SocketRequestResult> RequestPayloadAsync(
+      string service,
+      string operation,
+      SocketPayload payload,
+      TimeSpan timeout,
+      string idempotencyKey,
+      CancellationToken cancellationToken)
+  {
+    var frame = new SocketFrame
     {
       Kind = SocketMessageKind.Request,
       Service = service ?? string.Empty,
       Operation = operation ?? string.Empty,
-      IdempotencyKey = idempotencyKey ?? string.Empty,
-      Payload = payload ?? []
-    }, timeout, cancellationToken);
+      IdempotencyKey = idempotencyKey ?? string.Empty
+    };
+    frame.SetPayload(payload);
+    return RequestFrameAsync(frame, timeout, cancellationToken);
   }
 
   // Measures the request only when a metrics listener is attached; otherwise this adds nothing.
@@ -215,20 +232,34 @@ public sealed partial class SocketPeer
       TRequest payload,
       CancellationToken cancellationToken = default)
   {
-    return await OpenStreamAsync(
-        service,
-        operation,
-        Options.Codec.Serialize(payload),
-        Options.RequestTimeout,
-        cancellationToken);
+    var serialized = SocketPayloadWriter.Serialize(Options.Codec, payload);
+    try
+    {
+      return await OpenStreamPayloadAsync(service, operation, serialized, Options.RequestTimeout, cancellationToken);
+    }
+    finally
+    {
+      serialized.Dispose();
+    }
   }
 
-  public async ValueTask<Stream> OpenStreamAsync(
+  public ValueTask<Stream> OpenStreamAsync(
       string service,
       string operation,
       byte[] payload,
       TimeSpan timeout,
       CancellationToken cancellationToken = default)
+  {
+    return OpenStreamPayloadAsync(service, operation, SocketPayload.Wrap(payload ?? []), timeout, cancellationToken);
+  }
+
+  // The caller keeps ownership of payload; it is no longer read once this completes.
+  async ValueTask<Stream> OpenStreamPayloadAsync(
+      string service,
+      string operation,
+      SocketPayload payload,
+      TimeSpan timeout,
+      CancellationToken cancellationToken)
   {
     ThrowIfClosed();
     if (!TryAcquireInFlight())
@@ -262,9 +293,9 @@ public sealed partial class SocketPeer
         Service = service ?? string.Empty,
         Operation = operation ?? string.Empty,
         Value = Options.StreamWindowBytes,
-        DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout),
-        Payload = payload ?? []
+        DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout)
       };
+      request.SetPayload(payload);
       await MessageCredits.AcquireAsync(timeoutSource.Token);
       try
       {
@@ -319,15 +350,33 @@ public sealed partial class SocketPeer
       TPayload payload,
       CancellationToken cancellationToken = default)
   {
-    await SendEventAsync(service, operation, Options.Codec.Serialize(payload), cancellationToken);
+    var serialized = SocketPayloadWriter.Serialize(Options.Codec, payload);
+    try
+    {
+      await SendEventPayloadAsync(service, operation, serialized, cancellationToken);
+    }
+    finally
+    {
+      serialized.Dispose();
+    }
   }
 
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-  public async ValueTask SendEventAsync(
+  public ValueTask SendEventAsync(
       string service,
       string operation,
       byte[] payload,
       CancellationToken cancellationToken = default)
+  {
+    return SendEventPayloadAsync(service, operation, SocketPayload.Wrap(payload ?? []), cancellationToken);
+  }
+
+  // The caller keeps ownership of payload; it is no longer read once this completes.
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+  internal async ValueTask SendEventPayloadAsync(
+      string service,
+      string operation,
+      SocketPayload payload,
+      CancellationToken cancellationToken)
   {
     ThrowIfClosed();
     var frame = new SocketFrame
@@ -335,9 +384,9 @@ public sealed partial class SocketPeer
       MessageId = Interlocked.Increment(ref NextMessageId),
       Kind = SocketMessageKind.Event,
       Service = service ?? string.Empty,
-      Operation = operation ?? string.Empty,
-      Payload = payload ?? []
+      Operation = operation ?? string.Empty
     };
+    frame.SetPayload(payload);
 
     // Waits while the remote's handler queue is full, instead of the remote dropping the connection.
     try
@@ -368,13 +417,9 @@ public sealed partial class SocketPeer
       CancellationToken cancellationToken = default)
   {
     var batch = ValidateBatch(items);
-    var result = await RequestAsync(
-        InternalService,
-        BatchRequestOperation,
-        SocketBatchCodec.SerializeItems(batch),
-        timeout,
-        idempotencyKey: null,
-        cancellationToken);
+    SocketRequestResult result;
+    using (var encoded = SocketBatchCodec.SerializeItems(batch))
+      result = await RequestPayloadAsync(InternalService, BatchRequestOperation, encoded, timeout, idempotencyKey: null, cancellationToken);
     if (!result.Succeeded)
       throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
 
@@ -386,11 +431,8 @@ public sealed partial class SocketPeer
       CancellationToken cancellationToken = default)
   {
     var batch = ValidateBatch(items);
-    await SendEventAsync(
-        InternalService,
-        BatchEventOperation,
-        SocketBatchCodec.SerializeItems(batch),
-        cancellationToken);
+    using var encoded = SocketBatchCodec.SerializeItems(batch);
+    await SendEventPayloadAsync(InternalService, BatchEventOperation, encoded, cancellationToken);
   }
 
   public async ValueTask<IReadOnlyList<SocketBatchResult>> SendEventBatchWithResultsAsync(
@@ -399,13 +441,9 @@ public sealed partial class SocketPeer
       CancellationToken cancellationToken = default)
   {
     var batch = ValidateBatch(items);
-    var result = await RequestAsync(
-        InternalService,
-        BatchEventRequestOperation,
-        SocketBatchCodec.SerializeItems(batch),
-        timeout,
-        idempotencyKey: null,
-        cancellationToken);
+    SocketRequestResult result;
+    using (var encoded = SocketBatchCodec.SerializeItems(batch))
+      result = await RequestPayloadAsync(InternalService, BatchEventRequestOperation, encoded, timeout, idempotencyKey: null, cancellationToken);
     if (!result.Succeeded)
       throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
 

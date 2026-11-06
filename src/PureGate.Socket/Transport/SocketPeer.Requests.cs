@@ -53,16 +53,38 @@ public sealed partial class SocketPeer
       }
 
       response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Request was not handled.");
+
+      // A typed response is serialized here, straight into a pooled buffer. A value the codec cannot
+      // serialize fails the request like a handler exception would.
+      ReadOnlyMemory<byte> payload;
+      SocketPayload owned;
+      try
+      {
+        payload = response.RentPayload(out owned);
+      }
+      catch (Exception ex)
+      {
+        response = HandlerFailure(frame.Service, frame.Operation, ex);
+        payload = response.RentPayload(out owned);
+      }
+
       SocketMetrics.ServerRequestCompleted(frame.Service, frame.Operation, metricsStarted, response.Succeeded ? null : response.ErrorCode);
       ObserveRequestCompleted(frame, response);
-      await WriteFrameAsync(new SocketFrame
+      try
       {
-        MessageId = frame.MessageId,
-        Kind = SocketMessageKind.Response,
-        Ok = response.Succeeded,
-        ErrorCode = response.ErrorCode,
-        ErrorMessage = response.ErrorMessage
-      }, response.Payload, Lifetime.Token);
+        await WriteFrameAsync(new SocketFrame
+        {
+          MessageId = frame.MessageId,
+          Kind = SocketMessageKind.Response,
+          Ok = response.Succeeded,
+          ErrorCode = response.ErrorCode,
+          ErrorMessage = response.ErrorMessage
+        }, payload, Lifetime.Token);
+      }
+      finally
+      {
+        owned.Dispose();
+      }
     }
     finally
     {
@@ -211,6 +233,8 @@ public sealed partial class SocketPeer
       {
         var response = await HandleRequestAsync(request, cancellationToken)
             ?? SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Request was not handled.");
+        // Cached and possibly sent more than once, so its bytes are fixed now.
+        _ = response.Payload;
         candidate.TrySetResult(response);
         return response;
       }
@@ -248,7 +272,7 @@ public sealed partial class SocketPeer
       return new SocketBatchResult(
           item.Id,
           response.Succeeded,
-          response.Payload.ToArray(),
+          response.PayloadArray(),
           response.ErrorCode,
           response.ErrorMessage);
     }

@@ -17,6 +17,6 @@ public sealed class SocketRequest(
 
   public T ReadPayload<T>(ISocketMessageCodec codec)
   {
-    return codec.Deserialize<T>(Payload.Span);
+    return codec.Deserialize<T>(Payload);
   }
 }

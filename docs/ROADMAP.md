@@ -26,11 +26,9 @@ The wire format is specified in [PROTOCOL.md](PROTOCOL.md). Still to do:
 
 ## Phase 4 — Zero-copy, low-allocation APIs
 
-- **Codec API:** `Serialize<T>(T, IBufferWriter<byte>)` and `Deserialize<T>(ReadOnlySequence<byte>)`. JSON is written straight into the pipe, with support for source-generated serializers (AOT and trimming friendly).
-- **No intermediate `byte[]`** for outgoing payloads. Response payloads can optionally come from a pooled buffer the caller must dispose; copying stays the safe default.
+- **Pooled responses for typed calls.** A typed `RequestAsync<TRequest, TResponse>` deserializes the response and never exposes its bytes, so its payload can be read into a pooled buffer and returned right after. That removes the client's response payload array from a typed round trip without changing any API.
+- **Opt-in pooled payloads** for raw calls: a response payload from a pooled buffer the caller must dispose, and request payloads valid only while the handler runs. Copying stays the default.
 - **No `SocketFrame` object on the hot path.** Use struct headers instead.
-- **Interned method names**, so the server doesn't allocate a string per request.
-- **Batch encoders** write directly to the pipe.
 
 ## Phase 5 — Hardening
 

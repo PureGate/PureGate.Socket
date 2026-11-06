@@ -196,7 +196,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
 
     try
     {
-      var remoteHello = JsonSocketMessageCodec.Shared.Deserialize<SocketHandshakeHello>(frame.PayloadMemory.Span);
+      var remoteHello = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeHello>(frame.PayloadMemory);
       if (remoteHello.Version != SocketFabricOptions.CurrentProtocolVersion)
         throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
 
@@ -210,7 +210,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
         Service = "socket",
         Operation = "challenge",
         Ok = true,
-        Payload = JsonSocketMessageCodec.Shared.Serialize(challenge)
+        Payload = SocketHandshakeJson.Codec.Serialize(challenge)
       }, cancellationToken);
 
       var proofFrame = await reader.ReadAsync(cancellationToken);
@@ -223,7 +223,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
         throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid handshake proof.");
       }
 
-      var proof = JsonSocketMessageCodec.Shared.Deserialize<SocketHandshakeProof>(proofFrame.PayloadMemory.Span);
+      var proof = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeProof>(proofFrame.PayloadMemory);
       var remoteWindow = SocketPeer.ReadHandshakeWindow(proofFrame);
       var auth = await Options.Authenticator.AuthenticateProofAsync(
           remoteHello,

@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using PureGate.Socket.Fabric;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
+using PureGate.Socket.Serialization;
 using PureGate.Socket.Security;
 using PureGate.Socket.Transport;
 

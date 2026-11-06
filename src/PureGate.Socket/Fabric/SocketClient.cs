@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using PureGate.Socket.Handling;
 using PureGate.Socket.Protocol;
+using PureGate.Socket.Serialization;
 using PureGate.Socket.Transport;
 
 namespace PureGate.Socket.Fabric;
@@ -104,7 +105,26 @@ public sealed class SocketClient : IAsyncDisposable
     var idempotencyKey = retry.Idempotent
         ? string.IsNullOrEmpty(retry.IdempotencyKey) ? Guid.NewGuid().ToString("N") : retry.IdempotencyKey
         : string.Empty;
-    var serialized = Options.Codec.Serialize(payload);
+    // Serialized once into a pooled buffer, reused by every attempt and returned at the end.
+    var serialized = SocketPayloadWriter.Serialize(Options.Codec, payload);
+    try
+    {
+      return await RequestWithRetriesAsync(service, operation, serialized, retry, idempotencyKey, cancellationToken);
+    }
+    finally
+    {
+      serialized.Dispose();
+    }
+  }
+
+  async ValueTask<SocketRequestResult> RequestWithRetriesAsync(
+      string service,
+      string operation,
+      SocketPayload serialized,
+      SocketClientRequestOptions retry,
+      string idempotencyKey,
+      CancellationToken cancellationToken)
+  {
     for (var attempt = 1; ; attempt++)
     {
       // The connection is shared by every caller of this client, so a retry never closes it. A timeout
@@ -114,7 +134,7 @@ public sealed class SocketClient : IAsyncDisposable
       {
         peer = await GetPeerAsync(cancellationToken);
         var sentTicks = Environment.TickCount64;
-        var result = await peer.RequestAsync(
+        var result = await peer.RequestPayloadAsync(
             service,
             operation,
             serialized,

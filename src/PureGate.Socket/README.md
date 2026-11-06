@@ -28,7 +28,7 @@ See [CLUSTER_GUIDE.md](CLUSTER_GUIDE.md) for the socket-side contract future Pur
 - Optional Brotli frame payload compression, decompressed off the read loop with pooled buffers.
 - Decompressed payload size enforcement.
 - Bounded handler concurrency and queueing.
-- Pluggable payload codec.
+- Pluggable payload codec that writes into pooled buffers and reads received bytes in place; source-generated JSON for AOT.
 - Pluggable handshake authentication.
 - Pluggable request/event authorization.
 - Pluggable stream filter for TLS/mTLS or other transport wrapping.
@@ -60,6 +60,34 @@ Each side controls how much the other may send it:
 - **Streams.** A producer sends only what the consumer has room for: `StreamWindowBytes` to start (1 MB by default), with more granted as the application reads. When the consumer runs out of data while the producer is waiting for room, the window doubles, up to `MaxStreamWindowBytes` (64 MB by default). A slow or stalled reader holds back only its own stream, never the connection.
 
 Because nothing a peer sends can exceed what it was granted, the connection's read loop never waits, and two peers flooding each other cannot deadlock. A peer that sends more than it was granted is closed.
+
+## Serialization
+
+A codec turns message values into payload bytes and back:
+
+```csharp
+public interface ISocketMessageCodec
+{
+  void Serialize<T>(T value, IBufferWriter<byte> output);
+  T Deserialize<T>(ReadOnlySequence<byte> payload);
+}
+```
+
+Typed calls (`RequestAsync<TRequest, TResponse>`, `SendEventAsync<T>`, `OpenStreamAsync<T>`, `SocketClient`) serialize into a buffer rented from the shared array pool and return it once the frame has been sent, so they allocate no payload array. `SocketClient` serializes once and reuses the buffer for every retry. Received payloads are read in place by `ReadPayload<T>(codec)`. The `byte[]` overloads remain for callers that already have bytes.
+
+`SocketResponse.Success(codec, value)` serializes when the response is sent, straight into a pooled buffer, so the value must not change after the handler returns. A value the codec cannot serialize fails that request with `handler_failed`. A response kept for idempotent retries, or whose `Payload` is read, is serialized once into an array instead.
+
+`JsonSocketMessageCodec.Shared` uses System.Text.Json with web defaults and reflection. For AOT and trimming, pass a source-generated context, which must register every message type:
+
+```csharp
+[JsonSourceGenerationOptions(JsonSerializerDefaults.Web)]
+[JsonSerializable(typeof(Order))]
+partial class AppJsonContext : JsonSerializerContext;
+
+var options = new SocketFabricOptions { Codec = new JsonSocketMessageCodec(AppJsonContext.Default) };
+```
+
+The handshake has its own source-generated JSON, so it needs no reflection whatever codec is configured. `RawSocketMessageCodec` carries `byte[]`, `ReadOnlyMemory<byte>`, `Memory<byte>`, `ArraySegment<byte>` and strings (UTF-8). For one-off use, `codec.Serialize(value)` returns an array and `codec.Deserialize<T>(memory)` reads one.
 
 ## Memory budget
 
