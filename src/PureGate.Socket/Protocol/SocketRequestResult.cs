@@ -7,6 +7,20 @@ public sealed class SocketRequestResult
   // The payload arrived compressed; the requester decompresses it on its own thread.
   internal bool PayloadCompressed { get; init; }
 
+  // A pooled buffer holding Payload, for typed requests only: released by the library once the payload
+  // has been deserialized, and never handed to application code.
+  object PooledOwner;
+
+  internal object Owner
+  {
+    init => PooledOwner = value;
+  }
+
+  internal void ReleasePooled()
+  {
+    SocketPayload.ReleaseOwner(Interlocked.Exchange(ref PooledOwner, null));
+  }
+
   public bool Succeeded { get; init; }
   public ReadOnlyMemory<byte> Payload { get; init; }
   public string ErrorCode { get; init; }

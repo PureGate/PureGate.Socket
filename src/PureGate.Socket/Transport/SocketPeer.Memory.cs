@@ -140,5 +140,10 @@ public sealed partial class SocketPeer
         ErrorMessage = ex.Message
       };
     }
+    finally
+    {
+      // The compressed bytes are no longer needed.
+      result.ReleasePooled();
+    }
   }
 }

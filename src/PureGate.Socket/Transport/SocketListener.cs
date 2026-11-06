@@ -42,14 +42,17 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     return ValueTask.CompletedTask;
   }
 
+  // Started by StartAsync once Listener and Lifetime are set.
   async Task AcceptLoopAsync(ISocketPeerHandler handler)
   {
-    while (!Lifetime.IsCancellationRequested)
+    var listener = Listener;
+    var lifetime = Lifetime;
+    while (!lifetime.IsCancellationRequested)
     {
       TcpClient client = null;
       try
       {
-        client = await Listener.AcceptTcpClientAsync(Lifetime.Token);
+        client = await listener.AcceptTcpClientAsync(lifetime.Token);
         client.NoDelay = true;
         if (!TryAdmit(client))
         {
@@ -74,7 +77,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
       catch (Exception ex)
       {
         client?.Dispose();
-        if (Lifetime.IsCancellationRequested)
+        if (lifetime.IsCancellationRequested)
           break;
 
         ObserveListenerAcceptFailed(ex);
@@ -196,7 +199,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
 
     try
     {
-      var remoteHello = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeHello>(frame.PayloadMemory);
+      var remoteHello = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeHello>(frame.PayloadMemory)
+        ?? throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid handshake hello.");
       if (remoteHello.Version != SocketFabricOptions.CurrentProtocolVersion)
         throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
 
@@ -223,7 +227,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
         throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid handshake proof.");
       }
 
-      var proof = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeProof>(proofFrame.PayloadMemory);
+      var proof = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeProof>(proofFrame.PayloadMemory)
+        ?? throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid handshake proof.");
       var remoteWindow = SocketPeer.ReadHandshakeWindow(proofFrame);
       var auth = await Options.Authenticator.AuthenticateProofAsync(
           remoteHello,

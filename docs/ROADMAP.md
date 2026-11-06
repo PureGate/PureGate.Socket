@@ -26,7 +26,6 @@ The wire format is specified in [PROTOCOL.md](PROTOCOL.md). Still to do:
 
 ## Phase 4 — Zero-copy, low-allocation APIs
 
-- **Pooled responses for typed calls.** A typed `RequestAsync<TRequest, TResponse>` deserializes the response and never exposes its bytes, so its payload can be read into a pooled buffer and returned right after. That removes the client's response payload array from a typed round trip without changing any API.
 - **Opt-in pooled payloads** for raw calls: a response payload from a pooled buffer the caller must dispose, and request payloads valid only while the handler runs. Copying stays the default.
 - **No `SocketFrame` object on the hot path.** Use struct headers instead.
 
@@ -35,11 +34,11 @@ The wire format is specified in [PROTOCOL.md](PROTOCOL.md). Still to do:
 - **Coverage-guided fuzzing:** run SharpFuzz on the frame decoder, batch codecs, chunk reassembly and handshake, and add the crashes it finds to the seeded NUnit fuzz tests.
 - **More chaos scenarios:** duplicate connections from one node ID, and peers that read very slowly at the socket level.
 - **Systematic concurrency testing** with Microsoft Coyote on the request and stream lifecycles (optional).
-- **Gates:** at least 85% line coverage and every decoder branch covered. Add a public-API analyzer and turn on nullable annotations (deferred until Phases 2–4 have reshaped the public API).
+- **Branch coverage:** cover every decoder branch (branch coverage is 69% today, against 86% of lines), then gate branch coverage in CI as line coverage is.
 
 ## Phase 6 — Release
 
-Publish a versioned NuGet package and a performance report comparing the new numbers with the baseline.
+Publish a versioned NuGet package and a performance report comparing the new numbers with the baseline. Move the entries of `PublicAPI.Unshipped.txt` into `PublicAPI.Shipped.txt`, so later changes to the released API are reviewed as such.
 
 ---
 

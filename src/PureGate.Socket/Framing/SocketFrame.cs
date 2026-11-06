@@ -12,9 +12,9 @@ sealed class SocketFrame
   // A small integer whose meaning depends on the kind: credit amount (Credit), initial stream window
   // (StreamRequest), message window (handshake proof and ready).
   public int Value { get; set; }
-  public string Service { get; set; }
-  public string Operation { get; set; }
-  public string IdempotencyKey { get; set; }
+  public string Service { get; set; } = string.Empty;
+  public string Operation { get; set; } = string.Empty;
+  public string IdempotencyKey { get; set; } = string.Empty;
   public int Flags { get; set; }
   public int DeadlineMs { get; set; }
   public int ChunkIndex { get; set; }
@@ -40,6 +40,8 @@ sealed class SocketFrame
   // Bytes this frame holds against its connection's memory budget. Whoever takes the payload over takes
   // this over too; SocketPeer.ReleaseFrame gives back what is left.
   internal long ReservedBytes { get; set; }
+
+  internal bool PayloadIsPooled => PayloadValue.IsPooled;
 
   // Received payloads stay compressed until they are needed, so decompression happens off the read loop.
   internal bool IsCompressed => (Flags & SocketFrameFlags.PayloadCompressed) != 0;

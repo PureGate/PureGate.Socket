@@ -73,7 +73,7 @@ public interface ISocketMessageCodec
 }
 ```
 
-Typed calls (`RequestAsync<TRequest, TResponse>`, `SendEventAsync<T>`, `OpenStreamAsync<T>`, `SocketClient`) serialize into a buffer rented from the shared array pool and return it once the frame has been sent, so they allocate no payload array. `SocketClient` serializes once and reuses the buffer for every retry. Received payloads are read in place by `ReadPayload<T>(codec)`. The `byte[]` overloads remain for callers that already have bytes.
+Typed calls (`RequestAsync<TRequest, TResponse>`, `SendEventAsync<T>`, `OpenStreamAsync<T>`, `SocketClient`) serialize into a buffer rented from the shared array pool and return it once the frame has been sent, so they allocate no payload array. `RequestAsync<TRequest, TResponse>` also reads the response into a pooled buffer, because it only deserializes it, and returns the buffer straight after. `SocketClient` serializes once and reuses the buffer for every retry. Received payloads are read in place by `ReadPayload<T>(codec)`. The `byte[]` overloads remain for callers that already have bytes. A typed result is `null` when the payload is JSON `null`.
 
 `SocketResponse.Success(codec, value)` serializes when the response is sent, straight into a pooled buffer, so the value must not change after the handler returns. A value the codec cannot serialize fails that request with `handler_failed`. A response kept for idempotent retries, or whose `Payload` is read, is serialized once into an array instead.
 

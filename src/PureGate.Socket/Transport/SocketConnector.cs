@@ -88,7 +88,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
       }
     }
 
-    throw lastFailure;
+    throw lastFailure ?? new SocketException((int)SocketError.HostNotFound);
   }
 
   async ValueTask<(string NodeId, int MessageWindow)> RunClientHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
@@ -121,7 +121,8 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     if (!challengeFrame.Ok)
       throw new SocketProtocolException(challengeFrame.ErrorCode ?? SocketProtocolError.Unauthorized, challengeFrame.ErrorMessage ?? "Handshake rejected.");
 
-    var challenge = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeChallenge>(challengeFrame.PayloadMemory);
+    var challenge = SocketHandshakeJson.Codec.Deserialize<SocketHandshakeChallenge>(challengeFrame.PayloadMemory)
+        ?? throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid handshake challenge.");
     if (challenge.Version != SocketFabricOptions.CurrentProtocolVersion)
       throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
 

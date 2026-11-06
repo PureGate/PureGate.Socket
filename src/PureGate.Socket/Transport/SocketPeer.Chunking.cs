@@ -202,7 +202,7 @@ public sealed partial class SocketPeer
     public SocketFrame ToFrame(SocketFrameReader reader)
     {
       var buffer = Buffer;
-      Buffer = null;
+      Buffer = [];
       var frame = reader.DecodeBody(new System.Buffers.ReadOnlySequence<byte>(buffer, 0, TotalLength), buffer);
       if (frame.Kind != FirstFrame.OriginalKind || frame.MessageId != FirstFrame.MessageId)
       {

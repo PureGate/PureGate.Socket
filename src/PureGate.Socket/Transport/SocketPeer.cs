@@ -64,6 +64,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
     Handler = handler ?? EmptySocketPeerHandler.Shared;
     Reader = reader ?? throw new ArgumentNullException(nameof(reader));
     Reader.MaxFrameSizeBytes = Options.MaxFrameSizeBytes;
+    Reader.PoolPayload = PoolResponsePayload;
     Writer = new SocketFrameWriter(
         stream,
         Options.MaxFrameSizeBytes,

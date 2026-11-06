@@ -27,6 +27,10 @@ sealed class SocketFrameReader(
   // by metrics.
   internal long BytesRead;
 
+  // Asked before a response payload is read: true when it should go into a pooled buffer because the
+  // requester only deserializes it and never keeps the bytes. Set by the connection.
+  internal Func<SocketFrame, bool> PoolPayload { get; set; }
+
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketFrame> ReadAsync(CancellationToken cancellationToken)
   {
@@ -137,7 +141,8 @@ sealed class SocketFrameReader(
       frame.TotalPayloadLength = ReadInt32(ref reader);
     }
 
-    frame.SetPayload(ReadPayload(ref reader, kind, alias));
+    var pooled = kind == SocketMessageKind.Response && alias is null && PoolPayload?.Invoke(frame) == true;
+    frame.SetPayload(ReadPayload(ref reader, kind, alias, pooled));
     return FinishFrame(frame);
   }
 
@@ -178,7 +183,7 @@ sealed class SocketFrameReader(
     return ReadStringBytes(ref reader, length);
   }
 
-  static SocketPayload ReadPayload(ref SequenceReader<byte> reader, SocketMessageKind kind, byte[] alias)
+  static SocketPayload ReadPayload(ref SequenceReader<byte> reader, SocketMessageKind kind, byte[] alias, bool pooled)
   {
     var length = checked((int)reader.Remaining);
     if (length == 0)
@@ -193,9 +198,10 @@ sealed class SocketFrameReader(
 
     var source = reader.UnreadSequence;
     SocketPayload payload;
-    if (kind == SocketMessageKind.StreamItem)
+    if (kind == SocketMessageKind.StreamItem || pooled)
     {
-      // Stream data is pooled; the pull stream returns the buffer once the application has read it.
+      // Stream data is pooled; the pull stream returns the buffer once the application has read it. So is
+      // a typed request's response, returned once it has been deserialized.
       payload = SocketPayload.Rent(length);
       source.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsMemory(payload.Memory).Span);
     }

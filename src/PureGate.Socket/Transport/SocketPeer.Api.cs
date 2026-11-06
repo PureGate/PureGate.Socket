@@ -10,23 +10,17 @@ public sealed partial class SocketPeer
 {
   // The payload is serialized straight into a pooled buffer, returned once the request has been sent.
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-  public async ValueTask<SocketRequestResult> RequestAsync<TRequest>(
+  public ValueTask<SocketRequestResult> RequestAsync<TRequest>(
       string service,
       string operation,
       TRequest payload,
       CancellationToken cancellationToken = default)
   {
-    var serialized = SocketPayloadWriter.Serialize(Options.Codec, payload);
-    try
-    {
-      return await RequestPayloadAsync(service, operation, serialized, Options.RequestTimeout, idempotencyKey: null, cancellationToken);
-    }
-    finally
-    {
-      serialized.Dispose();
-    }
+    return SendTypedRequestAsync(service, operation, payload, pooledResponse: false, cancellationToken);
   }
 
+  // The response is deserialized here and its bytes never reach the caller, so they are read into a
+  // pooled buffer and returned right after.
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<TResponse> RequestAsync<TRequest, TResponse>(
       string service,
@@ -34,11 +28,43 @@ public sealed partial class SocketPeer
       TRequest payload,
       CancellationToken cancellationToken = default)
   {
-    var result = await RequestAsync(service, operation, payload, cancellationToken);
-    if (!result.Succeeded)
-      throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
+    var result = await SendTypedRequestAsync(service, operation, payload, pooledResponse: true, cancellationToken);
+    return ReadTypedResult<TResponse>(result, Options.Codec);
+  }
 
-    return result.ReadPayload<TResponse>(Options.Codec);
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+  async ValueTask<SocketRequestResult> SendTypedRequestAsync<TRequest>(
+      string service,
+      string operation,
+      TRequest payload,
+      bool pooledResponse,
+      CancellationToken cancellationToken)
+  {
+    var serialized = SocketPayloadWriter.Serialize(Options.Codec, payload);
+    try
+    {
+      return await RequestPayloadAsync(service, operation, serialized, Options.RequestTimeout, idempotencyKey: null, cancellationToken, pooledResponse);
+    }
+    finally
+    {
+      serialized.Dispose();
+    }
+  }
+
+  // Deserializes a typed result and releases its pooled payload, whatever happens.
+  internal static TResponse ReadTypedResult<TResponse>(SocketRequestResult result, ISocketMessageCodec codec)
+  {
+    try
+    {
+      if (!result.Succeeded)
+        throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
+
+      return result.ReadPayload<TResponse>(codec);
+    }
+    finally
+    {
+      result.ReleasePooled();
+    }
   }
 
   public ValueTask<SocketRequestResult> RequestAsync(
@@ -60,7 +86,8 @@ public sealed partial class SocketPeer
       SocketPayload payload,
       TimeSpan timeout,
       string idempotencyKey,
-      CancellationToken cancellationToken)
+      CancellationToken cancellationToken,
+      bool pooledResponse = false)
   {
     var frame = new SocketFrame
     {
@@ -70,28 +97,30 @@ public sealed partial class SocketPeer
       IdempotencyKey = idempotencyKey ?? string.Empty
     };
     frame.SetPayload(payload);
-    return RequestFrameAsync(frame, timeout, cancellationToken);
+    return RequestFrameAsync(frame, timeout, cancellationToken, pooledResponse);
   }
 
   // Measures the request only when a metrics listener is attached; otherwise this adds nothing.
   ValueTask<SocketRequestResult> RequestFrameAsync(
       SocketFrame frame,
       TimeSpan timeout,
-      CancellationToken cancellationToken)
+      CancellationToken cancellationToken,
+      bool pooledResponse)
   {
     var started = SocketMetrics.ClientRequestStarted();
     return started == 0
-        ? RequestFrameCoreAsync(frame, timeout, cancellationToken)
-        : MeasuredRequestFrameAsync(frame, timeout, cancellationToken, started);
+        ? RequestFrameCoreAsync(frame, timeout, cancellationToken, pooledResponse)
+        : MeasuredRequestFrameAsync(frame, timeout, cancellationToken, pooledResponse, started);
   }
 
   async ValueTask<SocketRequestResult> MeasuredRequestFrameAsync(
       SocketFrame frame,
       TimeSpan timeout,
       CancellationToken cancellationToken,
+      bool pooledResponse,
       long started)
   {
-    var result = await RequestFrameCoreAsync(frame, timeout, cancellationToken);
+    var result = await RequestFrameCoreAsync(frame, timeout, cancellationToken, pooledResponse);
     SocketMetrics.ClientRequestCompleted(frame.Service, frame.Operation, started, result.Succeeded ? null : result.ErrorCode);
     return result;
   }
@@ -100,7 +129,8 @@ public sealed partial class SocketPeer
   async ValueTask<SocketRequestResult> RequestFrameCoreAsync(
       SocketFrame frame,
       TimeSpan timeout,
-      CancellationToken cancellationToken)
+      CancellationToken cancellationToken,
+      bool pooledResponse)
   {
     ThrowIfClosed();
     if (!TryAcquireInFlight())
@@ -114,7 +144,7 @@ public sealed partial class SocketPeer
     }
 
     var messageId = Interlocked.Increment(ref NextMessageId);
-    var pending = RentPendingRequest(messageId);
+    var pending = RentPendingRequest(messageId, pooledResponse);
     var sentTicks = Environment.TickCount64;
     var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
     var requestTimeout = RentRequestCancellation();

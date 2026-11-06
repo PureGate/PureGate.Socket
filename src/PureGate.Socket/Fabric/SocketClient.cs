@@ -94,12 +94,23 @@ public sealed class SocketClient : IAsyncDisposable
     return await RequestAsync(service, operation, payload, SocketClientRequestOptions.Default, cancellationToken);
   }
 
-  public async ValueTask<SocketRequestResult> RequestAsync<TRequest>(
+  public ValueTask<SocketRequestResult> RequestAsync<TRequest>(
       string service,
       string operation,
       TRequest payload,
       SocketClientRequestOptions options,
       CancellationToken cancellationToken = default)
+  {
+    return SendAsync(service, operation, payload, options, pooledResponse: false, cancellationToken);
+  }
+
+  async ValueTask<SocketRequestResult> SendAsync<TRequest>(
+      string service,
+      string operation,
+      TRequest payload,
+      SocketClientRequestOptions options,
+      bool pooledResponse,
+      CancellationToken cancellationToken)
   {
     var retry = (options ?? SocketClientRequestOptions.Default).Normalize();
     var idempotencyKey = retry.Idempotent
@@ -109,7 +120,7 @@ public sealed class SocketClient : IAsyncDisposable
     var serialized = SocketPayloadWriter.Serialize(Options.Codec, payload);
     try
     {
-      return await RequestWithRetriesAsync(service, operation, serialized, retry, idempotencyKey, cancellationToken);
+      return await RequestWithRetriesAsync(service, operation, serialized, retry, idempotencyKey, pooledResponse, cancellationToken);
     }
     finally
     {
@@ -123,6 +134,7 @@ public sealed class SocketClient : IAsyncDisposable
       SocketPayload serialized,
       SocketClientRequestOptions retry,
       string idempotencyKey,
+      bool pooledResponse,
       CancellationToken cancellationToken)
   {
     for (var attempt = 1; ; attempt++)
@@ -140,9 +152,13 @@ public sealed class SocketClient : IAsyncDisposable
             serialized,
             TimeSpan.Zero,
             idempotencyKey,
-            cancellationToken);
+            cancellationToken,
+            pooledResponse);
         if (!ShouldRetry(result, retry, attempt))
           return result;
+
+        // A result that is retried is dropped, so its pooled payload (if any) goes back now.
+        result.ReleasePooled();
 
         // Before retrying a timeout, find out whether the connection is still alive. A half-open one is
         // closed by the check, so the retry goes out on a fresh connection instead of timing out again.
@@ -218,11 +234,9 @@ public sealed class SocketClient : IAsyncDisposable
       SocketClientRequestOptions options,
       CancellationToken cancellationToken = default)
   {
-    var result = await RequestAsync(service, operation, payload, options, cancellationToken);
-    if (!result.Succeeded)
-      throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
-
-    return result.ReadPayload<TResponse>(Options.Codec);
+    // Deserialized here, so the response bytes can be pooled and returned right after.
+    var result = await SendAsync(service, operation, payload, options, pooledResponse: true, cancellationToken);
+    return SocketPeer.ReadTypedResult<TResponse>(result, Options.Codec);
   }
 
   public async ValueTask SendEventAsync<TPayload>(

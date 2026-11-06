@@ -166,6 +166,21 @@ public sealed partial class SocketFabricTests
       Assert.That(cancelled.ErrorCode, Is.EqualTo(SocketProtocolError.Cancelled));
     }
 
+    // A typed response that arrives after its request timed out: nobody takes it, so the connection
+    // returns its pooled buffer.
+    await using (var impatient = await ConnectAsync(listener, new SocketFabricOptions
+    {
+      NodeId = "impatient",
+      MaxFrameSizeBytes = 64 * 1024,
+      RequestTimeout = TimeSpan.FromMilliseconds(50)
+    }))
+    {
+      var timedOut = await Assert.ThrowsAsync<SocketProtocolException>(async () =>
+          await impatient.RequestAsync<CodecOrder, CodecOrder>("orders", "slow", new CodecOrder(1, "late", 1m)));
+      Assert.That(timedOut.ErrorCode, Is.EqualTo(SocketProtocolError.Timeout));
+      await Task.Delay(400);
+    }
+
     var batch = await client.RequestBatchAsync(
         [new SocketBatchItem(1, "orders", "echo", client.Codec.Serialize(new CodecOrder(5, "batched", 5m)))],
         TimeSpan.FromSeconds(5));

@@ -14,6 +14,10 @@ public sealed partial class SocketPeer
     ManualResetValueTaskSourceCore<SocketRequestResult> Source;
     long ArmedMessageId;
 
+    // The requester deserializes the response and keeps no bytes, so its payload may be pooled. Set
+    // before the request is registered, so the read loop sees the value for this request.
+    public bool PooledResponse { get; set; }
+
     public PendingRequest()
     {
       Source.RunContinuationsAsynchronously = true;
@@ -35,10 +39,13 @@ public sealed partial class SocketPeer
       Interlocked.Exchange(ref ArmedMessageId, 0);
     }
 
-    public void TrySetResult(long messageId, SocketRequestResult result)
+    public bool TrySetResult(long messageId, SocketRequestResult result)
     {
-      if (messageId != 0 && Interlocked.CompareExchange(ref ArmedMessageId, 0, messageId) == messageId)
-        Source.SetResult(result);
+      if (messageId == 0 || Interlocked.CompareExchange(ref ArmedMessageId, 0, messageId) != messageId)
+        return false;
+
+      Source.SetResult(result);
+      return true;
     }
 
     // Used only by the timeout and cancellation callbacks, whose registrations are disposed before the
@@ -126,10 +133,11 @@ public sealed partial class SocketPeer
     }
   }
 
-  PendingRequest RentPendingRequest(long messageId)
+  PendingRequest RentPendingRequest(long messageId, bool pooledResponse)
   {
     if (!PendingRequestPool.TryDequeue(out var pending))
       pending = new PendingRequest();
+    pending.PooledResponse = pooledResponse;
     pending.Arm(messageId);
     return pending;
   }

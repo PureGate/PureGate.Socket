@@ -22,6 +22,15 @@ internal readonly struct SocketPayload : IDisposable
   public static SocketPayload Empty { get; } = new([], 0, 0, null);
 
   public int Length { get; }
+  internal bool IsPooled => Owner is not null;
+
+  // The pooled buffer's owner, for a holder that only needs to release it later (ReleaseOwner).
+  internal object OwnerToken => Owner;
+
+  internal static void ReleaseOwner(object owner)
+  {
+    (owner as SocketPayloadOwner)?.Release();
+  }
   public bool IsEmpty => Length == 0;
 
   public ReadOnlyMemory<byte> Memory => Length == 0

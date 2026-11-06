@@ -24,7 +24,16 @@ jobs:
         run: dotnet build PureGate.Socket.slnx -c Release
 
       - name: Test
-        run: dotnet test src/PureGate.Socket.Test -c Release --no-build --blame-hang-timeout 2m
+        run: dotnet test src/PureGate.Socket.Test -c Release --no-build --blame-hang-timeout 2m --collect:"XPlat Code Coverage" --results-directory artifacts/coverage
+
+      # Fails the build when line coverage of the library drops below 85%.
+      - name: Coverage gate
+        shell: bash
+        run: |
+          file=$(find artifacts/coverage -name coverage.cobertura.xml | head -1)
+          rate=$(grep -oE '<coverage line-rate="[0-9.]+"' "$file" | grep -oE '[0-9]+\.[0-9]+')
+          echo "Line coverage: $rate"
+          awk -v rate="$rate" 'BEGIN { exit !(rate >= 0.85) }' || { echo "::error::Line coverage $rate is below 0.85"; exit 1; }
 
       # Races only show up across many runs, so run the suite repeatedly.
       - name: Test (repeated x20)

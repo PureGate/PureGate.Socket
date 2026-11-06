@@ -186,7 +186,7 @@ public static class SocketMetrics
   {
     return exception is SocketProtocolException protocol
         ? protocol.ErrorCode
-        : exception.GetType().FullName;
+        : exception.GetType().FullName ?? exception.GetType().Name;
   }
 
   static string KindName(SocketMessageKind kind)

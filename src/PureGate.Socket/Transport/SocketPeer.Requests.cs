@@ -152,17 +152,43 @@ public sealed partial class SocketPeer
 
   void DispatchResponse(SocketFrame frame)
   {
-    if (!PendingRequests.TryGetValue(frame.MessageId, out var pending))
+    // The reader looked the request up a moment ago, on this same thread (see PoolResponsePayload).
+    var pending = LookedUpId == frame.MessageId ? LookedUp : null;
+    LookedUp = null;
+    if (pending is null && !PendingRequests.TryGetValue(frame.MessageId, out pending))
       return;
 
-    pending.TrySetResult(frame.MessageId, new SocketRequestResult
+    // A pooled payload (typed requests only) moves to the result; the requester releases it.
+    var payload = frame.PayloadMemory;
+    var owned = frame.PayloadIsPooled ? frame.TakePayload() : SocketPayload.Empty;
+    var delivered = pending.TrySetResult(frame.MessageId, new SocketRequestResult
     {
       Succeeded = frame.Ok,
-      Payload = frame.PayloadMemory,
+      Payload = payload,
+      Owner = owned.OwnerToken,
       PayloadCompressed = frame.IsCompressed,
       ErrorCode = frame.ErrorCode,
       ErrorMessage = frame.ErrorMessage
     });
+
+    // Too late (the request already timed out or was cancelled): nobody will release it.
+    if (!delivered)
+      owned.Dispose();
+  }
+
+  // Reader callback for each response, before its payload is read. Runs on the read loop, which then
+  // dispatches that same frame before reading another, so the lookup is kept for DispatchResponse.
+  long LookedUpId;
+  PendingRequest LookedUp;
+
+  bool PoolResponsePayload(SocketFrame frame)
+  {
+    if (!PendingRequests.TryGetValue(frame.MessageId, out var pending))
+      return false;
+
+    LookedUpId = frame.MessageId;
+    LookedUp = pending;
+    return pending.PooledResponse;
   }
 
   async ValueTask<SocketResponse> HandleBatchRequestAsync(
