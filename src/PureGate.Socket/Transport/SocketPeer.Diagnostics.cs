@@ -1,8 +1,8 @@
 namespace PureGate.Socket.Transport;
 
-// A point-in-time count of the per-connection state that must drain once traffic stops. Used by the
-// soak tests to catch leaks; every field is read without locking, so a busy connection gives an
-// approximate picture.
+// A point-in-time view of one connection: the per-connection state that must drain once traffic stops
+// (checked by the soak tests), plus totals read by SocketMetrics. Fields are read without locking, so a
+// busy connection gives an approximate picture.
 internal readonly record struct SocketPeerDiagnostics(
     int InFlight,
     int PendingRequests,
@@ -14,7 +14,10 @@ internal readonly record struct SocketPeerDiagnostics(
     int ActiveWriters,
     int IncomingChunks,
     long IncomingChunkBytes,
-    int EventLanes)
+    int EventLanes,
+    long MemoryInUse,
+    long BytesSent,
+    long BytesReceived)
 {
   public bool IsIdle =>
       InFlight == 0
@@ -27,7 +30,8 @@ internal readonly record struct SocketPeerDiagnostics(
       && ActiveWriters == 0
       && IncomingChunks == 0
       && IncomingChunkBytes == 0
-      && EventLanes == 0;
+      && EventLanes == 0
+      && MemoryInUse == 0;
 }
 
 public sealed partial class SocketPeer
@@ -51,7 +55,10 @@ public sealed partial class SocketPeer
           Volatile.Read(ref ActiveWriters),
           IncomingChunks.Count,
           Interlocked.Read(ref IncomingChunkBytes),
-          lanes);
+          lanes,
+          MemoryBudget.InUse,
+          Volatile.Read(ref Writer.BytesWritten),
+          Volatile.Read(ref Reader.BytesRead));
     }
   }
 }

@@ -35,7 +35,7 @@ public sealed partial class SocketPeer
         finally
         {
           if (releasePayload)
-            frame.ReleasePayload();
+            ReleaseFrame(frame);
         }
       }
     }
@@ -60,6 +60,12 @@ public sealed partial class SocketPeer
       case SocketMessageKind.Request:
       case SocketMessageKind.StreamRequest:
       case SocketMessageKind.Event:
+        if (!TryReserveFrame(frame))
+        {
+          RejectOverBudget(frame.Kind, frame.MessageId, creditTaken: true);
+          return true;
+        }
+
         // Message credits guarantee the queue has room; a full queue means the peer overran its credit.
         if (!TryEnqueueHandlerFrame(frame))
           throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Peer sent more messages than its credit allows.");

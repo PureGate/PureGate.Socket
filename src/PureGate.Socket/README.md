@@ -24,7 +24,8 @@ See [CLUSTER_GUIDE.md](CLUSTER_GUIDE.md) for the socket-side contract future Pur
 - Maximum frame size enforcement.
 - Transparent chunking for payloads larger than one frame.
 - Chunked message identity, timeout, and in-progress count limits.
-- Optional Brotli frame payload compression.
+- A per-connection memory budget (`MaxConnectionMemoryBytes`) over everything held for the remote.
+- Optional Brotli frame payload compression, decompressed off the read loop with pooled buffers.
 - Decompressed payload size enforcement.
 - Bounded handler concurrency and queueing.
 - Pluggable payload codec.
@@ -32,7 +33,8 @@ See [CLUSTER_GUIDE.md](CLUSTER_GUIDE.md) for the socket-side contract future Pur
 - Pluggable request/event authorization.
 - Pluggable stream filter for TLS/mTLS or other transport wrapping.
 - Built-in TLS/mTLS stream filter.
-- Metrics/logging observer hooks.
+- Metrics through `System.Diagnostics.Metrics` (meter `PureGate.Socket`).
+- Logging observer hooks.
 - Composite observer for combining registry, metrics, and logging.
 - Accept/handshake failure observer hook.
 - Graceful close frame on peer disposal.
@@ -58,6 +60,42 @@ Each side controls how much the other may send it:
 - **Streams.** A producer sends only what the consumer has room for: `StreamWindowBytes` to start (1 MB by default), with more granted as the application reads. When the consumer runs out of data while the producer is waiting for room, the window doubles, up to `MaxStreamWindowBytes` (64 MB by default). A slow or stalled reader holds back only its own stream, never the connection.
 
 Because nothing a peer sends can exceed what it was granted, the connection's read loop never waits, and two peers flooding each other cannot deadlock. A peer that sends more than it was granted is closed.
+
+## Memory budget
+
+Credits bound how many messages a peer can queue and windows bound each stream, but not their sizes added up. `MaxConnectionMemoryBytes` (256 MB by default) caps the total one connection holds for its remote: chunked messages being reassembled, received requests, stream requests and events until their handler finishes, decompressed payloads, and stream data the application has not read yet. Responses are not counted once they reach the caller.
+
+A message that does not fit is refused without closing the connection where its kind allows:
+
+- A request or stream request is answered with `overloaded`; the sender can retry.
+- A stream whose data does not fit fails with `overloaded` and its producer is told to stop. Other streams continue.
+- A response that does not fit fails its request with `overloaded`.
+- An event closes the connection with `overloaded`, because closing is the only signal an event's sender gets.
+
+Compressed payloads are decompressed where they are used, never on the read loop: requests, stream requests and events by the handler worker before the handler runs, responses on the caller's thread. Stream data is decompressed as it arrives, but never past the bytes the producer may still send. Decompression is bounded by `MaxDecompressedPayloadSizeBytes` and by the budget, so a small compressed payload cannot expand into unbounded work or memory.
+
+## Metrics
+
+Metrics are published through `System.Diagnostics.Metrics` under the meter `PureGate.Socket` (`SocketMetrics.MeterName`). Collect them with OpenTelemetry (`.AddMeter("PureGate.Socket")`), `dotnet-counters monitor --counters PureGate.Socket`, or a `MeterListener`. Nothing is measured until a listener subscribes.
+
+| Instrument | Unit | Tags |
+|---|---|---|
+| `puregate.socket.client.request.duration` | s | `rpc.service`, `rpc.method`, `error.type` |
+| `puregate.socket.server.request.duration` | s | `rpc.service`, `rpc.method`, `error.type` |
+| `puregate.socket.events.sent`, `puregate.socket.events.received` | {event} | `rpc.service`, `rpc.method` |
+| `puregate.socket.connections` | {connection} | |
+| `puregate.socket.connections.closed` | {connection} | `error.type` when the connection failed |
+| `puregate.socket.handshake.failures` | {handshake} | `role` (client, server), `error.type` |
+| `puregate.socket.bytes.sent`, `puregate.socket.bytes.received` | By | |
+| `puregate.socket.requests.in_flight` | {request} | |
+| `puregate.socket.handlers.queued`, `puregate.socket.handlers.active` | {message}, {worker} | |
+| `puregate.socket.streams.active` | {stream} | `direction` (in, out) |
+| `puregate.socket.memory.used` | By | |
+| `puregate.socket.memory.rejections` | {message} | `message.kind` |
+| `puregate.socket.flow_control.waits` | {wait} | |
+| `puregate.socket.liveness.failures` | {connection} | |
+
+Request durations use buckets from 50 µs to 10 s. `error.type` is the error code (for example `timeout` or `overloaded`) and is absent on success.
 
 ## Security
 
@@ -105,7 +143,7 @@ Frame reading and writing use `System.IO.Pipelines` internally. The public API s
 - `Protocol`: frame-level options, message kinds, errors, requests, and responses.
 - `Security`: handshake authentication and per-message authorization.
 - `Serialization`: payload codecs.
-- `Observability`: observer hooks and observer composition.
+- `Observability`: observer hooks and observer composition, and `SocketMetrics`.
 - `Fabric`: lifecycle and topology helpers such as reconnecting clients and peer registries.
 
 ## Benchmarks

@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Buffers.Binary;
-using System.IO.Compression;
 using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -13,8 +12,7 @@ namespace PureGate.Socket.Framing;
 sealed class SocketFrameReader(
     Stream stream,
     int maxFrameSizeBytes,
-    SocketPayloadCompression compression = SocketPayloadCompression.None,
-    int maxDecompressedPayloadSizeBytes = 128 * 1024 * 1024)
+    SocketPayloadCompression compression = SocketPayloadCompression.None)
 {
   const int MinimumReadHint = 4096;
 
@@ -24,6 +22,10 @@ sealed class SocketFrameReader(
   // Starts at the handshake limit; SocketPeer raises it to MaxFrameSizeBytes once the peer has
   // authenticated.
   internal int MaxFrameSizeBytes { get; set; } = maxFrameSizeBytes;
+
+  // Bytes of complete frames read so far, length prefixes included. Written by the reading thread, read
+  // by metrics.
+  internal long BytesRead;
 
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketFrame> ReadAsync(CancellationToken cancellationToken)
@@ -84,6 +86,7 @@ sealed class SocketFrameReader(
       return false;
     }
 
+    BytesRead += 4L + length;
     var body = buffer.Slice(reader.Position, length);
     consumed = buffer.GetPosition(length, reader.Position);
     frame = DecodeBody(body, alias: null);
@@ -208,60 +211,17 @@ sealed class SocketFrameReader(
     return payload;
   }
 
-  // Final step of every decode: decompresses a compressed payload.
+  // Final step of every decode. A compressed payload is left compressed (see SocketCompression): the
+  // connection decompresses it where it is used, not on the read loop. Only support is checked here.
   SocketFrame FinishFrame(SocketFrame frame)
   {
-    try
-    {
-      if ((frame.Flags & SocketFrameFlags.PayloadCompressed) != 0)
-      {
-        if (compression != SocketPayloadCompression.Brotli)
-          throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Compressed payload is not supported by this peer.");
-
-        frame.Payload = DecompressBrotli(frame.PayloadMemory.Span);
-        frame.Flags &= ~SocketFrameFlags.PayloadCompressed;
-      }
-    }
-    catch
+    if (frame.IsCompressed && compression != SocketPayloadCompression.Brotli)
     {
       frame.ReleasePayload();
-      throw;
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Compressed payload is not supported by this peer.");
     }
 
     return frame;
-  }
-
-  byte[] DecompressBrotli(ReadOnlySpan<byte> payload)
-  {
-    using var input = new MemoryStream(payload.ToArray());
-    using var brotli = new BrotliStream(input, CompressionMode.Decompress);
-    using var output = new MemoryStream();
-    var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
-    try
-    {
-      while (true)
-      {
-        var read = brotli.Read(buffer, 0, buffer.Length);
-        if (read == 0)
-          break;
-
-        if (output.Length + read > maxDecompressedPayloadSizeBytes)
-          throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Decompressed payload exceeds the configured maximum size.");
-
-        output.Write(buffer, 0, read);
-      }
-    }
-    catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or IOException)
-    {
-      // Corrupt compressed data is the peer's fault, so it is a protocol violation like any other.
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Compressed payload is corrupt.");
-    }
-    finally
-    {
-      ArrayPool<byte>.Shared.Return(buffer);
-    }
-
-    return output.ToArray();
   }
 
   static byte ReadByte(ref SequenceReader<byte> reader)

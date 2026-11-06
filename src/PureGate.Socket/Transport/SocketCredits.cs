@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 namespace PureGate.Socket.Transport;
 
 // Connection-level message credits: how many more handler-bound messages (requests, fast requests,
@@ -74,6 +75,8 @@ sealed class MessageCredits(long initial)
       await waiter.Task;
       return;
     }
+
+    SocketMetrics.CreditWaited();
 
     using var registration = cancellationToken.UnsafeRegister(
         static state =>

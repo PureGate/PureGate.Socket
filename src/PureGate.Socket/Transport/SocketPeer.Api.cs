@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
@@ -55,8 +56,31 @@ public sealed partial class SocketPeer
     }, timeout, cancellationToken);
   }
 
+  // Measures the request only when a metrics listener is attached; otherwise this adds nothing.
+  ValueTask<SocketRequestResult> RequestFrameAsync(
+      SocketFrame frame,
+      TimeSpan timeout,
+      CancellationToken cancellationToken)
+  {
+    var started = SocketMetrics.ClientRequestStarted();
+    return started == 0
+        ? RequestFrameCoreAsync(frame, timeout, cancellationToken)
+        : MeasuredRequestFrameAsync(frame, timeout, cancellationToken, started);
+  }
+
+  async ValueTask<SocketRequestResult> MeasuredRequestFrameAsync(
+      SocketFrame frame,
+      TimeSpan timeout,
+      CancellationToken cancellationToken,
+      long started)
+  {
+    var result = await RequestFrameCoreAsync(frame, timeout, cancellationToken);
+    SocketMetrics.ClientRequestCompleted(frame.Service, frame.Operation, started, result.Succeeded ? null : result.ErrorCode);
+    return result;
+  }
+
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-  async ValueTask<SocketRequestResult> RequestFrameAsync(
+  async ValueTask<SocketRequestResult> RequestFrameCoreAsync(
       SocketFrame frame,
       TimeSpan timeout,
       CancellationToken cancellationToken)
@@ -116,6 +140,8 @@ public sealed partial class SocketPeer
       }
 
       var result = await pending.Task;
+      if (result.PayloadCompressed)
+        result = DecompressResult(result);
       if (result.ErrorCode is SocketProtocolError.Timeout or SocketProtocolError.Cancelled)
         SendCancelInBackground(messageId);
       if (result.ErrorCode == SocketProtocolError.Timeout)
@@ -213,7 +239,8 @@ public sealed partial class SocketPeer
         Options.StreamWindowBytes,
         Options.MaxStreamWindowBytes,
         amount => SendCreditInBackground(messageId, amount),
-        () => SendCancelInBackground(messageId));
+        () => SendCancelInBackground(messageId),
+        MemoryBudget.Release);
     var pending = new PendingStream(stream);
     var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
     using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Lifetime.Token);
@@ -331,6 +358,8 @@ public sealed partial class SocketPeer
       RefundUnsentMessage(frame);
       throw;
     }
+
+    SocketMetrics.EventSent(frame.Service, frame.Operation);
   }
 
   public async ValueTask<IReadOnlyList<SocketBatchResult>> RequestBatchAsync(

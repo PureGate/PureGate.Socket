@@ -24,6 +24,7 @@ sealed class SocketPullStream : Stream
   readonly Channel<SocketStreamChunk> Chunks;
   readonly Action<long> SendCredit;
   readonly Action OnDispose;
+  readonly Action<long> ReleaseMemory;
   readonly long MaxWindow;
   SocketStreamChunk Current;
   int Offset;
@@ -46,7 +47,8 @@ sealed class SocketPullStream : Stream
       long initialWindow,
       long maxWindow,
       Action<long> sendCredit,
-      Action onDispose)
+      Action onDispose,
+      Action<long> releaseMemory = null)
   {
     Chunks = Channel.CreateUnbounded<SocketStreamChunk>(new UnboundedChannelOptions
     {
@@ -58,10 +60,14 @@ sealed class SocketPullStream : Stream
     Granted = initialWindow;
     SendCredit = sendCredit;
     OnDispose = onDispose;
+    ReleaseMemory = releaseMemory;
   }
 
   // The current window. Read it only from the consumer's thread, or after reading has finished.
   internal long WindowBytes => Window;
+
+  // Bytes the producer may still send. Read loop only.
+  internal long RemainingWindow => Interlocked.Read(ref Granted) - Volatile.Read(ref Received);
 
   public override bool CanRead => true;
   public override bool CanSeek => false;
@@ -79,21 +85,23 @@ sealed class SocketPullStream : Stream
   // touches Current or reads from the channel. The producer side only writes to and completes the
   // channel, so it can never release a buffer the consumer is still copying from.
 
-  // Read loop. Returns false when the chunk exceeds the granted window (a protocol violation).
-  public bool TryWriteChunk(SocketPayload payload, bool producerWaiting)
+  // Read loop. Returns false when the chunk exceeds the granted window (a protocol violation). reserved is
+  // what the chunk holds against the connection's memory budget; it is given back once the chunk has been
+  // read or dropped.
+  public bool TryWriteChunk(SocketPayload payload, long reserved, bool producerWaiting)
   {
+    var chunk = new SocketStreamChunk(payload, reserved, ReleaseMemory);
     var received = Volatile.Read(ref Received) + payload.Length;
     Volatile.Write(ref Received, received);
     if (received > Interlocked.Read(ref Granted))
     {
-      payload.Dispose();
+      chunk.Dispose();
       return false;
     }
 
     // Tracks the latest frame: data that keeps arriving unflagged means the producer has window to spare.
     Volatile.Write(ref ProducerWaiting, producerWaiting ? 1 : 0);
 
-    var chunk = new SocketStreamChunk(payload);
     if (!Chunks.Writer.TryWrite(chunk))
     {
       // The consumer disposed the stream; chunks still in flight before the producer sees the cancel
@@ -242,10 +250,14 @@ sealed class SocketPullStream : Stream
   readonly struct SocketStreamChunk : IDisposable
   {
     readonly SocketPayload Payload;
+    readonly long Reserved;
+    readonly Action<long> ReleaseMemory;
 
-    public SocketStreamChunk(SocketPayload payload)
+    public SocketStreamChunk(SocketPayload payload, long reserved, Action<long> releaseMemory)
     {
       Payload = payload;
+      Reserved = reserved;
+      ReleaseMemory = releaseMemory;
     }
 
     public ReadOnlyMemory<byte> Memory => Payload.Memory;
@@ -254,6 +266,8 @@ sealed class SocketPullStream : Stream
     public void Dispose()
     {
       Payload.Dispose();
+      if (Reserved > 0)
+        ReleaseMemory?.Invoke(Reserved);
     }
   }
 }

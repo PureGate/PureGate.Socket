@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
@@ -15,6 +16,7 @@ public sealed partial class SocketPeer
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask DispatchRequestAsync(SocketFrame frame)
   {
+    var metricsStarted = SocketMetrics.ServerRequestStarted();
     SocketResponse response;
     var active = new ActiveRequest();
     var requestTimeout = active.Source;
@@ -51,6 +53,7 @@ public sealed partial class SocketPeer
       }
 
       response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Request was not handled.");
+      SocketMetrics.ServerRequestCompleted(frame.Service, frame.Operation, metricsStarted, response.Succeeded ? null : response.ErrorCode);
       ObserveRequestCompleted(frame, response);
       await WriteFrameAsync(new SocketFrame
       {
@@ -113,6 +116,7 @@ public sealed partial class SocketPeer
           this,
           socketEvent,
           Lifetime.Token);
+      SocketMetrics.EventReceived(frame.Service, frame.Operation);
     }
     catch (Exception) when (Lifetime.IsCancellationRequested)
     {
@@ -133,6 +137,7 @@ public sealed partial class SocketPeer
     {
       Succeeded = frame.Ok,
       Payload = frame.PayloadMemory,
+      PayloadCompressed = frame.IsCompressed,
       ErrorCode = frame.ErrorCode,
       ErrorMessage = frame.ErrorMessage
     });

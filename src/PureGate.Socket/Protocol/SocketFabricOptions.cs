@@ -16,7 +16,11 @@ public sealed class SocketFabricOptions
   public int MaxDecompressedPayloadSizeBytes { get; init; } = 128 * 1024 * 1024;
   public int MaxChunkPayloadBytes { get; init; } = 256 * 1024;
   public int MaxChunkedMessages { get; init; } = 1024;
-  public long MaxChunkedBytesInProgress { get; init; } = 256L * 1024 * 1024;
+  // Memory one connection may hold for its remote peer: chunked messages being reassembled, received
+  // messages until their handler finishes, decompressed payloads and unread stream data (see
+  // SocketMemoryBudget). Past it, requests and stream requests are refused with overloaded, a stream
+  // whose data does not fit fails with overloaded, and an event closes the connection.
+  public long MaxConnectionMemoryBytes { get; init; } = 256L * 1024 * 1024;
   public int MaxInFlightRequests { get; init; } = 1024;
   public int MaxConcurrentHandlers { get; init; } = 16;
   public int MaxQueuedHandlers { get; init; } = 4096;
@@ -88,7 +92,7 @@ public sealed class SocketFabricOptions
       MaxDecompressedPayloadSizeBytes = Math.Clamp(MaxDecompressedPayloadSizeBytes, 1024, 1024 * 1024 * 1024),
       MaxChunkPayloadBytes = Math.Clamp(MaxChunkPayloadBytes, 1, Math.Max(1, MaxFrameSizeBytes / 4)),
       MaxChunkedMessages = Math.Clamp(MaxChunkedMessages, 1, 100_000),
-      MaxChunkedBytesInProgress = Math.Clamp(MaxChunkedBytesInProgress, 1024, 16L * 1024 * 1024 * 1024),
+      MaxConnectionMemoryBytes = Math.Clamp(MaxConnectionMemoryBytes, 64 * 1024, 64L * 1024 * 1024 * 1024),
       MaxInFlightRequests = Math.Clamp(MaxInFlightRequests, 1, 100_000),
       MaxConcurrentHandlers = Math.Clamp(MaxConcurrentHandlers, 1, 1024),
       MaxQueuedHandlers = Math.Clamp(MaxQueuedHandlers, 1, 100_000),

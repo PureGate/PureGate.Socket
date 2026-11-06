@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
 
@@ -59,6 +60,7 @@ public sealed partial class SocketPeer
     if (Volatile.Read(ref LastReceivedTicks) >= started)
       return true;
 
+    SocketMetrics.LivenessFailed();
     await CloseAsync(new SocketProtocolException(SocketProtocolError.Timeout, "The remote did not answer a liveness probe."));
     return false;
   }

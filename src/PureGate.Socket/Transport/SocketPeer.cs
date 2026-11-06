@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Threading.Channels;
@@ -59,6 +60,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
     RemoteNodeId = remoteNodeId ?? string.Empty;
     MessageCredits = new MessageCredits(remoteMessageWindow);
     Options = options.Normalize();
+    MemoryBudget = new SocketMemoryBudget(Options.MaxConnectionMemoryBytes);
     Handler = handler ?? EmptySocketPeerHandler.Shared;
     Reader = reader ?? throw new ArgumentNullException(nameof(reader));
     Reader.MaxFrameSizeBytes = Options.MaxFrameSizeBytes;
@@ -68,6 +70,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
         Options.PayloadCompression,
         Options.CompressionMinPayloadBytes,
         useMethodTable: true);
+    SocketMetrics.Opened(this);
     State = SocketPeerState.Connected;
     ConnectedTask = Task.Run(NotifyConnectedAsync);
     ReadTask = Task.Run(ReadLoopAsync);
@@ -106,7 +109,6 @@ public sealed partial class SocketPeer : IAsyncDisposable
     return new SocketFrameReader(
         stream,
         options.MaxHandshakeFrameBytes,
-        options.PayloadCompression,
-        options.MaxDecompressedPayloadSizeBytes);
+        options.PayloadCompression);
   }
 }

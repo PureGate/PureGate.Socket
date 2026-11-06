@@ -15,8 +15,10 @@ Targets **.NET 10**.
 - **Idempotency**: a built-in cache so retried requests are not executed twice.
 - **Compact wire protocol**: a request costs a few header bytes after its method's first use; see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Chunking and compression**: large payloads are split into frames and can be compressed.
+- **Memory budget**: each connection caps what it holds for its remote, and refuses what does not fit instead of running out of memory.
 - **Security**: pluggable authentication and authorization (`ISocketAuthenticator`, `ISocketAuthorizer`), with an HMAC authenticator that supports per-node secrets. TLS and mTLS are available through `TlsSocketStreamFilter`, which can bind node IDs to certificates. Handshake frame size, pending handshakes and connection counts are limited before a peer authenticates.
 - **Serialization**: JSON codec by default, raw codec for byte payloads, or implement `ISocketMessageCodec`.
+- **Metrics**: request latency, connections, bytes, queues, memory and flow control through `System.Diagnostics.Metrics` (meter `PureGate.Socket`), ready for OpenTelemetry.
 - **Observability**: hook in with `ISocketObserver`; combine several with `CompositeSocketObserver`.
 - **Client fabric**: `SocketClient` with a peer registry and peer selection policies.
 

@@ -8,8 +8,8 @@ public sealed partial class SocketPeer
   static readonly long ChunkPruneIntervalTicks = TimeSpan.FromSeconds(1).Ticks;
 
   // Only the read loop touches the chunk state below, so it needs no synchronization.
-  // IncomingChunkBytes is the allocated capacity of every reassembly buffer, not the bytes received, so
-  // MaxChunkedBytesInProgress bounds real memory.
+  // IncomingChunkBytes is the allocated capacity of every reassembly buffer, not the bytes received; that
+  // capacity is what is reserved from the connection's memory budget.
   long IncomingChunkBytes;
   long LastChunkPruneTicks = DateTimeOffset.UtcNow.UtcTicks;
 
@@ -39,23 +39,45 @@ public sealed partial class SocketPeer
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Chunk is out of order or inconsistent with its message.");
     }
 
-    var capacity = incoming.PlanCapacity(frame.PayloadLength, Options.MaxChunkedBytesInProgress - IncomingChunkBytes);
-    if (capacity < 0)
-      throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Chunked messages in progress exceed the configured memory budget.");
+    // A message that does not fit is dropped and refused (its remaining chunks find no entry and are
+    // dropped too), so one oversized message does not cost the connection.
+    var capacity = incoming.PlanCapacity(frame.PayloadLength, MemoryBudget.Available);
+    if (capacity < 0 || !MemoryBudget.TryReserve(capacity - incoming.Capacity))
+    {
+      RemoveIncomingChunks(key, incoming);
+      RejectOverBudget(frame.OriginalKind, frame.MessageId, creditTaken: true);
+      return null;
+    }
 
     IncomingChunkBytes += capacity - incoming.Capacity;
     incoming.Append(frame, capacity);
     if (!incoming.Completed)
       return null;
 
-    RemoveIncomingChunks(key, incoming);
-    return incoming.ToFrame(Reader);
+    // The reassembly buffer becomes the frame's payload, so its reservation moves to the frame.
+    IncomingChunks.TryRemove(key, out _);
+    IncomingChunkBytes -= incoming.Capacity;
+    var reserved = (long)incoming.Capacity;
+    try
+    {
+      var whole = incoming.ToFrame(Reader);
+      whole.ReservedBytes = reserved;
+      return whole;
+    }
+    catch
+    {
+      MemoryBudget.Release(reserved);
+      throw;
+    }
   }
 
   void RemoveIncomingChunks(ChunkKey key, IncomingChunkedFrame incoming)
   {
-    if (IncomingChunks.TryRemove(key, out _))
-      IncomingChunkBytes -= incoming.Capacity;
+    if (!IncomingChunks.TryRemove(key, out _))
+      return;
+
+    IncomingChunkBytes -= incoming.Capacity;
+    MemoryBudget.Release(incoming.Capacity);
   }
 
   // A message expires when no chunk for it has arrived for ChunkTimeout. Measuring from the last chunk,

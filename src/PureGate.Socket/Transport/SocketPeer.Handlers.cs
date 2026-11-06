@@ -108,7 +108,7 @@ public sealed partial class SocketPeer
         while (lane.Waiting.TryDequeue(out var frame))
         {
           Interlocked.Decrement(ref QueuedHandlerFrames);
-          frame.ReleasePayload();
+          ReleaseFrame(frame);
         }
       }
 
@@ -149,7 +149,7 @@ public sealed partial class SocketPeer
         ReturnMessageCredit();
         if (Lifetime.IsCancellationRequested)
         {
-          frame.ReleasePayload();
+          ReleaseFrame(frame);
           continue;
         }
 
@@ -173,6 +173,9 @@ public sealed partial class SocketPeer
   {
     try
     {
+      if (frame.IsCompressed && !TryDecompressHandlerFrame(frame))
+        return;
+
       switch (frame.Kind)
       {
         case SocketMessageKind.Request:
@@ -182,15 +185,7 @@ public sealed partial class SocketPeer
           await DispatchStreamRequestAsync(frame);
           break;
         case SocketMessageKind.Event:
-          try
-          {
-            await DispatchEventAsync(frame);
-          }
-          finally
-          {
-            ReleaseLane(frame);
-          }
-
+          await DispatchEventAsync(frame);
           break;
       }
     }
@@ -206,7 +201,9 @@ public sealed partial class SocketPeer
     }
     finally
     {
-      frame.ReleasePayload();
+      if (frame.Kind == SocketMessageKind.Event)
+        ReleaseLane(frame);
+      ReleaseFrame(frame);
     }
   }
 
@@ -215,7 +212,7 @@ public sealed partial class SocketPeer
     while (HandlerQueue.TryDequeue(out var frame))
     {
       Interlocked.Decrement(ref QueuedHandlerFrames);
-      frame.ReleasePayload();
+      ReleaseFrame(frame);
     }
 
     DrainEventLanes();

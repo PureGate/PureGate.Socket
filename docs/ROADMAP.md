@@ -21,10 +21,7 @@ Phases 0 (safety net) and 1 (local bug fixes) are done, and so are flow control,
 
 The wire format is specified in [PROTOCOL.md](PROTOCOL.md). Still to do:
 
-- **Compression:**
-  - Use span-based Brotli with pooled buffers, with no `MemoryStream`.
-  - Decompress within a memory budget, off the read loop, so a large compressed frame cannot stall it.
-  - Benchmark Deflate as a cheaper alternative. Zstandard isn't in the .NET 10 base library, so it would need a third-party package; benchmark it before deciding whether that's worth a dependency.
+- **Compression:** benchmark Deflate as a cheaper alternative to Brotli, and compress with span-based Brotli and pooled buffers on the send side too (receiving already does). Zstandard isn't in the .NET 10 base library, so it would need a third-party package; benchmark it before deciding whether that's worth a dependency.
 - **Handshake binding:** derive a session key from the handshake nonces (HKDF). Optionally sign every frame when TLS isn't used.
 
 ## Phase 4 — Zero-copy, low-allocation APIs
@@ -40,8 +37,6 @@ The wire format is specified in [PROTOCOL.md](PROTOCOL.md). Still to do:
 - **Coverage-guided fuzzing:** run SharpFuzz on the frame decoder, batch codecs, chunk reassembly and handshake, and add the crashes it finds to the seeded NUnit fuzz tests.
 - **More chaos scenarios:** duplicate connections from one node ID, and peers that read very slowly at the socket level.
 - **Systematic concurrency testing** with Microsoft Coyote on the request and stream lifecycles (optional).
-- **A per-connection memory budget** covering chunk reassembly, queued handlers and stream buffers together.
-- **Metrics** through the built-in `System.Diagnostics.Metrics`.
 - **Gates:** at least 85% line coverage and every decoder branch covered. Add a public-API analyzer and turn on nullable annotations (deferred until Phases 2–4 have reshaped the public API).
 
 ## Phase 6 — Release

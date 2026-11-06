@@ -57,6 +57,10 @@ sealed class SocketFrameWriter(
   //
   // The payload is payloadOverride when non-empty, otherwise the frame's own payload. Compression is
   // decided here and only changes the flags and bytes encoded; the frame itself is never modified.
+  // Bytes encoded so far, length prefixes included. Written by the encoding thread (under the connection's
+  // write lock), read by metrics.
+  internal long BytesWritten;
+
   public OversizedFrame Encode(SocketFrame frame, ReadOnlyMemory<byte> payloadOverride)
   {
     frame ??= new SocketFrame();
@@ -83,6 +87,7 @@ sealed class SocketFrameWriter(
       layout.Write(span, ref offset, frame);
       payload.Span.CopyTo(span.Slice(offset));
       Writer.Advance(4 + (int)bodyLength);
+      BytesWritten += 4 + bodyLength;
       if (method.Defines)
         Methods[(frame.Service, frame.Operation)] = method.Id;
       return null;
@@ -136,6 +141,7 @@ sealed class SocketFrameWriter(
     first.CopyTo(span.Slice(offset));
     second.CopyTo(span.Slice(offset + first.Length));
     Writer.Advance(4 + bodyLength);
+    BytesWritten += 4 + bodyLength;
   }
 
   MethodPlan PlanMethod(SocketFrame frame, bool allowDefinition)

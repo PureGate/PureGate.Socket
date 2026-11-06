@@ -24,12 +24,13 @@ public sealed partial class SocketFabricTests
       var input = Mutate(corpus[random.Next(corpus.Count)], random);
       try
       {
-        var reader = new SocketFrameReader(new MemoryStream(input), 64 * 1024, SocketPayloadCompression.Brotli, 1024 * 1024);
+        var reader = new SocketFrameReader(new MemoryStream(input), 64 * 1024, SocketPayloadCompression.Brotli);
         for (var frames = 0; frames < 64; frames++)
         {
           var frame = await reader.ReadAsync(CancellationToken.None).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
           if (frame is null)
             break;
+          SocketCompression.DecompressFrame(frame, 1024 * 1024);
           frame.ReleasePayload();
         }
       }

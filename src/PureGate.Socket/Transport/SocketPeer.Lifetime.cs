@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 using PureGate.Socket.Protocol;
 
 namespace PureGate.Socket.Transport;
@@ -38,6 +39,7 @@ public sealed partial class SocketPeer
       pending.ReleaseInFlight(this);
     }
     PendingStreams.Clear();
+    SocketMetrics.Closed(this, exception);
     try
     {
       ObservePeerDisconnected(exception);

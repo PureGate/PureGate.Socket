@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 using System.Net;
 using System.Net.Sockets;
 using PureGate.Socket.Framing;
@@ -159,6 +160,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
 
   void ObservePeerAcceptFailed(TcpClient client, Exception exception)
   {
+    SocketMetrics.HandshakeFailed("server", exception);
     IPEndPoint remoteEndPoint = null;
     try
     {

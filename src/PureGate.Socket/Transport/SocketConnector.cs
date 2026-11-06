@@ -1,3 +1,4 @@
+using PureGate.Socket.Observability;
 using System.Net;
 using System.Net.Sockets;
 using PureGate.Socket.Framing;
@@ -37,8 +38,9 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
       var (remoteNodeId, remoteWindow) = await RunClientHandshakeAsync(stream, reader, timeout.Token);
       return new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, remoteWindow, Options, handler);
     }
-    catch
+    catch (Exception ex)
     {
+      SocketMetrics.HandshakeFailed("client", ex);
       stream?.Dispose();
       client?.Dispose();
       throw;

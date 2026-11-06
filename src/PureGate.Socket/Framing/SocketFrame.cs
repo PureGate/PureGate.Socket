@@ -37,6 +37,13 @@ sealed class SocketFrame
   // connection closes), so a message credit spent on it is not given back.
   internal bool WriteStarted { get; set; }
 
+  // Bytes this frame holds against its connection's memory budget. Whoever takes the payload over takes
+  // this over too; SocketPeer.ReleaseFrame gives back what is left.
+  internal long ReservedBytes { get; set; }
+
+  // Received payloads stay compressed until they are needed, so decompression happens off the read loop.
+  internal bool IsCompressed => (Flags & SocketFrameFlags.PayloadCompressed) != 0;
+
   public int PayloadLength => PayloadValue.Length;
   public ReadOnlyMemory<byte> PayloadMemory => PayloadValue.Memory;
 

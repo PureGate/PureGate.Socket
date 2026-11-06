@@ -70,6 +70,13 @@ internal readonly struct SocketPayload : IDisposable
     return new SocketPayload(owner.Buffer, 0, length, owner);
   }
 
+  // Takes ownership of a buffer rented from ArrayPool<byte>.Shared; it is returned when the payload is released.
+  public static SocketPayload Adopt(byte[] rented, int length)
+  {
+    var owner = SocketPayloadOwner.Adopt(rented);
+    return new SocketPayload(rented, 0, length, owner);
+  }
+
   public SocketPayload Retain()
   {
     Owner?.Retain();
@@ -112,6 +119,12 @@ internal readonly struct SocketPayload : IDisposable
     {
       Interlocked.Increment(ref Outstanding);
       return new SocketPayloadOwner(ArrayPool<byte>.Shared.Rent(length));
+    }
+
+    public static SocketPayloadOwner Adopt(byte[] rented)
+    {
+      Interlocked.Increment(ref Outstanding);
+      return new SocketPayloadOwner(rented);
     }
 
     public void Retain()

@@ -25,18 +25,55 @@ public sealed partial class SocketPeer
     pending.ReleaseInFlight(this);
   }
 
-  // Never waits: the window bounds what the producer may send, so the chunk is buffered as it is.
+  // Never waits: the window bounds what the producer may send, so the chunk is buffered as it is. The
+  // buffered data is charged to the memory budget until the application reads it.
   void DispatchStreamItem(SocketFrame frame)
   {
     if (!PendingStreams.TryGetValue(frame.MessageId, out var pending))
-    {
-      frame.ReleasePayload();
       return;
+
+    SocketPayload payload;
+    long reserved;
+    if (frame.IsCompressed)
+    {
+      // Decompressed here, but never past what the producer may still send, so this costs at most the
+      // window the consumer already agreed to buffer. More than that breaks the protocol.
+      var limit = (int)Math.Clamp(pending.Stream.RemainingWindow, 0, Options.MaxDecompressedPayloadSizeBytes);
+      if (!SocketCompression.TryDecompress(frame.PayloadMemory.Span, limit, MemoryBudget, pooled: true, out payload, out reserved))
+      {
+        RejectOverBudget(SocketMessageKind.StreamItem, frame.MessageId, creditTaken: false);
+        return;
+      }
+    }
+    else
+    {
+      if (!TryReserveFrame(frame))
+      {
+        RejectOverBudget(SocketMessageKind.StreamItem, frame.MessageId, creditTaken: false);
+        return;
+      }
+
+      reserved = frame.ReservedBytes;
+      frame.ReservedBytes = 0;
+      payload = frame.TakePayload();
     }
 
     var producerWaiting = (frame.Flags & SocketFrameFlags.WindowExhausted) != 0;
-    if (!pending.Stream.TryWriteChunk(frame.TakePayload(), producerWaiting))
+    if (!pending.Stream.TryWriteChunk(payload, reserved, producerWaiting))
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Stream data exceeds the granted window.");
+  }
+
+  // Ends a stream this side is consuming with an error, and tells its producer to stop.
+  void FailIncomingStream(long messageId, SocketProtocolException exception)
+  {
+    if (!PendingStreams.TryRemove(messageId, out var pending))
+      return;
+
+    if (!pending.IsStarted)
+      pending.TrySetFailed(exception);
+    pending.Stream.Complete(exception);
+    pending.ReleaseInFlight(this);
+    SendCancelInBackground(messageId);
   }
 
   void DispatchStreamEnd(SocketFrame frame)
