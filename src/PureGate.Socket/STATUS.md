@@ -1,0 +1,54 @@
+**PureGate.Socket status**:
+
+**Supports**
+- Raw TCP connect/listen.
+- Length-prefixed binary frames.
+- Raw payload bytes without JSON/base64 envelope overhead.
+- Pipe-backed frame reading and writing.
+- Bidirectional peers.
+- Request/response RPC.
+- Pull-based streaming requests.
+- Wire-level request batching.
+- Fire-and-forget events.
+- Wire-level event batching.
+- Checked event batching with per-item results.
+- Ping/pong heartbeat.
+- Idle timeout.
+- Request timeout.
+- Request cancellation frame.
+- Remote request deadline enforcement.
+- Max frame size limit.
+- Transparent chunking for payloads larger than one frame.
+- Chunked message identity, timeout, and in-progress count limits.
+- Optional Brotli frame payload compression.
+- Max decompressed payload size limit.
+- Max in-flight request limit.
+- Bounded handler queue.
+- Bounded concurrent request/event handlers.
+- Pluggable payload codec.
+- Built-in JSON codec.
+- Built-in raw byte/string codec.
+- Pluggable handshake auth.
+- Built-in no-auth mode.
+- Built-in HMAC shared-secret challenge-response auth.
+- Pluggable request/event authorization.
+- Pluggable stream filter for TLS/mTLS or other transport wrapping.
+- Built-in TLS/mTLS stream filter.
+- Metrics/logging observer hooks.
+- Composite observer.
+- Accept/handshake failure observer hook.
+- Graceful close frame on peer disposal.
+- Reconnecting single-peer client wrapper.
+- Optional background keep-connected client loop with bounded jittered backoff.
+- Explicit idempotent request retry policy.
+- Protocol-level idempotency keys.
+- Shared idempotency/replay cache with TTL and size bounds.
+- Queue-indexed replay-cache pruning without full-cache scans.
+- Strict malformed-frame rejection.
+- Bounded inbound stream buffering.
+- Stream-specific authorization.
+- Allocation-tight stream chunk writes.
+- Live peer registry for multi-peer services, including multiple sessions per node.
+- Peer selection policies: first, round-robin, random.
+- Structured protocol errors.
+- Dependency-free benchmark harness for frame, RPC, batch, stream, and concurrent pressure.

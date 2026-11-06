@@ -1,0 +1,56 @@
+using System.Net;
+using PureGate.Socket.Protocol;
+using PureGate.Socket.Transport;
+
+namespace PureGate.Socket.Observability;
+
+public interface ISocketObserver
+{
+  void PeerConnected(SocketPeer peer)
+  {
+  }
+
+  void PeerDisconnected(SocketPeer peer, Exception exception)
+  {
+  }
+
+  void PeerAcceptFailed(IPEndPoint remoteEndPoint, Exception exception)
+  {
+  }
+
+  void ListenerAcceptFailed(IPEndPoint localEndPoint, Exception exception)
+  {
+  }
+
+  void ClientConnectStarted(IPEndPoint remoteEndPoint)
+  {
+  }
+
+  void ClientConnectFailed(IPEndPoint remoteEndPoint, Exception exception)
+  {
+  }
+
+  void ClientReconnectScheduled(IPEndPoint remoteEndPoint, TimeSpan delay)
+  {
+  }
+
+  void ClientKeepConnectedLoopFailed(IPEndPoint remoteEndPoint, Exception exception)
+  {
+  }
+
+  void FrameReceived(SocketPeer peer, SocketMessageKind kind, int payloadBytes)
+  {
+  }
+
+  void FrameSent(SocketPeer peer, SocketMessageKind kind, int payloadBytes)
+  {
+  }
+
+  void RequestStarted(SocketPeer peer, string service, string operation)
+  {
+  }
+
+  void RequestCompleted(SocketPeer peer, string service, string operation, bool succeeded, string errorCode)
+  {
+  }
+}

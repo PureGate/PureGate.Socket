@@ -1,0 +1,373 @@
+using PureGate.Socket.Framing;
+using PureGate.Socket.Protocol;
+
+namespace PureGate.Socket.Transport;
+
+public sealed partial class SocketPeer
+{
+  public async ValueTask<SocketRequestResult> RequestAsync<TRequest>(
+      string service,
+      string operation,
+      TRequest payload,
+      CancellationToken cancellationToken = default)
+  {
+    return await RequestAsync(
+        service,
+        operation,
+        Options.Codec.Serialize(payload),
+        Options.RequestTimeout,
+        idempotencyKey: null,
+        cancellationToken);
+  }
+
+  public async ValueTask<TResponse> RequestAsync<TRequest, TResponse>(
+      string service,
+      string operation,
+      TRequest payload,
+      CancellationToken cancellationToken = default)
+  {
+    var result = await RequestAsync(service, operation, payload, cancellationToken);
+    if (!result.Succeeded)
+      throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
+
+    return result.ReadPayload<TResponse>(Options.Codec);
+  }
+
+  public async ValueTask<SocketRequestResult> RequestAsync(
+      string service,
+      string operation,
+      byte[] payload,
+      TimeSpan timeout,
+      string idempotencyKey = null,
+      CancellationToken cancellationToken = default)
+  {
+    return await RequestFrameAsync(new SocketFrame
+    {
+      Version = Options.ProtocolVersion,
+      Kind = SocketMessageKind.Request,
+      Service = service ?? string.Empty,
+      Operation = operation ?? string.Empty,
+      IdempotencyKey = idempotencyKey ?? string.Empty,
+      Payload = payload ?? []
+    }, timeout, cancellationToken);
+  }
+
+  public async ValueTask<SocketRequestResult> RequestFastAsync(
+      int operationId,
+      byte[] payload,
+      TimeSpan timeout,
+      CancellationToken cancellationToken = default)
+  {
+    return await RequestFrameAsync(new SocketFrame
+    {
+      Version = Options.ProtocolVersion,
+      Kind = SocketMessageKind.FastRequest,
+      OperationId = operationId,
+      Payload = payload ?? []
+    }, timeout, cancellationToken);
+  }
+
+  public async ValueTask<IReadOnlyList<SocketFastBatchResult>> RequestFastBatchAsync(
+      IEnumerable<SocketFastBatchItem> items,
+      TimeSpan timeout,
+      CancellationToken cancellationToken = default)
+  {
+    var batch = ValidateFastBatch(items);
+    var result = await RequestFastAsync(
+        InternalFastBatchOperationId,
+        SocketFastBatchCodec.SerializeItems(batch),
+        timeout,
+        cancellationToken);
+    if (!result.Succeeded)
+      throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
+
+    return SocketFastBatchCodec.DeserializeResults(result.Payload.Span);
+  }
+
+  async ValueTask<SocketRequestResult> RequestFrameAsync(
+      SocketFrame frame,
+      TimeSpan timeout,
+      CancellationToken cancellationToken)
+  {
+    ThrowIfClosed();
+    if (!InFlightRequests.Wait(0))
+    {
+      return new SocketRequestResult
+      {
+        Succeeded = false,
+        ErrorCode = SocketProtocolError.ProtocolError,
+        ErrorMessage = "Too many in-flight requests."
+      };
+    }
+
+    var messageId = Interlocked.Increment(ref NextMessageId);
+    var pending = RentPendingRequest();
+    var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
+    var requestTimeout = RentRequestCancellation();
+    requestTimeout.CancelAfter(effectiveTimeout);
+    CancellationTokenSource writeCancellation = null;
+    CancellationTokenRegistration timeoutRegistration = default;
+    CancellationTokenRegistration cancellationRegistration = default;
+    var writeToken = cancellationToken.CanBeCanceled
+        ? (writeCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, requestTimeout.Token, Lifetime.Token)).Token
+        : requestTimeout.Token;
+
+    try
+    {
+      if (!PendingRequests.TryAdd(messageId, pending))
+        throw new InvalidOperationException("Could not register socket request.");
+
+      timeoutRegistration = requestTimeout.Token.UnsafeRegister(
+          static state => ((PendingRequest)state).TrySetTimeout(),
+          pending);
+      if (cancellationToken.CanBeCanceled)
+      {
+        cancellationRegistration = cancellationToken.UnsafeRegister(
+            static state => ((PendingRequest)state).TrySetCancelled(),
+            pending);
+      }
+
+      frame.MessageId = messageId;
+      frame.DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout);
+      await WriteFrameAsync(frame, writeToken);
+
+      var result = await pending.Task;
+      if (result.ErrorCode is SocketProtocolError.Timeout or SocketProtocolError.Cancelled)
+        await SendCancelAsync(messageId);
+
+      return result;
+    }
+    catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested)
+    {
+      var result = cancellationToken.IsCancellationRequested
+          ? new SocketRequestResult
+          {
+            Succeeded = false,
+            ErrorCode = SocketProtocolError.Cancelled,
+            ErrorMessage = "Request was cancelled."
+          }
+          : new SocketRequestResult
+          {
+            Succeeded = false,
+            ErrorCode = SocketProtocolError.Timeout,
+            ErrorMessage = "Request timed out."
+          };
+      await SendCancelAsync(messageId);
+      return result;
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+      await SendCancelAsync(messageId);
+      return new SocketRequestResult
+      {
+        Succeeded = false,
+        ErrorCode = SocketProtocolError.Cancelled,
+        ErrorMessage = "Request was cancelled."
+      };
+    }
+    catch (OperationCanceledException) when (Lifetime.IsCancellationRequested)
+    {
+      return new SocketRequestResult
+      {
+        Succeeded = false,
+        ErrorCode = SocketProtocolError.ConnectionClosed,
+        ErrorMessage = "Connection closed."
+      };
+    }
+    finally
+    {
+      timeoutRegistration.Dispose();
+      cancellationRegistration.Dispose();
+      writeCancellation?.Dispose();
+      ReturnRequestCancellation(requestTimeout);
+      PendingRequests.TryRemove(messageId, out _);
+      InFlightRequests.Release();
+      ReturnPendingRequest(pending);
+    }
+  }
+
+  public async ValueTask<Stream> OpenStreamAsync<TRequest>(
+      string service,
+      string operation,
+      TRequest payload,
+      CancellationToken cancellationToken = default)
+  {
+    return await OpenStreamAsync(
+        service,
+        operation,
+        Options.Codec.Serialize(payload),
+        Options.RequestTimeout,
+        cancellationToken);
+  }
+
+  public async ValueTask<Stream> OpenStreamAsync(
+      string service,
+      string operation,
+      byte[] payload,
+      TimeSpan timeout,
+      CancellationToken cancellationToken = default)
+  {
+    ThrowIfClosed();
+    if (!InFlightRequests.Wait(0))
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Too many in-flight requests.");
+
+    var messageId = Interlocked.Increment(ref NextMessageId);
+    var stream = new SocketPullStream(
+        Options.MaxStreamBufferChunks,
+        () => _ = SendCancelAsync(messageId).AsTask());
+    var pending = new PendingStream(stream);
+    var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
+    using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Lifetime.Token);
+    timeoutSource.CancelAfter(effectiveTimeout);
+    var registered = false;
+
+    try
+    {
+      if (!PendingStreams.TryAdd(messageId, pending))
+        throw new InvalidOperationException("Could not register socket stream request.");
+      registered = true;
+
+      await WriteFrameAsync(new SocketFrame
+      {
+        Version = Options.ProtocolVersion,
+        MessageId = messageId,
+        Kind = SocketMessageKind.StreamRequest,
+        Service = service ?? string.Empty,
+        Operation = operation ?? string.Empty,
+        DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout),
+        Payload = payload ?? []
+      }, timeoutSource.Token);
+
+      using var registration = timeoutSource.Token.Register(
+          static state => ((PendingStream)state).TrySetCancelled(),
+          pending);
+      return await pending.Task;
+    }
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+    {
+      if (registered && PendingStreams.TryRemove(messageId, out _))
+        pending.ReleaseInFlight(InFlightRequests);
+      if (!registered)
+        pending.ReleaseInFlight(InFlightRequests);
+      stream.Complete();
+      await SendCancelAsync(messageId);
+      throw new SocketProtocolException(SocketProtocolError.Cancelled, "Stream request was cancelled.");
+    }
+    catch (OperationCanceledException)
+    {
+      if (registered && PendingStreams.TryRemove(messageId, out _))
+        pending.ReleaseInFlight(InFlightRequests);
+      if (!registered)
+        pending.ReleaseInFlight(InFlightRequests);
+      stream.Complete();
+      await SendCancelAsync(messageId);
+      throw new SocketProtocolException(SocketProtocolError.Timeout, "Stream request timed out.");
+    }
+    catch
+    {
+      if (registered && PendingStreams.TryRemove(messageId, out _))
+        pending.ReleaseInFlight(InFlightRequests);
+      if (!registered)
+        pending.ReleaseInFlight(InFlightRequests);
+      stream.Complete();
+      throw;
+    }
+  }
+
+  public async ValueTask SendEventAsync<TPayload>(
+      string service,
+      string operation,
+      TPayload payload,
+      CancellationToken cancellationToken = default)
+  {
+    await SendEventAsync(service, operation, Options.Codec.Serialize(payload), cancellationToken);
+  }
+
+  public async ValueTask SendEventAsync(
+      string service,
+      string operation,
+      byte[] payload,
+      CancellationToken cancellationToken = default)
+  {
+    ThrowIfClosed();
+    await WriteFrameAsync(new SocketFrame
+    {
+      Version = Options.ProtocolVersion,
+      MessageId = Interlocked.Increment(ref NextMessageId),
+      Kind = SocketMessageKind.Event,
+      Service = service ?? string.Empty,
+      Operation = operation ?? string.Empty,
+      Payload = payload ?? []
+    }, cancellationToken);
+  }
+
+  public async ValueTask<IReadOnlyList<SocketBatchResult>> RequestBatchAsync(
+      IEnumerable<SocketBatchItem> items,
+      TimeSpan timeout,
+      CancellationToken cancellationToken = default)
+  {
+    var batch = ValidateBatch(items);
+    var result = await RequestAsync(
+        InternalService,
+        BatchRequestOperation,
+        SocketBatchCodec.SerializeItems(batch),
+        timeout,
+        idempotencyKey: null,
+        cancellationToken);
+    if (!result.Succeeded)
+      throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
+
+    return SocketBatchCodec.DeserializeResults(result.Payload.Span);
+  }
+
+  public async ValueTask SendEventBatchAsync(
+      IEnumerable<SocketBatchItem> items,
+      CancellationToken cancellationToken = default)
+  {
+    var batch = ValidateBatch(items);
+    await SendEventAsync(
+        InternalService,
+        BatchEventOperation,
+        SocketBatchCodec.SerializeItems(batch),
+        cancellationToken);
+  }
+
+  public async ValueTask<IReadOnlyList<SocketBatchResult>> SendEventBatchWithResultsAsync(
+      IEnumerable<SocketBatchItem> items,
+      TimeSpan timeout,
+      CancellationToken cancellationToken = default)
+  {
+    var batch = ValidateBatch(items);
+    var result = await RequestAsync(
+        InternalService,
+        BatchEventRequestOperation,
+        SocketBatchCodec.SerializeItems(batch),
+        timeout,
+        idempotencyKey: null,
+        cancellationToken);
+    if (!result.Succeeded)
+      throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
+
+    return SocketBatchCodec.DeserializeResults(result.Payload.Span);
+  }
+
+  public async ValueTask CloseGracefullyAsync(CancellationToken cancellationToken = default)
+  {
+    if (State != SocketPeerState.Closed && !Lifetime.IsCancellationRequested)
+    {
+      try
+      {
+        await WriteFrameAsync(new SocketFrame
+        {
+          Version = Options.ProtocolVersion,
+          Kind = SocketMessageKind.Close
+        }, cancellationToken);
+      }
+      catch
+      {
+      }
+    }
+
+    await CloseAsync(null);
+  }
+}

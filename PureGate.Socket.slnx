@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+  </Folder>
+  <Project Path="src/PureGate.Socket.Test/PureGate.Socket.Test.csproj" />
+  <Project Path="src/PureGate.Socket.Benchmarks/PureGate.Socket.Benchmarks.csproj" />  
+  <Project Path="src/PureGate.Socket/PureGate.Socket.csproj" />
+</Solution>
