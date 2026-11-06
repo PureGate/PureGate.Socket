@@ -29,7 +29,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     {
       using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
       timeout.CancelAfter(Options.HandshakeTimeout);
-      client = await ConnectTcpAsync(endpoint, timeout.Token);
+      client = await ConnectTcpAsync(endpoint, Options.SocketBufferBytes, timeout.Token);
       stream = await Options.StreamFilter.WrapClientAsync(
           client.GetStream(),
           Options.NodeId,
@@ -47,7 +47,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     }
   }
 
-  static async ValueTask<TcpClient> ConnectTcpAsync(EndPoint endpoint, CancellationToken cancellationToken)
+  static async ValueTask<TcpClient> ConnectTcpAsync(EndPoint endpoint, int socketBufferBytes, CancellationToken cancellationToken)
   {
     IPAddress[] addresses;
     int port;
@@ -71,6 +71,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     foreach (var address in addresses)
     {
       var client = new TcpClient(address.AddressFamily) { NoDelay = true };
+      SocketPeer.ApplySocketBuffers(client.Client, socketBufferBytes);
       try
       {
         await client.ConnectAsync(new IPEndPoint(address, port), cancellationToken);

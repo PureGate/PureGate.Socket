@@ -6,6 +6,5 @@
   </Folder>
   <Project Path="src/PureGate.Socket.Test/PureGate.Socket.Test.csproj" />
   <Project Path="src/PureGate.Socket.Benchmarks/PureGate.Socket.Benchmarks.csproj" />  
-  <Project Path="src/PureGate.Socket/PureGate.Socket.csproj" />
-  <Project Path="benchmark/Competitors/Competitors.csproj" />
+  <Project Path="src/PureGate.Socket/PureGate.Socket.csproj" />  <Project Path="benchmark/Competitors/Competitors.csproj" />
 </Solution>

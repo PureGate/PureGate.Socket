@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
@@ -8,7 +7,7 @@ namespace PureGate.Socket.Transport;
 // The write path.
 //
 // Writers encode their frame, under a short lock, into an in-memory batch (SocketWriteBuffer). One flusher
-// at a time writes the whole batch to the socket in a single write, outside the lock. A writer that finds
+// at a time writes the whole batch to the socket in 64 KB writes, outside the lock. A writer that finds
 // a flush already running only appends its frame and returns; its bytes go out with the next batch. So
 // writers never wait for each other's socket writes, and a busy connection sends many frames per system
 // call. (The previous design held one lock across encoding and the socket write, which serialized every
@@ -28,12 +27,10 @@ namespace PureGate.Socket.Transport;
 // - Failure: a socket write that fails closes the connection, which fails every outstanding request.
 public sealed partial class SocketPeer
 {
-  // A spare batch array larger than this goes back to the pool instead of being kept for the next batch.
-  const int MaxSpareBufferBytes = 1024 * 1024;
-
   readonly Lock WriteSync = new();
   readonly SocketWriteBuffer Pending = new();
-  byte[] SpareBuffer;
+  // The batch the flusher is writing; only the flusher (one at a time) touches it.
+  readonly SocketWriteBatch FlushBatch = new();
   bool Flushing;
   bool WritesClosed;
   long UnflushedBytes;
@@ -151,7 +148,7 @@ public sealed partial class SocketPeer
 
   // Under WriteSync, after encoding: counts the new bytes, and returns true when the caller must start the
   // flusher because none is running.
-  bool CommitLocked(int lengthBefore)
+  bool CommitLocked(long lengthBefore)
   {
     var added = Pending.Length - lengthBefore;
     if (added <= 0)
@@ -207,11 +204,9 @@ public sealed partial class SocketPeer
     var written = 0;
     while (true)
     {
-      ArraySegment<byte> batch = default;
       TaskCompletionSource idle = null;
-      byte[] releasedPending = null;
-      byte[] releasedSpare = null;
       var handOff = false;
+      var take = false;
       lock (WriteSync)
       {
         if (Pending.Length == 0 || WritesClosed)
@@ -220,9 +215,7 @@ public sealed partial class SocketPeer
           Flushing = false;
           idle = IdleSignal;
           IdleSignal = null;
-          releasedPending = Pending.Take(null).Array;
-          releasedSpare = SpareBuffer;
-          SpareBuffer = null;
+          Pending.Release();
         }
         else if (inline && written > 0)
         {
@@ -231,24 +224,20 @@ public sealed partial class SocketPeer
         }
         else
         {
-          batch = Pending.Take(SpareBuffer);
-          SpareBuffer = null;
+          Pending.MoveTo(FlushBatch);
+          take = true;
         }
       }
 
-      if (batch.Array is null)
+      if (!take)
       {
-        if (releasedPending is { Length: > 0 })
-          ArrayPool<byte>.Shared.Return(releasedPending);
-        if (releasedSpare is not null)
-          ArrayPool<byte>.Shared.Return(releasedSpare);
         if (handOff)
           QueueBackgroundFlush();
         idle?.TrySetResult();
         return;
       }
 
-      var write = Stream.WriteAsync(batch.AsMemory(), Lifetime.Token);
+      var write = FlushBatch.WriteToAsync(Stream, Lifetime.Token);
       if (!write.IsCompletedSuccessfully)
       {
         if (inline && cancellationToken.CanBeCanceled)
@@ -260,12 +249,12 @@ public sealed partial class SocketPeer
           }
           catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
           {
-            _ = FinishFlushInBackgroundAsync(pending, batch);
+            _ = FinishFlushInBackgroundAsync(pending);
             throw;
           }
           catch (Exception ex)
           {
-            WriteFailed(ex, batch, inline);
+            WriteFailed(ex, inline);
             return;
           }
         }
@@ -277,19 +266,19 @@ public sealed partial class SocketPeer
           }
           catch (Exception ex)
           {
-            WriteFailed(ex, batch, inline);
+            WriteFailed(ex, inline);
             return;
           }
         }
       }
 
       written++;
-      BatchWritten(batch);
+      BatchWritten();
     }
   }
 
   // The rest of a flush whose writer stopped waiting: finish its socket write, then keep flushing.
-  async Task FinishFlushInBackgroundAsync(Task write, ArraySegment<byte> batch)
+  async Task FinishFlushInBackgroundAsync(Task write)
   {
     try
     {
@@ -297,19 +286,19 @@ public sealed partial class SocketPeer
     }
     catch (Exception ex)
     {
-      WriteFailed(ex, batch, inline: false);
+      WriteFailed(ex, inline: false);
       return;
     }
 
-    BatchWritten(batch);
+    BatchWritten();
     await BackgroundFlushAsync();
   }
 
   // A socket write failed: the connection cannot be written any more, and closing it fails everything
   // outstanding. An inline writer gets the failure as connection_closed (or its cancellation).
-  void WriteFailed(Exception exception, ArraySegment<byte> batch, bool inline)
+  void WriteFailed(Exception exception, bool inline)
   {
-    ArrayPool<byte>.Shared.Return(batch.Array);
+    FlushBatch.Release();
     var lost = IsTransportFailure(exception) ? ConnectionLost(exception) : null;
     if (lost is null && exception is not OperationCanceledException)
       _ = CloseAsync(exception).AsTask();
@@ -320,23 +309,16 @@ public sealed partial class SocketPeer
     System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(exception);
   }
 
-  // Bookkeeping after a batch reached the socket: counts it as flushed, keeps its array for the next batch
+  // Bookkeeping after a batch reached the socket: counts it as flushed, returns its segments to the pool
   // and wakes writers waiting for room.
-  void BatchWritten(ArraySegment<byte> batch)
+  void BatchWritten()
   {
     TaskCompletionSource room = null;
-    var keep = false;
     lock (WriteSync)
     {
       // CloseWrites already reset the count.
       if (!WritesClosed)
-        UnflushedBytes -= batch.Count;
-      if (SpareBuffer is null && batch.Array.Length <= MaxSpareBufferBytes && !WritesClosed)
-      {
-        SpareBuffer = batch.Array;
-        keep = true;
-      }
-
+        UnflushedBytes -= FlushBatch.Length;
       if (RoomSignal is not null && UnflushedBytes <= WriteHighWaterBytes / 2)
       {
         room = RoomSignal;
@@ -344,8 +326,7 @@ public sealed partial class SocketPeer
       }
     }
 
-    if (!keep)
-      ArrayPool<byte>.Shared.Return(batch.Array);
+    FlushBatch.Release();
     room?.TrySetResult();
   }
 
@@ -396,8 +377,6 @@ public sealed partial class SocketPeer
   {
     TaskCompletionSource room;
     TaskCompletionSource idle;
-    byte[] pending;
-    byte[] spare;
     lock (WriteSync)
     {
       WritesClosed = true;
@@ -405,17 +384,12 @@ public sealed partial class SocketPeer
       idle = IdleSignal;
       RoomSignal = null;
       IdleSignal = null;
-      // A flush in progress still owns its batch; only what is not being written is released here.
-      pending = Flushing ? null : Pending.Take(null).Array;
-      spare = SpareBuffer;
-      SpareBuffer = null;
+      // A flush in progress still owns its batch and releases the rest when it stops.
+      if (!Flushing)
+        Pending.Release();
       UnflushedBytes = 0;
     }
 
-    if (pending is { Length: > 0 })
-      ArrayPool<byte>.Shared.Return(pending);
-    if (spare is not null)
-      ArrayPool<byte>.Shared.Return(spare);
     room?.TrySetResult();
     idle?.TrySetResult();
   }

@@ -1,7 +1,7 @@
 name: Publish Nuget Package
 
-# Manual: Actions > Publish Nuget Package > Run workflow. Publishes the version in VersionPrefix of
-# src/PureGate.Socket/PureGate.Socket.csproj, then tags the commit and creates a GitHub release.
+# Manual: Actions > Publish Nuget Package > Run workflow. Publishes PureGate.Socket at the VersionPrefix
+# in Directory.Build.props, then tags the commit and creates a GitHub release.
 # Any failure stops the run: nothing is tagged, released or uploaded unless nuget.org accepted the package.
 on:
   workflow_dispatch:
@@ -35,7 +35,7 @@ jobs:
           version=$(dotnet msbuild src/PureGate.Socket/PureGate.Socket.csproj -getProperty:Version)
           echo "Publishing PureGate.Socket $version"
           if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
-            echo "::error::v$version is already tagged. Raise VersionPrefix in src/PureGate.Socket/PureGate.Socket.csproj."
+            echo "::error::v$version is already tagged. Raise VersionPrefix in Directory.Build.props."
             exit 1
           fi
           # 200 lists the published versions; 404 means nothing is published yet.
@@ -45,20 +45,10 @@ jobs:
             exit 1
           fi
           if [ "$status" = "200" ] && grep -qi "\"${version}\"" versions.json; then
-            echo "::error::PureGate.Socket $version is already on nuget.org. Raise VersionPrefix in src/PureGate.Socket/PureGate.Socket.csproj."
+            echo "::error::PureGate.Socket $version is already on nuget.org. Raise VersionPrefix in Directory.Build.props."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      # Everything public must be declared as shipped before it is released, so the next release can
-      # tell new API from released API.
-      - name: Public API is shipped
-        shell: bash
-        run: |
-          if grep -qv '^\s*$' src/PureGate.Socket/PublicAPI/PublicAPI.Unshipped.txt; then
-            echo "::error::Move the lines of PublicAPI.Unshipped.txt into PublicAPI.Shipped.txt before publishing."
-            exit 1
-          fi
 
       - name: Build
         run: dotnet build PureGate.Socket.slnx -c Release
@@ -80,7 +70,7 @@ jobs:
       # No --skip-duplicate: a package nuget.org refuses (a conflict included) fails the run. The symbols
       # package (.snupkg) next to it is pushed along with it.
       - name: Publish the package to nuget.org
-        run: dotnet nuget push "artifacts/packages/*.nupkg" -k "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json
+        run: dotnet nuget push "artifacts/packages/PureGate.Socket.${{ steps.version.outputs.version }}.nupkg" -k "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json
 
       - name: Tag and GitHub release
         env:

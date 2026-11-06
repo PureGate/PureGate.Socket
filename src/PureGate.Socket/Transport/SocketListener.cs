@@ -35,6 +35,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
 
       Lifetime = new CancellationTokenSource();
       Listener = new TcpListener(endpoint);
+      // Accepted connections inherit these, from before they are established.
+      SocketPeer.ApplySocketBuffers(Listener.Server, Options.SocketBufferBytes);
       Listener.Start();
       AcceptTask = Task.Run(() => AcceptLoopAsync(handler ?? EmptySocketPeerHandler.Shared));
     }

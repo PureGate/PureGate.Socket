@@ -89,6 +89,29 @@ var options = new SocketFabricOptions { Codec = new JsonSocketMessageCodec(AppJs
 
 The handshake has its own source-generated JSON, so it needs no reflection whatever codec is configured. `RawSocketMessageCodec` carries `byte[]`, `ReadOnlyMemory<byte>`, `Memory<byte>`, `ArraySegment<byte>` and strings (UTF-8). For one-off use, `codec.Serialize(value)` returns an array and `codec.Deserialize<T>(memory)` reads one.
 
+JSON is the default because it needs no dependency, but it dominates the cost of a typed call: measured with a ~700-byte object, about 60% of the time went to System.Text.Json, and neither source generation nor stricter options changed that. A MessagePack codec made the same calls about 28% faster with 35% fewer bytes allocated. It takes a dozen lines plus the `MessagePack` package in your own project, so PureGate.Socket stays dependency-free (the test suite runs this exact codec):
+
+```csharp
+using System.Buffers;
+using MessagePack;
+using PureGate.Socket;
+
+public sealed class MessagePackSocketMessageCodec : ISocketMessageCodec
+{
+    public static readonly MessagePackSocketMessageCodec Shared = new();
+
+    public void Serialize<T>(T value, IBufferWriter<byte> output) => MessagePackSerializer.Serialize(output, value);
+
+    public T Deserialize<T>(ReadOnlySequence<byte> payload) => MessagePackSerializer.Deserialize<T>(payload);
+}
+```
+
+Its types are annotated with `[MessagePackObject]` and `[Key]`. Pass `MessagePackSerializerOptions` to both calls for contractless types, LZ4 compression or a source-generated resolver for AOT.
+
+## Socket buffers
+
+`SocketBufferBytes` sets each connection's kernel send and receive buffers, before the connection is established so TCP can scale its window to them. The kernel uses that memory only for data actually buffered. The default is 1 MB on Windows. Its own defaults made each socket write wait for the remote to drain the previous one: measured on loopback, 1 MB messages from 16 callers ran 9× faster and 64 KB messages from 64 callers 3× faster with 1 MB buffers. Elsewhere the default is 0, which keeps the operating system's setting: Linux tunes its buffers automatically, and setting them explicitly turns that tuning off.
+
 ## Memory budget
 
 Credits bound how many messages a peer can queue and windows bound each stream, but not their sizes added up. `MaxConnectionMemoryBytes` (256 MB by default) caps the total one connection holds for its remote: chunked messages being reassembled, received requests, stream requests and events until their handler finishes, decompressed payloads, and stream data the application has not read yet. Responses are not counted once they reach the caller.

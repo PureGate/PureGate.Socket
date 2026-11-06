@@ -45,8 +45,8 @@ Everything two .NET services need to talk over one long-lived connection, in a s
 **Operations**
 - OpenTelemetry-ready metrics and observer hooks
 - A peer registry to reach a node by ID or broadcast to all
-- Pluggable serialization: JSON (source-generated for AOT), raw bytes, or your own codec
-- Fuzz, chaos and soak tested, with a public API that changes only on purpose
+- Pluggable serialization: JSON (source-generated for AOT), raw bytes, or your own codec, such as MessagePack
+- Fuzz, chaos and soak tested
 
 **Speed**
 - 77% of a bare socket's call rate, and over half a million calls a second on one shared connection
@@ -234,6 +234,25 @@ partial class AppJson : JsonSerializerContext;
 var options = new SocketFabricOptions { Codec = new JsonSocketMessageCodec(AppJson.Default) };
 ```
 
+For the fastest typed calls, use a binary format such as MessagePack. Add the `MessagePack` package to your project and copy this codec; PureGate.Socket itself stays dependency-free:
+
+```csharp
+using System.Buffers;
+using MessagePack;
+using PureGate.Socket;
+
+public sealed class MessagePackSocketMessageCodec : ISocketMessageCodec
+{
+    public static readonly MessagePackSocketMessageCodec Shared = new();
+
+    public void Serialize<T>(T value, IBufferWriter<byte> output) => MessagePackSerializer.Serialize(output, value);
+
+    public T Deserialize<T>(ReadOnlySequence<byte> payload) => MessagePackSerializer.Deserialize<T>(payload);
+}
+
+var options = new SocketFabricOptions { Codec = MessagePackSocketMessageCodec.Shared };
+```
+
 ## Limits and defaults
 
 Every limit is an option on `SocketFabricOptions`.
@@ -245,18 +264,19 @@ Every limit is an option on `SocketFabricOptions`.
 | `MaxDecompressedPayloadSizeBytes` | 128 MB | One message, after reassembly and decompression |
 | `MaxConnectionMemoryBytes` | 256 MB | Everything a connection holds for its remote |
 | `MaxInFlightRequests` | 1,024 | This side's outstanding calls and streams on a connection |
-| `MaxConcurrentHandlers` | 16 | Handlers running at once on a connection |
+| `MaxConcurrentHandlers` | 100 | Handlers running at once on a connection |
 | `MaxQueuedHandlers` | 4,096 | Messages waiting for a handler, which is also how many the remote may send ahead |
 | `StreamWindowBytes` | 1 MB | Unread data per stream, growing up to `MaxStreamWindowBytes` (64 MB) |
 | `HeartbeatInterval` / `IdleTimeout` | 15 s / 45 s | Detection of dead connections |
 | `MaxPendingHandshakes` / `MaxConnections` | 256 / unlimited | What a listener admits |
+| `SocketBufferBytes` | 1 MB on Windows, system default elsewhere | Kernel send and receive buffers per connection |
 
 ## Documentation
 
 - [Library guide](https://github.com/PureGate/PureGate.Socket/blob/main/src/PureGate.Socket/README.md): flow control, the memory budget, serialization and the full list of metrics.
 - [Wire protocol](https://github.com/PureGate/PureGate.Socket/blob/main/docs/PROTOCOL.md): the frame format, the handshake, and flow control on the wire.
 - [Competitor benchmark](https://github.com/PureGate/PureGate.Socket/tree/main/benchmark/Competitors): PureGate.Socket against gRPC, SignalR and StreamJsonRpc, with results.
-- [Roadmap](https://github.com/PureGate/PureGate.Socket/blob/main/docs/ROADMAP.md) and [releasing](https://github.com/PureGate/PureGate.Socket/blob/main/docs/RELEASING.md).
+- [Roadmap](https://github.com/PureGate/PureGate.Socket/blob/main/docs/ROADMAP.md).
 - The [tests](https://github.com/PureGate/PureGate.Socket/tree/main/src/PureGate.Socket.Test) are working examples of every feature.
 
 ## Building and testing
@@ -274,7 +294,7 @@ dotnet test src/PureGate.Socket.Test -c Release --filter Category=Soak
 
 It runs for `PUREGATE_SOAK_SECONDS` (20 by default). The manual `soak` workflow on GitHub runs it for an hour.
 
-When contributing: the build treats warnings as errors, and the public API is recorded in `src/PureGate.Socket/PublicAPI/`. A change to the public surface fails the build until `PublicAPI.Unshipped.txt` is updated, so API changes are visible in review. CI also requires 85% line coverage.
+When contributing: the build treats warnings as errors, and CI requires 85% line coverage.
 
 ## License
 

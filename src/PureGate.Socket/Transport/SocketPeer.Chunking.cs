@@ -8,14 +8,16 @@ public sealed partial class SocketPeer
   static readonly long ChunkPruneIntervalTicks = TimeSpan.FromSeconds(1).Ticks;
 
   // Only the read loop touches the chunk state below, so it needs no synchronization.
-  // IncomingChunkBytes is the allocated capacity of every reassembly buffer, not the bytes received; that
-  // capacity is what is reserved from the connection's memory budget.
+  // IncomingChunkBytes is the payload received for messages still in progress; it is what is reserved
+  // from the connection's memory budget.
   long IncomingChunkBytes;
   long LastChunkPruneTicks = DateTimeOffset.UtcNow.UtcTicks;
 
-  // A sender writes the chunks of one message back to back, in order, with equal sizes except the last
-  // (see WriteChunkedFrameAsync). A chunk that breaks those rules is a protocol violation and closes the
-  // connection. Memory is committed as bytes arrive, never from the sender's declared sizes.
+  // A sender writes the chunks of one message in order, with equal sizes except the last (see
+  // WriteChunksAsync); other frames may come between them. A chunk that breaks those rules is a protocol
+  // violation and closes the connection. Memory is committed as bytes arrive, never from the sender's
+  // declared sizes. Chunk payloads are pooled buffers (see SocketFrameReader) kept as they are until the
+  // last chunk arrives; the message is then copied once into an array of its exact size.
   SocketFrame ReassembleChunk(SocketFrame frame)
   {
     ValidateChunk(frame);
@@ -41,23 +43,22 @@ public sealed partial class SocketPeer
 
     // A message that does not fit is dropped and refused (its remaining chunks find no entry and are
     // dropped too), so one oversized message does not cost the connection.
-    var capacity = incoming.PlanCapacity(frame.PayloadLength, MemoryBudget.Available);
-    if (capacity < 0 || !MemoryBudget.TryReserve(capacity - incoming.Capacity))
+    if (!MemoryBudget.TryReserve(frame.PayloadLength))
     {
       RemoveIncomingChunks(key, incoming);
       RejectOverBudget(frame.OriginalKind, frame.MessageId, creditTaken: true);
       return null;
     }
 
-    IncomingChunkBytes += capacity - incoming.Capacity;
-    incoming.Append(frame, capacity);
+    IncomingChunkBytes += frame.PayloadLength;
+    incoming.Append(frame);
     if (!incoming.Completed)
       return null;
 
-    // The reassembly buffer becomes the frame's payload, so its reservation moves to the frame.
+    // The reassembled payload is exactly the bytes received, so the reservation moves to the frame.
     IncomingChunks.TryRemove(key, out _);
-    IncomingChunkBytes -= incoming.Capacity;
-    var reserved = (long)incoming.Capacity;
+    var reserved = (long)incoming.ReceivedBytes;
+    IncomingChunkBytes -= reserved;
     try
     {
       var whole = incoming.ToFrame(Reader);
@@ -69,6 +70,10 @@ public sealed partial class SocketPeer
       MemoryBudget.Release(reserved);
       throw;
     }
+    finally
+    {
+      incoming.Release();
+    }
   }
 
   void RemoveIncomingChunks(ChunkKey key, IncomingChunkedFrame incoming)
@@ -76,8 +81,16 @@ public sealed partial class SocketPeer
     if (!IncomingChunks.TryRemove(key, out _))
       return;
 
-    IncomingChunkBytes -= incoming.Capacity;
-    MemoryBudget.Release(incoming.Capacity);
+    IncomingChunkBytes -= incoming.ReceivedBytes;
+    MemoryBudget.Release(incoming.ReceivedBytes);
+    incoming.Release();
+  }
+
+  // Returns the pooled buffers of every message still being reassembled. Called when the connection closes.
+  void ReleaseIncomingChunks()
+  {
+    foreach (var item in IncomingChunks)
+      RemoveIncomingChunks(item.Key, item.Value);
   }
 
   // A message expires when no chunk for it has arrived for ChunkTimeout. Measuring from the last chunk,
@@ -130,7 +143,7 @@ public sealed partial class SocketPeer
     readonly int ChunkSize;
     readonly int ChunkCount;
     readonly int TotalLength;
-    byte[] Buffer;
+    readonly List<SocketPayload> Parts = [];
     int NextIndex;
 
     public IncomingChunkedFrame(SocketFrame firstFrame)
@@ -143,14 +156,12 @@ public sealed partial class SocketPeer
       if (expectedCount != ChunkCount)
         throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Chunk count does not match the payload length.");
 
-      Buffer = [];
       LastActivity = DateTimeOffset.UtcNow;
     }
 
     public DateTimeOffset LastActivity { get; private set; }
-    public int Capacity => Buffer?.Length ?? 0;
     public bool Completed => NextIndex == ChunkCount;
-    int ReceivedBytes;
+    public int ReceivedBytes { get; private set; }
 
     public bool IsNextChunk(SocketFrame frame)
     {
@@ -168,47 +179,59 @@ public sealed partial class SocketPeer
       return frame.PayloadLength == expectedLength;
     }
 
-    // The buffer capacity needed to append `length` bytes. It doubles when the budget allows (so a large
-    // message is not copied once per chunk), grows to exactly what is needed when only that fits, and
-    // returns -1 when even that would exceed the budget.
-    public long PlanCapacity(int length, long budgetAvailable)
+    // Keeps the chunk's payload (a pooled buffer) as it is: no copy until the message is complete.
+    // The read loop appends; a closing connection may release at the same moment, hence the lock. A chunk
+    // that arrives after the release is returned to the pool at once.
+    public void Append(SocketFrame frame)
     {
-      long required = ReceivedBytes + length;
-      if (required <= Capacity)
-        return Capacity;
+      var payload = frame.TakePayload();
+      lock (Parts)
+      {
+        if (Released)
+        {
+          payload.Dispose();
+          return;
+        }
 
-      var preferred = Math.Min(TotalLength, Math.Max(required, Capacity * 2L));
-      if (preferred - Capacity <= budgetAvailable)
-        return preferred;
-      return required - Capacity <= budgetAvailable ? required : -1;
-    }
+        Parts.Add(payload);
+      }
 
-    public void Append(SocketFrame frame, long capacity)
-    {
-      if (capacity > Capacity)
-        Grow((int)capacity);
-
-      frame.PayloadMemory.Span.CopyTo(Buffer.AsSpan(ReceivedBytes));
-      ReceivedBytes += frame.PayloadLength;
+      ReceivedBytes += payload.Length;
       NextIndex++;
       LastActivity = DateTimeOffset.UtcNow;
     }
 
-    // Like Array.Resize, but skips zeroing the new buffer: the received bytes are copied over, and the rest
-    // is filled by later chunks before the payload is handed out (ToFrame only runs once all have arrived).
-    void Grow(int capacity)
+    bool Released;
+
+    public void Release()
     {
-      var grown = GC.AllocateUninitializedArray<byte>(capacity);
-      Buffer.AsSpan(0, ReceivedBytes).CopyTo(grown);
-      Buffer = grown;
+      lock (Parts)
+      {
+        Released = true;
+        foreach (var part in Parts)
+          part.Dispose();
+        Parts.Clear();
+      }
     }
 
     // The chunks together are the encoded body of the original frame (header and payload), so it is
-    // decoded like any other frame. Its payload stays in the reassembly buffer instead of being copied.
+    // decoded like any other frame. They are copied once into an array of the exact size, and the payload
+    // is exposed in place there, since handlers may keep it.
     public SocketFrame ToFrame(SocketFrameReader reader)
     {
-      var buffer = Buffer;
-      Buffer = [];
+      var buffer = GC.AllocateUninitializedArray<byte>(TotalLength);
+      var offset = 0;
+      lock (Parts)
+      {
+        if (Released)
+          throw new SocketProtocolException(SocketProtocolError.ConnectionClosed, "Connection closed.");
+        foreach (var part in Parts)
+        {
+          part.Span.CopyTo(buffer.AsSpan(offset));
+          offset += part.Length;
+        }
+      }
+
       var frame = reader.DecodeBody(new System.Buffers.ReadOnlySequence<byte>(buffer, 0, TotalLength), buffer);
       if (frame.Kind != FirstFrame.OriginalKind || frame.MessageId != FirstFrame.MessageId)
       {

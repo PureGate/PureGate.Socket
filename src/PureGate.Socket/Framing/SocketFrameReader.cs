@@ -198,10 +198,11 @@ sealed class SocketFrameReader(
 
     var source = reader.UnreadSequence;
     SocketPayload payload;
-    if (kind == SocketMessageKind.StreamItem || pooled)
+    if (kind is SocketMessageKind.StreamItem or SocketMessageKind.Chunk || pooled)
     {
-      // Stream data is pooled; the pull stream returns the buffer once the application has read it. So is
-      // a typed request's response, returned once it has been deserialized.
+      // Pooled: stream data (the pull stream returns the buffer once the application has read it), chunks of
+      // a large message (returned once it is reassembled), and a typed request's response (returned once it
+      // has been deserialized).
       payload = SocketPayload.Rent(length);
       source.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsMemory(payload.Memory).Span);
     }

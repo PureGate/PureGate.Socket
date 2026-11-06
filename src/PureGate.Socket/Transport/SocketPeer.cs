@@ -104,6 +104,16 @@ public sealed partial class SocketPeer : IAsyncDisposable
   public Task Completion => Closed.Task;
   public ISocketMessageCodec Codec => Options.Codec;
 
+  // Sets the kernel send and receive buffers (see SocketFabricOptions.SocketBufferBytes); 0 leaves them.
+  internal static void ApplySocketBuffers(System.Net.Sockets.Socket socket, int bytes)
+  {
+    if (bytes <= 0)
+      return;
+
+    socket.SendBufferSize = bytes;
+    socket.ReceiveBufferSize = bytes;
+  }
+
   internal static SocketFrameReader CreateReader(Stream stream, SocketFabricOptions options)
   {
     // Created for the handshake, so it starts with the pre-authentication frame limit.

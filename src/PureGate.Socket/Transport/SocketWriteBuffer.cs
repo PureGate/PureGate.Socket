@@ -2,58 +2,129 @@ using System.Buffers;
 
 namespace PureGate.Socket.Transport;
 
-// The frames a connection has encoded and not yet written to the socket: one contiguous array rented
-// from the shared pool, so a whole batch goes out in one socket write. Not thread-safe; SocketPeer uses it
-// under its write lock.
+// The frames a connection has encoded and not yet written to the socket, in 64 KB segments rented from the
+// shared pool. Each segment goes to the socket in one write. Two reasons for the size:
+// - A write larger than the socket's send buffer stays pending until the remote has read nearly all of it,
+//   and the remote then receives it in small pieces, one completion each. Measured: 64 KB payloads from 64
+//   callers ran at a third of the throughput with whole-batch writes, and worse with 256 KB writes.
+// - A 64 KB array stays below the large object heap threshold, so even a pool miss is a cheap
+//   allocation, and a large message is spread over several segments instead of needing one array of its
+//   size (which, under load, churned the large object heap and forced full collections).
+// Not thread-safe; SocketPeer uses it under its write lock.
 sealed class SocketWriteBuffer : IBufferWriter<byte>
 {
-  const int InitialBytes = 16 * 1024;
+  public const int SegmentBytes = 64 * 1024;
 
-  byte[] Buffer = [];
-  int Written;
+  readonly List<ArraySegment<byte>> Filled = [];
+  byte[] Current;
+  int CurrentWritten;
 
-  public int Length => Written;
+  public long Length { get; private set; }
 
   public void Advance(int count)
   {
-    if (count < 0 || Written + count > Buffer.Length)
+    if (count < 0 || Current is null || CurrentWritten + count > Current.Length)
       throw new ArgumentOutOfRangeException(nameof(count));
-    Written += count;
+    CurrentWritten += count;
+    Length += count;
   }
 
   public Memory<byte> GetMemory(int sizeHint = 0)
   {
     Ensure(sizeHint);
-    return Buffer.AsMemory(Written);
+    return Current.AsMemory(CurrentWritten);
   }
 
   public Span<byte> GetSpan(int sizeHint = 0)
   {
     Ensure(sizeHint);
-    return Buffer.AsSpan(Written);
+    return Current.AsSpan(CurrentWritten);
   }
 
-  // Hands the written bytes over (the caller returns the array to the pool, or gives it back as spare
-  // for a later Take) and starts again on spare, or on a fresh array when spare is null.
-  public ArraySegment<byte> Take(byte[] spare)
+  // Moves everything written into batch, in order, and starts empty.
+  public void MoveTo(SocketWriteBatch batch)
   {
-    var batch = new ArraySegment<byte>(Buffer, 0, Written);
-    Buffer = spare ?? [];
-    Written = 0;
-    return batch;
+    foreach (var segment in Filled)
+      batch.Add(segment);
+    Filled.Clear();
+    if (CurrentWritten > 0)
+    {
+      batch.Add(new ArraySegment<byte>(Current, 0, CurrentWritten));
+      Current = null;
+      CurrentWritten = 0;
+    }
+
+    Length = 0;
+  }
+
+  // Returns every segment to the pool, written or not.
+  public void Release()
+  {
+    foreach (var segment in Filled)
+      ArrayPool<byte>.Shared.Return(segment.Array);
+    Filled.Clear();
+    if (Current is not null)
+      ArrayPool<byte>.Shared.Return(Current);
+    Current = null;
+    CurrentWritten = 0;
+    Length = 0;
   }
 
   void Ensure(int sizeHint)
   {
     var needed = Math.Max(1, sizeHint);
-    if (Buffer.Length - Written >= needed)
+    if (Current is not null && Current.Length - CurrentWritten >= needed)
       return;
 
-    var size = (int)Math.Min(Array.MaxLength, Math.Max((long)Written + needed, Math.Max(InitialBytes, Buffer.Length * 2L)));
-    var grown = ArrayPool<byte>.Shared.Rent(size);
-    Buffer.AsSpan(0, Written).CopyTo(grown);
-    if (Buffer.Length > 0)
-      ArrayPool<byte>.Shared.Return(Buffer);
-    Buffer = grown;
+    // The current segment is full (or too small for this request): seal it and start another.
+    if (Current is not null)
+    {
+      if (CurrentWritten > 0)
+        Filled.Add(new ArraySegment<byte>(Current, 0, CurrentWritten));
+      else
+        ArrayPool<byte>.Shared.Return(Current);
+    }
+
+    Current = ArrayPool<byte>.Shared.Rent(Math.Max(SegmentBytes, needed));
+    CurrentWritten = 0;
+  }
+}
+
+// A batch being written to the socket: the segments taken from SocketWriteBuffer, in order. Owned by the
+// connection's flusher, one batch at a time.
+sealed class SocketWriteBatch
+{
+  readonly List<ArraySegment<byte>> Segments = [];
+
+  public long Length { get; private set; }
+  public bool IsEmpty => Segments.Count == 0;
+
+  public void Add(ArraySegment<byte> segment)
+  {
+    Segments.Add(segment);
+    Length += segment.Count;
+  }
+
+  // Writes the segments in order, each in one socket write.
+  public ValueTask WriteToAsync(Stream stream, CancellationToken cancellationToken)
+  {
+    return Segments.Count == 1
+        ? stream.WriteAsync(Segments[0].AsMemory(), cancellationToken)
+        : WriteAllAsync(stream, cancellationToken);
+  }
+
+  async ValueTask WriteAllAsync(Stream stream, CancellationToken cancellationToken)
+  {
+    foreach (var segment in Segments)
+      await stream.WriteAsync(segment.AsMemory(), cancellationToken);
+  }
+
+  // Returns the segments to the pool and empties the batch.
+  public void Release()
+  {
+    foreach (var segment in Segments)
+      ArrayPool<byte>.Shared.Return(segment.Array);
+    Segments.Clear();
+    Length = 0;
   }
 }

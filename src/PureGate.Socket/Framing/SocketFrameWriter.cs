@@ -89,12 +89,15 @@ sealed class SocketFrameWriter(
     var bodyLength = (long)layout.Length + payload.Length;
     if (bodyLength <= maxFrameSizeBytes)
     {
-      var span = Target.GetSpan(4 + (int)bodyLength);
+      // The header into one span, then the payload copied across as many buffer segments as it needs, so a
+      // large frame never needs a buffer of its own size.
+      var headerSize = 4 + layout.Length;
+      var span = Target.GetSpan(headerSize);
       BinaryPrimitives.WriteInt32BigEndian(span, (int)bodyLength);
       var offset = 4;
       layout.Write(span, ref offset, frame);
-      payload.Span.CopyTo(span.Slice(offset));
-      Target.Advance(4 + (int)bodyLength);
+      Target.Advance(headerSize);
+      Target.Write(payload.Span);
       BytesWritten += 4 + bodyLength;
       if (method.Defines)
         Methods[(frame.Service, frame.Operation)] = method.Id;
@@ -136,7 +139,7 @@ sealed class SocketFrameWriter(
     if (bodyLength > maxFrameSizeBytes)
       throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Chunk exceeds the configured maximum size.");
 
-    var span = Target.GetSpan(4 + bodyLength);
+    var span = Target.GetSpan(4 + headerLength);
     BinaryPrimitives.WriteInt32BigEndian(span, bodyLength);
     var offset = 4;
     span[offset++] = (byte)SocketMessageKind.Chunk;
@@ -146,9 +149,9 @@ sealed class SocketFrameWriter(
     SocketWire.WriteVarint(span, ref offset, (ulong)index);
     SocketWire.WriteVarint(span, ref offset, (ulong)count);
     SocketWire.WriteVarint(span, ref offset, (ulong)total);
-    first.CopyTo(span.Slice(offset));
-    second.CopyTo(span.Slice(offset + first.Length));
-    Target.Advance(4 + bodyLength);
+    Target.Advance(4 + headerLength);
+    Target.Write(first);
+    Target.Write(second);
     BytesWritten += 4 + bodyLength;
   }
 

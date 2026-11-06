@@ -14,7 +14,8 @@ public sealed class SocketFabricOptions
   public string NodeId { get; init; } = Environment.MachineName;
   public int MaxFrameSizeBytes { get; init; } = 1024 * 1024;
   public int MaxDecompressedPayloadSizeBytes { get; init; } = 128 * 1024 * 1024;
-  public int MaxChunkPayloadBytes { get; init; } = 256 * 1024;
+  // Chunk size for messages larger than one frame. 64 KB keeps every chunk buffer off the large object heap.
+  public int MaxChunkPayloadBytes { get; init; } = 64 * 1024;
   public int MaxChunkedMessages { get; init; } = 1024;
   // Memory one connection may hold for its remote peer: chunked messages being reassembled, received
   // messages until their handler finishes, decompressed payloads and unread stream data (see
@@ -22,7 +23,9 @@ public sealed class SocketFabricOptions
   // whose data does not fit fails with overloaded, and an event closes the connection.
   public long MaxConnectionMemoryBytes { get; init; } = 256L * 1024 * 1024;
   public int MaxInFlightRequests { get; init; } = 1024;
-  public int MaxConcurrentHandlers { get; init; } = 16;
+  // Handlers running at once on one connection. High enough that handlers waiting on I/O (a database, another
+  // service) do not cap a connection's throughput; CPU-bound handlers are still limited by the thread pool.
+  public int MaxConcurrentHandlers { get; init; } = 100;
   public int MaxQueuedHandlers { get; init; } = 4096;
   public int MaxIdempotencyEntries { get; init; } = 100_000;
   // Bytes a stream consumer lets its producer send ahead of what the application has read. The window
@@ -45,6 +48,14 @@ public sealed class SocketFabricOptions
   public int MaxHandshakeFrameBytes { get; init; } = 16 * 1024;
   public int MaxPendingHandshakes { get; init; } = 256;
   public int MaxConnections { get; init; } = int.MaxValue;
+
+  // Kernel send and receive buffer size per connection, in bytes; 0 keeps the operating system's default.
+  // Applied before the connection is established, so TCP can scale its window to it, and used by the
+  // kernel only for data actually buffered. The default is 1 MB on Windows, whose default buffers make
+  // each socket write wait for the remote to drain the previous one: measured on loopback, 1 MB messages
+  // from 16 callers ran 9x faster and 64 KB messages from 64 callers 3x faster with 1 MB buffers. Elsewhere
+  // the default is 0: Linux tunes its buffers automatically, and setting them turns that tuning off.
+  public int SocketBufferBytes { get; init; } = OperatingSystem.IsWindows() ? 1024 * 1024 : 0;
 
   // Longest gap allowed between two stream chunks once a stream has started. The open timeout only
   // covers the time until the stream starts.
@@ -109,6 +120,7 @@ public sealed class SocketFabricOptions
       MaxHandshakeFrameBytes = Math.Clamp(MaxHandshakeFrameBytes, 1024, Math.Clamp(MaxFrameSizeBytes, 1024, 128 * 1024 * 1024)),
       MaxPendingHandshakes = Math.Max(1, MaxPendingHandshakes),
       MaxConnections = Math.Max(1, MaxConnections),
+      SocketBufferBytes = Math.Clamp(SocketBufferBytes, 0, 64 * 1024 * 1024),
       StreamIdleTimeout = StreamIdleTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : StreamIdleTimeout,
       LivenessProbeTimeout = LivenessProbeTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(5) : LivenessProbeTimeout,
       IncludeExceptionDetails = IncludeExceptionDetails,

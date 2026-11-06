@@ -15,7 +15,7 @@ public sealed partial class SocketPeer
     CloseWrites();
     MessageCredits.Fail(Lifetime.Token);
     DrainHandlerQueue();
-    IncomingChunks.Clear();
+    ReleaseIncomingChunks();
     foreach (var active in ActiveRequests.Values)
       active.Source.Cancel();
     ActiveRequests.Clear();

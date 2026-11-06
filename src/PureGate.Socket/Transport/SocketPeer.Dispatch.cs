@@ -22,7 +22,17 @@ public sealed partial class SocketPeer
         PruneExpiredChunks();
         if (frame.Kind == SocketMessageKind.Chunk)
         {
-          frame = ReassembleChunk(frame);
+          // A chunk's payload is a pooled buffer; reassembly keeps it, and any it did not keep goes back here.
+          var chunk = frame;
+          try
+          {
+            frame = ReassembleChunk(chunk);
+          }
+          finally
+          {
+            chunk.ReleasePayload();
+          }
+
           if (frame is null)
             continue;
         }
