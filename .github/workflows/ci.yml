@@ -10,13 +10,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-26.04, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
@@ -47,11 +47,11 @@ jobs:
 
       # Checks that the package builds; the artifact is never published.
       - name: Pack
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-26.04'
         run: dotnet pack src/PureGate.Socket -c Release --no-build -o artifacts/packages
 
-      - uses: actions/upload-artifact@v4
-        if: matrix.os == 'ubuntu-latest'
+      - uses: actions/upload-artifact@v7
+        if: matrix.os == 'ubuntu-26.04'
         with:
           name: packages
           path: artifacts/packages/
@@ -59,7 +59,7 @@ jobs:
       - name: Benchmark smoke run
         run: dotnet run -c Release --no-build --project src/PureGate.Socket.Benchmarks -- --quick --json artifacts/bench-${{ matrix.os }}.json
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-${{ matrix.os }}

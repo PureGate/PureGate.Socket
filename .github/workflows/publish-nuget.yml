@@ -2,6 +2,7 @@ name: Publish Nuget Package
 
 # Manual: Actions > Publish Nuget Package > Run workflow. Publishes the version in VersionPrefix of
 # src/PureGate.Socket/PureGate.Socket.csproj, then tags the commit and creates a GitHub release.
+# Any failure stops the run: nothing is tagged, released or uploaded unless nuget.org accepted the package.
 on:
   workflow_dispatch:
     inputs:
@@ -16,16 +17,17 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
+      # Refuses a version that is already tagged or already on nuget.org, before anything is built.
       - name: Version
         id: version
         shell: bash
@@ -33,7 +35,17 @@ jobs:
           version=$(dotnet msbuild src/PureGate.Socket/PureGate.Socket.csproj -getProperty:Version)
           echo "Publishing PureGate.Socket $version"
           if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
-            echo "::error::v$version is already released. Raise VersionPrefix in src/PureGate.Socket/PureGate.Socket.csproj."
+            echo "::error::v$version is already tagged. Raise VersionPrefix in src/PureGate.Socket/PureGate.Socket.csproj."
+            exit 1
+          fi
+          # 200 lists the published versions; 404 means nothing is published yet.
+          status=$(curl -sS --retry 3 -o versions.json -w '%{http_code}' https://api.nuget.org/v3-flatcontainer/puregate.socket/index.json)
+          if [ "$status" != "200" ] && [ "$status" != "404" ]; then
+            echo "::error::Could not read the published versions from nuget.org (HTTP $status)."
+            exit 1
+          fi
+          if [ "$status" = "200" ] && grep -qi "\"${version}\"" versions.json; then
+            echo "::error::PureGate.Socket $version is already on nuget.org. Raise VersionPrefix in src/PureGate.Socket/PureGate.Socket.csproj."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -57,22 +69,18 @@ jobs:
       - name: Pack
         run: dotnet pack src/PureGate.Socket -c Release --no-build -o artifacts/packages
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: packages
-          path: artifacts/packages/
-
       # Exchanges the OIDC token for a temporary API key (valid for an hour), per the trusted publishing
-      # policy on nuget.org. user is the nuget.org profile name of the policy's owner.
+      # policy on nuget.org. user is the nuget.org profile name of the policy's creator.
       - name: NuGet login
         id: nuget-login
         uses: NuGet/login@v1
         with:
           user: koculu
 
-      # The symbols package (.snupkg) next to it is pushed along with it.
+      # No --skip-duplicate: a package nuget.org refuses (a conflict included) fails the run. The symbols
+      # package (.snupkg) next to it is pushed along with it.
       - name: Publish the package to nuget.org
-        run: dotnet nuget push "artifacts/packages/*.nupkg" -k "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push "artifacts/packages/*.nupkg" -k "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json
 
       - name: Tag and GitHub release
         env:
@@ -82,3 +90,8 @@ jobs:
           --target "$GITHUB_SHA"
           --title "PureGate.Socket ${{ steps.version.outputs.version }}"
           --generate-notes
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: artifacts/packages/

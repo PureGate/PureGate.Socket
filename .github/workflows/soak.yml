@@ -18,13 +18,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.os == 'both' && '["ubuntu-latest", "windows-latest"]' || format('["{0}-latest"]', inputs.os)) }}
+        os: ${{ fromJSON(inputs.os == 'both' && '["ubuntu-26.04", "windows-latest"]' || inputs.os == 'windows' && '["windows-latest"]' || '["ubuntu-26.04"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
