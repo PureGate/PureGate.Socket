@@ -11,7 +11,7 @@ using PureGate.Socket.Serialization;
 using PureGate.Socket.Transport;
 
 // The matrix suite: latency percentiles, payload sizes, connection scaling, TLS and compression variants,
-// and a raw-socket ceiling so every PureGate number can be read against what the machine can do.
+// and a raw-socket ceiling so every PureGate.Socket number can be read against what the machine can do.
 static class MatrixBenchmarks
 {
   static readonly int[] PayloadSizes = [64, 1024, 64 * 1024, 1024 * 1024];
@@ -45,7 +45,7 @@ static class MatrixBenchmarks
     foreach (var connections in ConnectionCounts)
       results.Add(await MeasureConcurrentAsync($"raw socket echo 1KB x{connections} conn", connections, 20_000 / scale, 1024, RawEchoSession.StartAsync));
 
-    Console.WriteLine("Matrix: PureGate RPC");
+    Console.WriteLine("Matrix: PureGate.Socket RPC");
     foreach (var size in PayloadSizes)
       results.Add(await MeasureSequentialAsync($"rpc echo {Size(size)}", Iterations(size) / scale, size, () => PeerEchoSession.StartAsync(Variant.Plain, certificate)));
     foreach (var connections in ConnectionCounts)

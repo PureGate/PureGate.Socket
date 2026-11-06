@@ -12,8 +12,7 @@ using PureGate.Socket.Transport;
 namespace PureGate.Socket.Test;
 
 // Regression tests: each one reproduces a specific defect and fails without its fix.
-// Each test names the bug number it guards. Tests that need the Phase 2 connection-core rework are
-// ignored with the reason, so the suite stays green while still documenting the open defect.
+// Each test names the bug number it guards.
 public sealed partial class SocketFabricTests
 {
 
@@ -1670,8 +1669,8 @@ public sealed partial class SocketFabricTests
     }
   }
 
-  // Stress tests for defects suspected from code reading. They may pass today because the races are
-  // narrow; they exist so the Phase 2 rework is checked against them.
+  // Stress tests for races suspected from code reading. The races are narrow, so these mostly guard
+  // future changes to the connection core.
 
   [Test]
   [Category("Stress")]
