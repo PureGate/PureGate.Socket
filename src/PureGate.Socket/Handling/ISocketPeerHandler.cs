@@ -15,16 +15,6 @@ public interface ISocketPeerHandler
       SocketRequest request,
       CancellationToken cancellationToken);
 
-  ValueTask<SocketResponse> HandleFastRequestAsync(
-      SocketPeer peer,
-      SocketFastRequest request,
-      CancellationToken cancellationToken)
-  {
-    return ValueTask.FromResult(SocketResponse.Failed(
-        SocketProtocolError.UnsupportedOperation,
-        "Fast request was not handled."));
-  }
-
   ValueTask<SocketStreamResponse> HandleStreamAsync(
       SocketPeer peer,
       SocketStreamRequest request,

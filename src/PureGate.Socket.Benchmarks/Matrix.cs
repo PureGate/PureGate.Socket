@@ -48,8 +48,6 @@ static class MatrixBenchmarks
     Console.WriteLine("Matrix: PureGate RPC");
     foreach (var size in PayloadSizes)
       results.Add(await MeasureSequentialAsync($"rpc echo {Size(size)}", Iterations(size) / scale, size, () => PeerEchoSession.StartAsync(Variant.Plain, certificate)));
-    foreach (var size in PayloadSizes)
-      results.Add(await MeasureSequentialAsync($"fast rpc echo {Size(size)}", Iterations(size) / scale, size, () => PeerEchoSession.StartAsync(Variant.Plain, certificate, fast: true)));
     foreach (var connections in ConnectionCounts)
       results.Add(await MeasureConcurrentAsync($"rpc echo 1KB x{connections} conn", connections, 20_000 / scale, 1024, () => PeerEchoSession.StartAsync(Variant.Plain, certificate)));
     foreach (var callers in MultiplexedCallers)
@@ -306,21 +304,20 @@ static class MatrixBenchmarks
     ValueTask<Func<byte[], ValueTask>> CreateEchoAsync();
   }
 
-  sealed class PeerEchoSession(SocketListener listener, Variant variant, X509Certificate2 certificate, bool fast) : IEchoSession
+  sealed class PeerEchoSession(SocketListener listener, Variant variant, X509Certificate2 certificate) : IEchoSession
   {
     readonly List<SocketPeer> Clients = [];
 
-    public static async ValueTask<IEchoSession> StartAsync(Variant variant, X509Certificate2 certificate, bool fast = false)
+    public static async ValueTask<IEchoSession> StartAsync(Variant variant, X509Certificate2 certificate)
     {
       var listener = new SocketListener(Options("server", variant, certificate));
       await listener.StartAsync(
           new IPEndPoint(IPAddress.Loopback, 0),
           new BenchmarkHandler
           {
-            OnRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse { Succeeded = true, Payload = request.Payload }),
-            OnFastRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse { Succeeded = true, Payload = request.Payload })
+            OnRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse { Succeeded = true, Payload = request.Payload })
           });
-      return new PeerEchoSession(listener, variant, certificate, fast);
+      return new PeerEchoSession(listener, variant, certificate);
     }
 
     public static SocketFabricOptions Options(string nodeId, Variant variant, X509Certificate2 certificate)
@@ -351,9 +348,7 @@ static class MatrixBenchmarks
           .ConnectAsync(listener.EndPoint, new BenchmarkHandler());
       Clients.Add(client);
       var timeout = TimeSpan.FromSeconds(30);
-      return fast
-          ? async payload => Check(await client.RequestFastAsync(1, payload, timeout), payload.Length)
-          : async payload => Check(await client.RequestAsync("bench", "echo", payload, timeout), payload.Length);
+      return async payload => Check(await client.RequestAsync("bench", "echo", payload, timeout), payload.Length);
     }
 
     static void Check(SocketRequestResult result, int expectedLength)

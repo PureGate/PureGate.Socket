@@ -7,11 +7,11 @@ namespace PureGate.Socket.Protocol;
 
 public sealed class SocketFabricOptions
 {
+  // Sent in the handshake so peers built from mismatched sources fail at connect time.
   public const int CurrentProtocolVersion = 1;
   const int MaxWindowLimit = 512 * 1024 * 1024;
 
   public string NodeId { get; init; } = Environment.MachineName;
-  public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
   public int MaxFrameSizeBytes { get; init; } = 1024 * 1024;
   public int MaxDecompressedPayloadSizeBytes { get; init; } = 128 * 1024 * 1024;
   public int MaxChunkPayloadBytes { get; init; } = 256 * 1024;
@@ -38,6 +38,11 @@ public sealed class SocketFabricOptions
   // covers the time until the stream starts.
   public TimeSpan StreamIdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
+  // After a request times out without anything arriving from the remote, how long a liveness ping may
+  // take before the connection is declared dead and closed. Detects half-open links long before
+  // IdleTimeout would.
+  public TimeSpan LivenessProbeTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
   // When false (the default), handler exception messages are replaced with a generic message before
   // they are sent to the remote peer. The full exception always reaches ISocketObserver.HandlerFailed.
   public bool IncludeExceptionDetails { get; init; }
@@ -45,6 +50,9 @@ public sealed class SocketFabricOptions
   // Whether an event rejected by the authorizer closes the connection. Events have no response, so
   // closing is the only signal the sender gets.
   public bool CloseOnUnauthorizedEvent { get; init; } = true;
+
+  // Whether events from one connection are handled in order. Sequential by default.
+  public SocketEventOrdering EventOrdering { get; init; } = SocketEventOrdering.Sequential;
   public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(15);
   public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromSeconds(45);
   public ISocketMessageCodec Codec { get; init; } = JsonSocketMessageCodec.Shared;
@@ -68,9 +76,6 @@ public sealed class SocketFabricOptions
     return new SocketFabricOptions
     {
       NodeId = string.IsNullOrWhiteSpace(NodeId) ? Environment.MachineName : NodeId.Trim(),
-      ProtocolVersion = ProtocolVersion == SocketFabricOptions.CurrentProtocolVersion
-          ? ProtocolVersion
-          : SocketFabricOptions.CurrentProtocolVersion,
       MaxFrameSizeBytes = Math.Clamp(MaxFrameSizeBytes, 1024, 128 * 1024 * 1024),
       MaxDecompressedPayloadSizeBytes = Math.Clamp(MaxDecompressedPayloadSizeBytes, 1024, 1024 * 1024 * 1024),
       MaxChunkPayloadBytes = Math.Clamp(MaxChunkPayloadBytes, 1, Math.Max(1, MaxFrameSizeBytes / 4)),
@@ -90,8 +95,10 @@ public sealed class SocketFabricOptions
       ChunkTimeout = ChunkTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : ChunkTimeout,
       HandshakeTimeout = HandshakeTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(5) : HandshakeTimeout,
       StreamIdleTimeout = StreamIdleTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : StreamIdleTimeout,
+      LivenessProbeTimeout = LivenessProbeTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(5) : LivenessProbeTimeout,
       IncludeExceptionDetails = IncludeExceptionDetails,
       CloseOnUnauthorizedEvent = CloseOnUnauthorizedEvent,
+      EventOrdering = Enum.IsDefined(EventOrdering) ? EventOrdering : SocketEventOrdering.Sequential,
       HeartbeatInterval = heartbeatInterval,
       IdleTimeout = idleTimeout,
       Codec = Codec ?? JsonSocketMessageCodec.Shared,

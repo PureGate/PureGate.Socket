@@ -22,19 +22,19 @@ public interface ISocketObserver
   {
   }
 
-  void ClientConnectStarted(IPEndPoint remoteEndPoint)
+  void ClientConnectStarted(EndPoint remoteEndPoint)
   {
   }
 
-  void ClientConnectFailed(IPEndPoint remoteEndPoint, Exception exception)
+  void ClientConnectFailed(EndPoint remoteEndPoint, Exception exception)
   {
   }
 
-  void ClientReconnectScheduled(IPEndPoint remoteEndPoint, TimeSpan delay)
+  void ClientReconnectScheduled(EndPoint remoteEndPoint, TimeSpan delay)
   {
   }
 
-  void ClientKeepConnectedLoopFailed(IPEndPoint remoteEndPoint, Exception exception)
+  void ClientKeepConnectedLoopFailed(EndPoint remoteEndPoint, Exception exception)
   {
   }
 

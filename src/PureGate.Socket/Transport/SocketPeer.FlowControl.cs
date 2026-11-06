@@ -47,18 +47,18 @@ public sealed partial class SocketPeer
   // Read loop: a Credit frame from the remote.
   void DispatchCredit(SocketFrame frame)
   {
-    if (frame.OperationId <= 0)
+    if (frame.Value <= 0)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Credit frame carries no credit.");
 
     if (frame.MessageId == 0)
     {
-      MessageCredits.Release(frame.OperationId);
+      MessageCredits.Release(frame.Value);
       return;
     }
 
     // A grant for a stream that already ended is harmless and ignored.
     if (OutgoingStreams.TryGetValue(frame.MessageId, out var window))
-      window.Grant(frame.OperationId);
+      window.Grant(frame.Value);
   }
 
   internal void SendCreditInBackground(long messageId, long amount)
@@ -66,10 +66,9 @@ public sealed partial class SocketPeer
     // Grants are capped well below int.MaxValue by the window limits, so this never truncates.
     SendControlInBackground(new SocketFrame
     {
-      Version = Options.ProtocolVersion,
       MessageId = messageId,
       Kind = SocketMessageKind.Credit,
-      OperationId = (int)amount
+      Value = (int)amount
     });
   }
 
@@ -96,11 +95,11 @@ public sealed partial class SocketPeer
   }
 
   // The handshake's proof (client to server) and ready (server to client) frames carry the sender's
-  // message window in OperationId.
+  // message window in their value.
   internal static int ReadHandshakeWindow(SocketFrame frame)
   {
-    if (frame.OperationId <= 0)
+    if (frame.Value <= 0)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Handshake carries no flow-control window.");
-    return frame.OperationId;
+    return frame.Value;
   }
 }

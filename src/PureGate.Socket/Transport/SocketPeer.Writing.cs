@@ -59,7 +59,7 @@ public sealed partial class SocketPeer
 
     frame.WriteStarted = true;
     var abandonable = cancellationToken.CanBeCanceled && payloadOverride.IsEmpty;
-    var lease = abandonable && frame.PayloadLength > Options.MaxChunkPayloadBytes ? new PayloadLease() : null;
+    var lease = abandonable && MayBeChunked(frame) ? new PayloadLease() : null;
     var write = WriteLockedFrameAsync(frame, payloadOverride, lease);
     if (write.IsCompleted || !abandonable)
     {
@@ -84,28 +84,26 @@ public sealed partial class SocketPeer
     }
   }
 
+  // Conservative: true for any frame whose encoded body could exceed one wire frame (a chunk is at most a
+  // quarter of the frame limit, and a UTF-8 character at most three bytes).
+  bool MayBeChunked(SocketFrame frame)
+  {
+    var text = (long)(frame.Service?.Length ?? 0) + (frame.Operation?.Length ?? 0) + (frame.IdempotencyKey?.Length ?? 0)
+        + (frame.ErrorCode?.Length ?? 0) + (frame.ErrorMessage?.Length ?? 0);
+    return frame.PayloadLength + 3 * text + 64 > Options.MaxChunkPayloadBytes;
+  }
+
   // Runs with WriteLock held; FinishWriteAsync releases it.
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask WriteLockedFrameAsync(SocketFrame frame, ReadOnlyMemory<byte> payloadOverride, PayloadLease lease)
   {
     try
     {
-      try
-      {
-        Writer.Encode(frame, payloadOverride);
+      var oversized = Writer.Encode(frame, payloadOverride);
+      if (oversized is null)
         ObserveFrameSent(frame, payloadOverride.IsEmpty ? frame.PayloadLength : payloadOverride.Length);
-      }
-      catch (SocketProtocolException ex)
-          when (ex.ErrorCode == SocketProtocolError.PayloadTooLarge
-              && frame.Kind != SocketMessageKind.Chunk
-              && (frame.PayloadLength > 0 || payloadOverride.Length > 0))
-      {
-        await WriteChunkedFrameAsync(
-            frame,
-            payloadOverride.IsEmpty ? frame.PayloadMemory : payloadOverride,
-            lease,
-            Lifetime.Token);
-      }
+      else
+        await WriteChunkedFrameAsync(oversized, lease, Lifetime.Token);
     }
     catch
     {
@@ -174,55 +172,48 @@ public sealed partial class SocketPeer
     }
   }
 
-  async ValueTask WriteChunkedFrameAsync(
-      SocketFrame frame,
-      ReadOnlyMemory<byte> payload,
-      PayloadLease lease,
-      CancellationToken cancellationToken)
+  // Sends a frame too large for one wire frame as consecutive chunks of its encoded body (the header,
+  // already encoded, followed by the payload). Chunks are equal-sized except the last.
+  async ValueTask WriteChunkedFrameAsync(OversizedFrame oversized, PayloadLease lease, CancellationToken cancellationToken)
   {
-    var chunkSize = Math.Min(Options.MaxChunkPayloadBytes, payload.Length);
-    if (chunkSize <= 0)
-      throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Frame exceeds the configured maximum size.");
-
-    var chunkCount = (payload.Length + chunkSize - 1) / chunkSize;
+    var header = oversized.Header;
+    var payload = oversized.Payload;
+    var total = oversized.TotalLength;
+    var chunkSize = Options.MaxChunkPayloadBytes;
+    var chunkCount = (int)(((long)total + chunkSize - 1) / chunkSize);
     for (var index = 0; index < chunkCount; index++)
     {
-      var offset = index * chunkSize;
-      var count = Math.Min(chunkSize, payload.Length - offset);
-      var chunk = new SocketFrame
-      {
-        Version = frame.Version,
-        MessageId = frame.MessageId,
-        Kind = SocketMessageKind.Chunk,
-        OriginalKind = frame.Kind,
-        OperationId = frame.OperationId,
-        Service = frame.Service,
-        Operation = frame.Operation,
-        IdempotencyKey = frame.IdempotencyKey,
-        Flags = frame.Flags,
-        DeadlineMs = frame.DeadlineMs,
-        ChunkIndex = index,
-        ChunkCount = chunkCount,
-        TotalPayloadLength = payload.Length,
-        Ok = frame.Ok,
-        ErrorCode = frame.ErrorCode,
-        ErrorMessage = frame.ErrorMessage
-      };
+      var start = index * chunkSize;
+      var end = (int)Math.Min(total, (long)start + chunkSize);
+      var headerPart = start < header.Length
+          ? header.AsSpan(start, Math.Min(end, header.Length) - start)
+          : ReadOnlySpan<byte>.Empty;
+      var payloadStart = Math.Max(0, start - header.Length);
+      var payloadEnd = Math.Max(0, end - header.Length);
 
       // Encoding is synchronous, so the payload is only read while the lease is held.
-      if (lease is not null && !lease.TryAcquire())
+      var touchesPayload = payloadEnd > payloadStart;
+      if (touchesPayload && lease is not null && !lease.TryAcquire())
         throw new OperationCanceledException("The caller cancelled; the rest of the chunked message is not sent.");
 
       try
       {
-        Writer.Encode(chunk, payload.Slice(offset, count));
+        Writer.EncodeChunk(
+            oversized.MessageId,
+            oversized.Kind,
+            index,
+            chunkCount,
+            total,
+            headerPart,
+            payload.Span.Slice(payloadStart, payloadEnd - payloadStart));
       }
       finally
       {
-        lease?.Release();
+        if (touchesPayload)
+          lease?.Release();
       }
 
-      ObserveFrameSent(chunk, count);
+      ObserveFrameSent(SocketMessageKind.Chunk, end - start);
 
       // Every chunk but the last is flushed here, so a large message never sits whole in the pipe. The
       // last one is flushed (or coalesced) by FinishWriteAsync like any other frame.

@@ -1,22 +1,25 @@
-using System.Runtime.CompilerServices;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
 using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
 using System.Text;
 using PureGate.Socket.Protocol;
 
 namespace PureGate.Socket.Framing;
 
+// Decodes frames in the wire format (see SocketWire). Used by one reader at a time: the connection's read
+// loop (or the handshake before it). It owns the receive side of the method table.
 sealed class SocketFrameReader(
     Stream stream,
     int maxFrameSizeBytes,
     SocketPayloadCompression compression = SocketPayloadCompression.None,
     int maxDecompressedPayloadSizeBytes = 128 * 1024 * 1024)
 {
-  readonly PipeReader Reader = PipeReader.Create(stream);
-
   const int MinimumReadHint = 4096;
+
+  readonly PipeReader Reader = PipeReader.Create(stream);
+  readonly List<(string Service, string Operation)> Methods = [];
 
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketFrame> ReadAsync(CancellationToken cancellationToken)
@@ -43,7 +46,7 @@ sealed class SocketFrameReader(
         Reader.AdvanceTo(buffer.End);
         return buffer.Length == 0
             ? null
-            : throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame is truncated.");
+            : throw Truncated();
       }
 
       Reader.AdvanceTo(buffer.Start, buffer.End);
@@ -68,7 +71,7 @@ sealed class SocketFrameReader(
     if (!reader.TryReadBigEndian(out int length))
       return false;
 
-    if (length < 1 || length > maxFrameSizeBytes)
+    if (length < 2 || length > maxFrameSizeBytes)
       throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Frame size is invalid.");
 
     if (reader.Remaining < length)
@@ -77,127 +80,121 @@ sealed class SocketFrameReader(
       return false;
     }
 
-    var payload = buffer.Slice(reader.Position, length);
+    var body = buffer.Slice(reader.Position, length);
     consumed = buffer.GetPosition(length, reader.Position);
-    frame = Decode(payload);
+    frame = DecodeBody(body, alias: null);
     return true;
   }
 
-  SocketFrame Decode(ReadOnlySequence<byte> payload)
+  // Decodes one frame body. When alias is the array the body lives in (a reassembled chunked frame, which
+  // nobody else uses), the payload is exposed in place instead of being copied.
+  internal SocketFrame DecodeBody(ReadOnlySequence<byte> body, byte[] alias)
   {
-    return payload.IsSingleSegment
-        ? Decode(payload.FirstSpan)
-        : DecodeSegmented(payload);
-  }
-
-  // A frame split across pipe segments (common for large frames). The header is parsed in place and the
-  // payload is copied straight into its final buffer, so the payload is copied once, not twice.
-  SocketFrame DecodeSegmented(ReadOnlySequence<byte> payload)
-  {
-    var reader = new SequenceReader<byte>(payload);
-    var version = ReadInt32(ref reader);
+    var reader = new SequenceReader<byte>(body);
     var kind = (SocketMessageKind)ReadByte(ref reader);
-    var fast = kind is SocketMessageKind.FastRequest or SocketMessageKind.FastResponse;
-    var messageId = ReadInt64(ref reader);
-    var operationId = ReadInt32(ref reader);
-    var flags = ReadInt32(ref reader);
-    var deadlineMs = ReadInt32(ref reader);
+    if (!Enum.IsDefined(kind))
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Unknown frame kind.");
+
+    int flags = ReadByte(ref reader);
     var frame = new SocketFrame
     {
-      Version = version,
       Kind = kind,
-      MessageId = messageId,
-      OperationId = operationId,
-      Flags = flags,
-      DeadlineMs = deadlineMs
+      MessageId = SocketWire.UnZigZag(ReadVarint(ref reader)),
+      Ok = (flags & SocketWire.Ok) != 0,
+      Flags = flags & SocketFrameFlags.Known,
+      Service = string.Empty,
+      Operation = string.Empty,
+      IdempotencyKey = string.Empty
     };
 
-    if (fast)
+    if ((flags & SocketWire.HasMethod) != 0)
+      ReadMethod(ref reader, frame);
+    if ((flags & SocketWire.HasDeadline) != 0)
+      frame.DeadlineMs = ReadInt32(ref reader);
+    if ((flags & SocketWire.HasIdempotencyKey) != 0)
+      frame.IdempotencyKey = ReadString(ref reader);
+    if ((flags & SocketWire.HasValue) != 0)
+      frame.Value = checked((int)SocketWire.UnZigZag(ReadVarint(ref reader)));
+    if ((flags & SocketWire.HasError) != 0)
     {
-      frame.Ok = ReadByte(ref reader) != 0;
-      frame.ErrorCode = kind == SocketMessageKind.FastResponse ? ReadString(ref reader) : string.Empty;
-      frame.ErrorMessage = kind == SocketMessageKind.FastResponse ? ReadString(ref reader) : string.Empty;
+      var index = ReadVarint(ref reader);
+      frame.ErrorCode = index == 0 ? ReadString(ref reader) : SocketWire.ErrorCodeAt(index);
+      frame.ErrorMessage = ReadString(ref reader);
     }
-    else
+
+    if (kind == SocketMessageKind.Chunk)
     {
       frame.OriginalKind = (SocketMessageKind)ReadByte(ref reader);
       frame.ChunkIndex = ReadInt32(ref reader);
       frame.ChunkCount = ReadInt32(ref reader);
       frame.TotalPayloadLength = ReadInt32(ref reader);
-      frame.Ok = ReadByte(ref reader) != 0;
-      frame.Service = ReadString(ref reader);
-      frame.Operation = ReadString(ref reader);
-      frame.IdempotencyKey = ReadString(ref reader);
-      frame.ErrorCode = ReadString(ref reader);
-      frame.ErrorMessage = ReadString(ref reader);
     }
 
-    var framePayload = ReadBytes(ref reader, pooled: kind == SocketMessageKind.StreamItem);
-    if (!reader.End)
-    {
-      framePayload.Dispose();
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains trailing bytes.");
-    }
-
-    frame.SetPayload(framePayload);
+    frame.SetPayload(ReadPayload(ref reader, kind, alias));
     return FinishFrame(frame);
   }
 
-  static byte ReadByte(ref SequenceReader<byte> reader)
+  void ReadMethod(ref SequenceReader<byte> reader, SocketFrame frame)
   {
-    if (!reader.TryRead(out var value))
-      throw Truncated();
-    return value;
+    var code = ReadVarint(ref reader);
+    if (code == 0)
+    {
+      frame.Service = ReadMethodName(ref reader);
+      frame.Operation = ReadMethodName(ref reader);
+      return;
+    }
+
+    var id = code >> 1;
+    if ((code & 1) != 0)
+    {
+      // Definitions arrive in order, numbered from 1, so the table only ever grows by one.
+      if (id != (ulong)Methods.Count + 1 || id > SocketWire.MaxMethods)
+        throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame defines a method out of order or past the limit.");
+
+      frame.Service = ReadMethodName(ref reader);
+      frame.Operation = ReadMethodName(ref reader);
+      Methods.Add((frame.Service, frame.Operation));
+      return;
+    }
+
+    if (id == 0 || id > (ulong)Methods.Count)
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame references an undefined method.");
+
+    (frame.Service, frame.Operation) = Methods[(int)id - 1];
   }
 
-  static int ReadInt32(ref SequenceReader<byte> reader)
+  static string ReadMethodName(ref SequenceReader<byte> reader)
   {
-    if (!reader.TryReadBigEndian(out int value))
-      throw Truncated();
-    return value;
+    var length = ReadVarint(ref reader);
+    if (length > SocketWire.MaxMethodNameBytes)
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Method name exceeds the limit.");
+    return ReadStringBytes(ref reader, length);
   }
 
-  static long ReadInt64(ref SequenceReader<byte> reader)
+  static SocketPayload ReadPayload(ref SequenceReader<byte> reader, SocketMessageKind kind, byte[] alias)
   {
-    if (!reader.TryReadBigEndian(out long value))
-      throw Truncated();
-    return value;
-  }
-
-  static string ReadString(ref SequenceReader<byte> reader)
-  {
-    var length = ReadInt32(ref reader);
-    if (length < 0)
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame string length is invalid.");
-    if (reader.Remaining < length)
-      throw Truncated();
-    if (length == 0)
-      return string.Empty;
-
-    var value = Encoding.UTF8.GetString(reader.UnreadSequence.Slice(0, length));
-    reader.Advance(length);
-    return value;
-  }
-
-  static SocketPayload ReadBytes(ref SequenceReader<byte> reader, bool pooled)
-  {
-    var length = ReadInt32(ref reader);
-    if (length < 0)
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame payload length is invalid.");
-    if (reader.Remaining < length)
-      throw Truncated();
+    var length = checked((int)reader.Remaining);
     if (length == 0)
       return SocketPayload.Empty;
 
-    var source = reader.UnreadSequence.Slice(0, length);
-    SocketPayload payload;
-    if (pooled)
+    if (alias is not null && kind != SocketMessageKind.StreamItem)
     {
+      var offset = checked((int)reader.Consumed);
+      reader.Advance(length);
+      return SocketPayload.Wrap(alias, offset, length);
+    }
+
+    var source = reader.UnreadSequence;
+    SocketPayload payload;
+    if (kind == SocketMessageKind.StreamItem)
+    {
+      // Stream data is pooled; the pull stream returns the buffer once the application has read it.
       payload = SocketPayload.Rent(length);
-      source.CopyTo(MemoryMarshalWritable(payload, length));
+      source.CopyTo(System.Runtime.InteropServices.MemoryMarshal.AsMemory(payload.Memory).Span);
     }
     else
     {
+      // Uninitialized: every byte is overwritten by the copy before anything can read it.
       var value = GC.AllocateUninitializedArray<byte>(length);
       source.CopyTo(value);
       payload = SocketPayload.Wrap(value);
@@ -207,118 +204,17 @@ sealed class SocketFrameReader(
     return payload;
   }
 
-  static Span<byte> MemoryMarshalWritable(SocketPayload payload, int length)
-  {
-    return System.Runtime.InteropServices.MemoryMarshal.AsMemory(payload.Memory).Span.Slice(0, length);
-  }
-
-  static SocketProtocolException Truncated()
-  {
-    return new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame is truncated.");
-  }
-
-  SocketFrame Decode(ReadOnlySpan<byte> payload)
-  {
-    var offset = 0;
-    var version = ReadInt32(payload, ref offset);
-    var kind = (SocketMessageKind)ReadByte(payload, ref offset);
-    if (kind is SocketMessageKind.FastRequest or SocketMessageKind.FastResponse)
-      return DecodeFast(payload, ref offset, version, kind);
-
-    var messageId = ReadInt64(payload, ref offset);
-    var operationId = ReadInt32(payload, ref offset);
-    var flags = ReadInt32(payload, ref offset);
-    var deadlineMs = ReadInt32(payload, ref offset);
-    var originalKind = (SocketMessageKind)ReadByte(payload, ref offset);
-    var chunkIndex = ReadInt32(payload, ref offset);
-    var chunkCount = ReadInt32(payload, ref offset);
-    var totalPayloadLength = ReadInt32(payload, ref offset);
-    var ok = ReadByte(payload, ref offset) != 0;
-    var service = ReadString(payload, ref offset);
-    var operation = ReadString(payload, ref offset);
-    var idempotencyKey = ReadString(payload, ref offset);
-    var errorCode = ReadString(payload, ref offset);
-    var errorMessage = ReadString(payload, ref offset);
-    var framePayload = ReadBytes(payload, ref offset, kind == SocketMessageKind.StreamItem);
-    if (offset != payload.Length)
-    {
-      framePayload.Dispose();
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains trailing bytes.");
-    }
-
-    var frame = new SocketFrame
-    {
-      Version = version,
-      Kind = kind,
-      OriginalKind = originalKind,
-      MessageId = messageId,
-      OperationId = operationId,
-      Flags = flags,
-      DeadlineMs = deadlineMs,
-      ChunkIndex = chunkIndex,
-      ChunkCount = chunkCount,
-      TotalPayloadLength = totalPayloadLength,
-      Ok = ok,
-      Service = service,
-      Operation = operation,
-      IdempotencyKey = idempotencyKey,
-      ErrorCode = errorCode,
-      ErrorMessage = errorMessage
-    };
-    frame.SetPayload(framePayload);
-    return FinishFrame(frame);
-  }
-
-  SocketFrame DecodeFast(
-      ReadOnlySpan<byte> payload,
-      ref int offset,
-      int version,
-      SocketMessageKind kind)
-  {
-    var messageId = ReadInt64(payload, ref offset);
-    var operationId = ReadInt32(payload, ref offset);
-    var flags = ReadInt32(payload, ref offset);
-    var deadlineMs = ReadInt32(payload, ref offset);
-    var ok = ReadByte(payload, ref offset) != 0;
-    var errorCode = kind == SocketMessageKind.FastResponse ? ReadString(payload, ref offset) : string.Empty;
-    var errorMessage = kind == SocketMessageKind.FastResponse ? ReadString(payload, ref offset) : string.Empty;
-    var framePayload = ReadBytes(payload, ref offset, pooled: false);
-    if (offset != payload.Length)
-    {
-      framePayload.Dispose();
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains trailing bytes.");
-    }
-
-    var frame = new SocketFrame
-    {
-      Version = version,
-      Kind = kind,
-      MessageId = messageId,
-      OperationId = operationId,
-      Flags = flags,
-      DeadlineMs = deadlineMs,
-      Ok = ok,
-      ErrorCode = errorCode,
-      ErrorMessage = errorMessage
-    };
-    frame.SetPayload(framePayload);
-    return FinishFrame(frame);
-  }
-
-  // Shared final step of every decoder: rejects unknown flags and decompresses a compressed payload.
+  // Final step of every decode: decompresses a compressed payload.
   SocketFrame FinishFrame(SocketFrame frame)
   {
     try
     {
-      if ((frame.Flags & ~SocketFrameFlags.Known) != 0)
-        throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains unsupported flags.");
-
       if ((frame.Flags & SocketFrameFlags.PayloadCompressed) != 0)
       {
         if (compression != SocketPayloadCompression.Brotli)
           throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Compressed payload is not supported by this peer.");
 
-        frame.Payload = DecompressBrotli(frame.PayloadMemory.ToArray());
+        frame.Payload = DecompressBrotli(frame.PayloadMemory.Span);
         frame.Flags &= ~SocketFrameFlags.PayloadCompressed;
       }
     }
@@ -331,9 +227,9 @@ sealed class SocketFrameReader(
     return frame;
   }
 
-  byte[] DecompressBrotli(byte[] payload)
+  byte[] DecompressBrotli(ReadOnlySpan<byte> payload)
   {
-    using var input = new MemoryStream(payload);
+    using var input = new MemoryStream(payload.ToArray());
     using var brotli = new BrotliStream(input, CompressionMode.Decompress);
     using var output = new MemoryStream();
     var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
@@ -359,67 +255,54 @@ sealed class SocketFrameReader(
     return output.ToArray();
   }
 
-  static byte ReadByte(ReadOnlySpan<byte> buffer, ref int offset)
+  static byte ReadByte(ref SequenceReader<byte> reader)
   {
-    EnsureRemaining(buffer, offset, 1);
-    return buffer[offset++];
-  }
-
-  static int ReadInt32(ReadOnlySpan<byte> buffer, ref int offset)
-  {
-    EnsureRemaining(buffer, offset, 4);
-    var value = BinaryPrimitives.ReadInt32BigEndian(buffer.Slice(offset, 4));
-    offset += 4;
+    if (!reader.TryRead(out var value))
+      throw Truncated();
     return value;
   }
 
-  static long ReadInt64(ReadOnlySpan<byte> buffer, ref int offset)
+  static ulong ReadVarint(ref SequenceReader<byte> reader)
   {
-    EnsureRemaining(buffer, offset, 8);
-    var value = BinaryPrimitives.ReadInt64BigEndian(buffer.Slice(offset, 8));
-    offset += 8;
-    return value;
-  }
-
-  static string ReadString(ReadOnlySpan<byte> buffer, ref int offset)
-  {
-    var length = ReadInt32(buffer, ref offset);
-    if (length < 0)
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame string length is invalid.");
-    EnsureRemaining(buffer, offset, length);
-    var value = length == 0
-        ? string.Empty
-        : Encoding.UTF8.GetString(buffer.Slice(offset, length));
-    offset += length;
-    return value;
-  }
-
-  static SocketPayload ReadBytes(ReadOnlySpan<byte> buffer, ref int offset, bool pooled)
-  {
-    var length = ReadInt32(buffer, ref offset);
-    if (length < 0)
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame payload length is invalid.");
-    EnsureRemaining(buffer, offset, length);
-    if (length == 0)
-      return SocketPayload.Empty;
-
-    if (pooled)
+    ulong value = 0;
+    for (var shift = 0; shift < 64; shift += 7)
     {
-      var payload = SocketPayload.Copy(buffer.Slice(offset, length));
-      offset += length;
-      return payload;
+      var b = ReadByte(ref reader);
+      value |= (ulong)(b & 0x7F) << shift;
+      if ((b & 0x80) == 0)
+        return value;
     }
 
-    // Uninitialized: every byte is overwritten by the copy below before anything can read it.
-    var value = GC.AllocateUninitializedArray<byte>(length);
-    buffer.Slice(offset, length).CopyTo(value);
-    offset += length;
-    return SocketPayload.Wrap(value);
+    throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains an invalid varint.");
   }
 
-  static void EnsureRemaining(ReadOnlySpan<byte> buffer, int offset, int length)
+  static int ReadInt32(ref SequenceReader<byte> reader)
   {
-    if (length < 0 || offset < 0 || offset > buffer.Length || buffer.Length - offset < length)
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame is truncated.");
+    var value = ReadVarint(ref reader);
+    if (value > int.MaxValue)
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame field is out of range.");
+    return (int)value;
+  }
+
+  static string ReadString(ref SequenceReader<byte> reader)
+  {
+    return ReadStringBytes(ref reader, ReadVarint(ref reader));
+  }
+
+  static string ReadStringBytes(ref SequenceReader<byte> reader, ulong length)
+  {
+    if (length > (ulong)reader.Remaining)
+      throw Truncated();
+    if (length == 0)
+      return string.Empty;
+
+    var value = Encoding.UTF8.GetString(reader.UnreadSequence.Slice(0, (long)length));
+    reader.Advance((long)length);
+    return value;
+  }
+
+  static SocketProtocolException Truncated()
+  {
+    return new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame is truncated.");
   }
 }

@@ -42,71 +42,7 @@ public sealed partial class SocketFabricTests
   }
 
   [Test]
-  public async Task RequestFastAsync_ReturnsResponse()
-  {
-    await using var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
-    await listener.StartAsync(
-        new IPEndPoint(IPAddress.Loopback, 0),
-        new DelegateSocketPeerHandler
-        {
-          OnFastRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse
-          {
-            Succeeded = request.OperationId == 7,
-            Payload = request.Payload,
-            ErrorCode = request.OperationId == 7 ? null : SocketProtocolError.UnsupportedOperation,
-            ErrorMessage = request.OperationId == 7 ? null : "Unknown operation."
-          })
-        });
-
-    var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
-    await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
-
-    var payload = new byte[] { 1, 2, 3 };
-    var response = await client.RequestFastAsync(7, payload, TimeSpan.FromSeconds(1));
-
-    Assert.That(response.Succeeded, Is.True);
-    Assert.That(response.Payload.ToArray(), Is.EqualTo(payload));
-  }
-
-  [Test]
-  public async Task RequestFastBatchAsync_ReturnsPerItemResults()
-  {
-    await using var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
-    await listener.StartAsync(
-        new IPEndPoint(IPAddress.Loopback, 0),
-        new DelegateSocketPeerHandler
-        {
-          OnFastRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse
-          {
-            Succeeded = request.OperationId == 7,
-            Payload = request.OperationId == 7 ? request.Payload : ReadOnlyMemory<byte>.Empty,
-            ErrorCode = request.OperationId == 7 ? null : SocketProtocolError.UnsupportedOperation,
-            ErrorMessage = request.OperationId == 7 ? null : "Unknown operation."
-          })
-        });
-
-    var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
-    await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
-
-    var results = await client.RequestFastBatchAsync(
-        [
-          new SocketFastBatchItem(1, 7, [1]),
-          new SocketFastBatchItem(2, 8, [2]),
-          new SocketFastBatchItem(3, 7, [3])
-        ],
-        TimeSpan.FromSeconds(1));
-
-    Assert.That(results.Count, Is.EqualTo(3));
-    Assert.That(results[0].Succeeded, Is.True);
-    Assert.That(results[0].Payload, Is.EqualTo(new byte[] { 1 }));
-    Assert.That(results[1].Succeeded, Is.False);
-    Assert.That(results[1].ErrorCode, Is.EqualTo(SocketProtocolError.UnsupportedOperation));
-    Assert.That(results[2].Succeeded, Is.True);
-    Assert.That(results[2].Payload, Is.EqualTo(new byte[] { 3 }));
-  }
-
-  [Test]
-  public async Task RequestFastAsync_ReturnsUnauthorizedWithoutCallingHandler()
+  public async Task RequestBatchAsync_AuthorizesEachItemWithoutClosingPeer()
   {
     var handlerCalls = 0;
     await using var listener = new SocketListener(new SocketFabricOptions
@@ -114,48 +50,8 @@ public sealed partial class SocketFabricTests
       NodeId = "server",
       Authorizer = new DelegateSocketAuthorizer
       {
-        OnFastRequest = (_, request, _) => ValueTask.FromResult(
-            request.OperationId == 7
-                ? SocketAuthorizationResult.Denied("no fast")
-                : SocketAuthorizationResult.Allowed)
-      }
-    });
-    await listener.StartAsync(
-        new IPEndPoint(IPAddress.Loopback, 0),
-        new DelegateSocketPeerHandler
-        {
-          OnFastRequest = (_, request, _) =>
-          {
-            Interlocked.Increment(ref handlerCalls);
-            return ValueTask.FromResult(new SocketResponse
-            {
-              Succeeded = true,
-              Payload = request.Payload
-            });
-          }
-        });
-
-    var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
-    await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
-
-    var response = await client.RequestFastAsync(7, [1, 2, 3], TimeSpan.FromSeconds(1));
-
-    Assert.That(response.Succeeded, Is.False);
-    Assert.That(response.ErrorCode, Is.EqualTo(SocketProtocolError.Unauthorized));
-    Assert.That(handlerCalls, Is.EqualTo(0));
-  }
-
-  [Test]
-  public async Task RequestFastBatchAsync_AuthorizesEachItemWithoutClosingPeer()
-  {
-    var handlerCalls = 0;
-    await using var listener = new SocketListener(new SocketFabricOptions
-    {
-      NodeId = "server",
-      Authorizer = new DelegateSocketAuthorizer
-      {
-        OnFastRequest = (_, request, _) => ValueTask.FromResult(
-            request.OperationId == 8
+        OnRequest = (_, request, _) => ValueTask.FromResult(
+            request.Operation == "denied"
                 ? SocketAuthorizationResult.Denied("denied item")
                 : SocketAuthorizationResult.Allowed)
       }
@@ -164,7 +60,7 @@ public sealed partial class SocketFabricTests
         new IPEndPoint(IPAddress.Loopback, 0),
         new DelegateSocketPeerHandler
         {
-          OnFastRequest = (_, request, _) =>
+          OnRequest = (_, request, _) =>
           {
             Interlocked.Increment(ref handlerCalls);
             return ValueTask.FromResult(new SocketResponse
@@ -178,14 +74,14 @@ public sealed partial class SocketFabricTests
     var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
     await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
 
-    var results = await client.RequestFastBatchAsync(
+    var results = await client.RequestBatchAsync(
         [
-          new SocketFastBatchItem(1, 7, [1]),
-          new SocketFastBatchItem(2, 8, [2]),
-          new SocketFastBatchItem(3, 7, [3])
+          new SocketBatchItem(1, "test", "allowed", [1]),
+          new SocketBatchItem(2, "test", "denied", [2]),
+          new SocketBatchItem(3, "test", "allowed", [3])
         ],
         TimeSpan.FromSeconds(1));
-    var afterDeniedItem = await client.RequestFastAsync(7, [4], TimeSpan.FromSeconds(1));
+    var afterDeniedItem = await client.RequestAsync("test", "allowed", [4], TimeSpan.FromSeconds(1));
 
     Assert.That(results.Count, Is.EqualTo(3));
     Assert.That(results[0].Succeeded, Is.True);
@@ -197,7 +93,7 @@ public sealed partial class SocketFabricTests
   }
 
   [Test]
-  public async Task RequestFastBatchAsync_RejectsEmptyBatch()
+  public async Task RequestBatchAsync_RejectsEmptyBatch()
   {
     await using var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
     await listener.StartAsync(
@@ -208,18 +104,18 @@ public sealed partial class SocketFabricTests
     await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
 
     await Assert.ThrowsAsync<ArgumentException>(async () =>
-        await client.RequestFastBatchAsync([], TimeSpan.FromSeconds(1)));
+        await client.RequestBatchAsync([], TimeSpan.FromSeconds(1)));
   }
 
   [Test]
-  public async Task RequestFastBatchAsync_RejectsNestedFastBatchItem()
+  public async Task RequestBatchAsync_RejectsNestedBatchItem()
   {
     await using var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
     await listener.StartAsync(
         new IPEndPoint(IPAddress.Loopback, 0),
         new DelegateSocketPeerHandler
         {
-          OnFastRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse
+          OnRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse
           {
             Succeeded = true,
             Payload = request.Payload
@@ -229,9 +125,9 @@ public sealed partial class SocketFabricTests
     var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
     await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
 
-    var results = await client.RequestFastBatchAsync(
+    var results = await client.RequestBatchAsync(
         [
-          new SocketFastBatchItem(1, int.MinValue, [])
+          new SocketBatchItem(1, "socket", "batch.request", [])
         ],
         TimeSpan.FromSeconds(1));
 
@@ -546,7 +442,6 @@ public sealed partial class SocketFabricTests
     var reader = new SocketFrameReader(stream, 1024);
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = 42,
       Kind = SocketMessageKind.Ping
     }, CancellationToken.None);
@@ -1512,7 +1407,6 @@ public sealed partial class SocketFabricTests
     var writer = new SocketFrameWriter(tcp.GetStream(), 1024);
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = 1,
       Kind = SocketMessageKind.Chunk,
       OriginalKind = SocketMessageKind.Event,
@@ -1525,7 +1419,6 @@ public sealed partial class SocketFabricTests
     }, CancellationToken.None);
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = 2,
       Kind = SocketMessageKind.Chunk,
       OriginalKind = SocketMessageKind.Event,
@@ -1566,34 +1459,35 @@ public sealed partial class SocketFabricTests
         await client.SendEventAsync(new string('s', 2048), "large", []));
   }
 
-  [Test]
-  public async Task SocketFrameReader_RejectsNegativeStringLength()
+  [TestCaseSource(nameof(MalformedFrames))]
+  public async Task SocketFrameReader_RejectsMalformedFrames(byte[] frame)
   {
-    using var stream = new MemoryStream(BuildFrameWithNegativeServiceLength());
-    var reader = new SocketFrameReader(stream, 1024);
+    using var stream = new MemoryStream(frame);
+    var reader = new SocketFrameReader(stream, 64 * 1024);
 
     await Assert.ThrowsAsync<SocketProtocolException>(async () =>
         await reader.ReadAsync(CancellationToken.None));
   }
 
-  [Test]
-  public async Task SocketFrameReader_RejectsFastFrameTrailingBytes()
+  // Hand-built frames, each broken in one way. Flags: 0x08 method, 0x80 error. Ids are zigzag varints.
+  static IEnumerable<TestCaseData> MalformedFrames()
   {
-    using var stream = new MemoryStream(BuildFastRequestFrameWithTrailingByte());
-    var reader = new SocketFrameReader(stream, 1024);
-
-    await Assert.ThrowsAsync<SocketProtocolException>(async () =>
-        await reader.ReadAsync(CancellationToken.None));
+    yield return new TestCaseData(RawFrame(3, 0x08, 2, 0, 50, (byte)'a', (byte)'b')).SetName("String longer than the frame");
+    yield return new TestCaseData(RawFrame(4, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01)).SetName("Varint that never ends");
+    yield return new TestCaseData(RawFrame(99, 0, 0)).SetName("Unknown frame kind");
+    yield return new TestCaseData(RawFrame(1, 0x08, 2, 2)).SetName("Reference to an undefined method");
+    yield return new TestCaseData(RawFrame(1, 0x08, 2, 5, 1, (byte)'a', 1, (byte)'b')).SetName("Method defined out of order");
+    yield return new TestCaseData(RawFrame([1, 0x08, 2, 0, 0x81, 0x08, .. Enumerable.Repeat((byte)'a', 1025), 0])).SetName("Method name over the limit");
+    yield return new TestCaseData(RawFrame(2, 0x80, 2, 99, 0)).SetName("Unknown error code");
+    yield return new TestCaseData(new byte[] { 0, 0, 0, 1, 4 }).SetName("Frame shorter than a header");
   }
 
-  [Test]
-  public async Task SocketFrameReader_RejectsFastFrameNegativePayloadLength()
+  static byte[] RawFrame(params byte[] body)
   {
-    using var stream = new MemoryStream(BuildFastRequestFrameWithNegativePayloadLength());
-    var reader = new SocketFrameReader(stream, 1024);
-
-    await Assert.ThrowsAsync<SocketProtocolException>(async () =>
-        await reader.ReadAsync(CancellationToken.None));
+    var frame = new byte[4 + body.Length];
+    BinaryPrimitives.WriteInt32BigEndian(frame, body.Length);
+    body.CopyTo(frame, 4);
+    return frame;
   }
 
   [Test]
@@ -1678,57 +1572,6 @@ public sealed partial class SocketFabricTests
     return entry;
   }
 
-  static byte[] BuildFrameWithNegativeServiceLength()
-  {
-    using var output = new MemoryStream();
-    Span<byte> buffer = stackalloc byte[8];
-    WriteInt32(output, 39);
-    WriteInt32(output, SocketFabricOptions.CurrentProtocolVersion);
-    output.WriteByte((byte)SocketMessageKind.Ping);
-    BinaryPrimitives.WriteInt64BigEndian(buffer, 1);
-    output.Write(buffer[..8]);
-    WriteInt32(output, 0);
-    WriteInt32(output, 0);
-    output.WriteByte(0);
-    WriteInt32(output, 0);
-    WriteInt32(output, 0);
-    WriteInt32(output, 0);
-    output.WriteByte(0);
-    WriteInt32(output, -1);
-    return output.ToArray();
-  }
-
-  static byte[] BuildFastRequestFrameWithTrailingByte()
-  {
-    using var payload = new MemoryStream();
-    WriteFastRequestHeader(payload);
-    WriteInt32(payload, 1);
-    payload.WriteByte(42);
-    payload.WriteByte(99);
-
-    return BuildFrame(payload);
-  }
-
-  static byte[] BuildFastRequestFrameWithNegativePayloadLength()
-  {
-    using var payload = new MemoryStream();
-    WriteFastRequestHeader(payload);
-    WriteInt32(payload, -1);
-
-    return BuildFrame(payload);
-  }
-
-  static void WriteFastRequestHeader(Stream stream)
-  {
-    WriteInt32(stream, SocketFabricOptions.CurrentProtocolVersion);
-    stream.WriteByte((byte)SocketMessageKind.FastRequest);
-    WriteInt64(stream, 1);
-    WriteInt32(stream, 7);
-    WriteInt32(stream, 0);
-    WriteInt32(stream, 0);
-    stream.WriteByte(0);
-  }
-
   static byte[] BuildFrame(MemoryStream payload)
   {
     var bytes = payload.ToArray();
@@ -1787,7 +1630,6 @@ public sealed partial class SocketFabricTests
     var writer = new SocketFrameWriter(stream, 1024);
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "hello",
@@ -1801,11 +1643,10 @@ public sealed partial class SocketFabricTests
     Assert.That(challenge.Operation, Is.EqualTo("challenge"));
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "proof",
-      OperationId = 4096,
+      Value = 4096,
       Payload = JsonSocketMessageCodec.Shared.Serialize(new SocketHandshakeProof(
           SocketFabricOptions.CurrentProtocolVersion,
           "raw-client",
@@ -1831,10 +1672,10 @@ public sealed partial class SocketFabricTests
     public Action<SocketPeer> OnPeerConnected { get; init; }
     public Action<IPEndPoint, Exception> OnPeerAcceptFailed { get; init; }
     public Action<IPEndPoint, Exception> OnListenerAcceptFailed { get; init; }
-    public Action<IPEndPoint> OnClientConnectStarted { get; init; }
-    public Action<IPEndPoint, Exception> OnClientConnectFailed { get; init; }
-    public Action<IPEndPoint, TimeSpan> OnClientReconnectScheduled { get; init; }
-    public Action<IPEndPoint, Exception> OnClientKeepConnectedLoopFailed { get; init; }
+    public Action<EndPoint> OnClientConnectStarted { get; init; }
+    public Action<EndPoint, Exception> OnClientConnectFailed { get; init; }
+    public Action<EndPoint, TimeSpan> OnClientReconnectScheduled { get; init; }
+    public Action<EndPoint, Exception> OnClientKeepConnectedLoopFailed { get; init; }
     public Action<SocketPeer, string, string, bool, string> OnRequestCompleted { get; init; }
 
     public void PeerConnected(SocketPeer peer)
@@ -1852,22 +1693,22 @@ public sealed partial class SocketFabricTests
       OnListenerAcceptFailed?.Invoke(localEndPoint, exception);
     }
 
-    public void ClientConnectStarted(IPEndPoint remoteEndPoint)
+    public void ClientConnectStarted(EndPoint remoteEndPoint)
     {
       OnClientConnectStarted?.Invoke(remoteEndPoint);
     }
 
-    public void ClientConnectFailed(IPEndPoint remoteEndPoint, Exception exception)
+    public void ClientConnectFailed(EndPoint remoteEndPoint, Exception exception)
     {
       OnClientConnectFailed?.Invoke(remoteEndPoint, exception);
     }
 
-    public void ClientReconnectScheduled(IPEndPoint remoteEndPoint, TimeSpan delay)
+    public void ClientReconnectScheduled(EndPoint remoteEndPoint, TimeSpan delay)
     {
       OnClientReconnectScheduled?.Invoke(remoteEndPoint, delay);
     }
 
-    public void ClientKeepConnectedLoopFailed(IPEndPoint remoteEndPoint, Exception exception)
+    public void ClientKeepConnectedLoopFailed(EndPoint remoteEndPoint, Exception exception)
     {
       OnClientKeepConnectedLoopFailed?.Invoke(remoteEndPoint, exception);
     }
@@ -1949,7 +1790,6 @@ public sealed partial class SocketFabricTests
   sealed class DelegateSocketAuthorizer : ISocketAuthorizer
   {
     public Func<SocketPeer, SocketRequest, CancellationToken, ValueTask<SocketAuthorizationResult>> OnRequest { get; init; }
-    public Func<SocketPeer, SocketFastRequest, CancellationToken, ValueTask<SocketAuthorizationResult>> OnFastRequest { get; init; }
     public Func<SocketPeer, SocketStreamRequest, CancellationToken, ValueTask<SocketAuthorizationResult>> OnStream { get; init; }
     public Func<SocketPeer, SocketEvent, CancellationToken, ValueTask<SocketAuthorizationResult>> OnEvent { get; init; }
 
@@ -1959,15 +1799,6 @@ public sealed partial class SocketFabricTests
         CancellationToken cancellationToken)
     {
       return OnRequest?.Invoke(peer, request, cancellationToken)
-          ?? ValueTask.FromResult(SocketAuthorizationResult.Allowed);
-    }
-
-    public ValueTask<SocketAuthorizationResult> AuthorizeFastRequestAsync(
-        SocketPeer peer,
-        SocketFastRequest request,
-        CancellationToken cancellationToken)
-    {
-      return OnFastRequest?.Invoke(peer, request, cancellationToken)
           ?? ValueTask.FromResult(SocketAuthorizationResult.Allowed);
     }
 
@@ -2025,7 +1856,6 @@ public sealed partial class SocketFabricTests
   {
     public Func<SocketPeer, CancellationToken, ValueTask> OnConnect { get; init; }
     public Func<SocketPeer, SocketRequest, CancellationToken, ValueTask<SocketResponse>> OnRequest { get; init; }
-    public Func<SocketPeer, SocketFastRequest, CancellationToken, ValueTask<SocketResponse>> OnFastRequest { get; init; }
     public Func<SocketPeer, SocketStreamRequest, CancellationToken, ValueTask<SocketStreamResponse>> OnStream { get; init; }
     public Func<SocketPeer, SocketEvent, CancellationToken, ValueTask> OnEvent { get; init; }
 
@@ -2041,15 +1871,6 @@ public sealed partial class SocketFabricTests
     {
       return OnRequest?.Invoke(peer, request, cancellationToken)
           ?? ValueTask.FromResult(SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "No handler."));
-    }
-
-    public ValueTask<SocketResponse> HandleFastRequestAsync(
-        SocketPeer peer,
-        SocketFastRequest request,
-        CancellationToken cancellationToken)
-    {
-      return OnFastRequest?.Invoke(peer, request, cancellationToken)
-          ?? ValueTask.FromResult(SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "No fast handler."));
     }
 
     public ValueTask<SocketStreamResponse> HandleStreamAsync(

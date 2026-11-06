@@ -10,14 +10,6 @@ public interface ISocketAuthorizer
       SocketRequest request,
       CancellationToken cancellationToken);
 
-  ValueTask<SocketAuthorizationResult> AuthorizeFastRequestAsync(
-      SocketPeer peer,
-      SocketFastRequest request,
-      CancellationToken cancellationToken)
-  {
-    return ValueTask.FromResult(SocketAuthorizationResult.Allowed);
-  }
-
   ValueTask<SocketAuthorizationResult> AuthorizeStreamAsync(
       SocketPeer peer,
       SocketStreamRequest request,

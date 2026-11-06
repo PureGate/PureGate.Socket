@@ -153,11 +153,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
 
     try
     {
-      if (frame.Version != Options.ProtocolVersion)
-        throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
-
       var remoteHello = JsonSocketMessageCodec.Shared.Deserialize<SocketHandshakeHello>(frame.PayloadMemory.Span);
-      if (remoteHello.Version != Options.ProtocolVersion)
+      if (remoteHello.Version != SocketFabricOptions.CurrentProtocolVersion)
         throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
 
       var challenge = await Options.Authenticator.CreateChallengeAsync(
@@ -166,7 +163,6 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
           cancellationToken);
       await writer.WriteAsync(new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         Kind = SocketMessageKind.Event,
         Service = "socket",
         Operation = "challenge",
@@ -196,12 +192,11 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
 
       await writer.WriteAsync(new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         Kind = SocketMessageKind.Event,
         Service = "socket",
         Operation = "ready",
         Ok = true,
-        OperationId = Options.MaxQueuedHandlers
+        Value = Options.MaxQueuedHandlers
       }, cancellationToken);
       return (auth.RemoteNodeId, remoteWindow);
     }
@@ -209,7 +204,6 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     {
       await writer.WriteAsync(new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         Kind = SocketMessageKind.Event,
         Service = "socket",
         Operation = "ready",

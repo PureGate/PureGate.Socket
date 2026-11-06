@@ -8,7 +8,6 @@ using PureGate.Socket.Transport;
 
 const int DefaultIterations = 5_000;
 const int RequestBatchSize = 64;
-const int FastEchoOperation = 1;
 
 var quick = args.Contains("--quick");
 var iterations = GetIntArg(args, "--iterations", quick ? 500 : DefaultIterations);
@@ -38,9 +37,7 @@ if (suite is not ("all" or "classic"))
 Console.WriteLine("Whole scenario");
 await RunAsync("frame roundtrip", iterations, () => FrameRoundtripAsync(iterations));
 await RunAsync("rpc echo connect+steady", iterations, () => RpcEchoScenarioAsync(iterations));
-await RunAsync("fast rpc echo connect+steady", iterations, () => FastRpcEchoScenarioAsync(iterations));
 await RunAsync("request batch connect+steady", RoundUp(iterations, RequestBatchSize), () => RequestBatchScenarioAsync(iterations));
-await RunAsync("fast request batch connect+steady", RoundUp(iterations, RequestBatchSize), () => FastRequestBatchScenarioAsync(iterations));
 await RunAsync("pull stream connect+steady", streamBytes, () => PullStreamScenarioAsync(streamBytes), "bytes");
 await RunAsync("concurrent rpc connect+steady", iterations * concurrentClients, () => ConcurrentRpcScenarioAsync(concurrentClients, iterations));
 
@@ -51,20 +48,10 @@ await RunWithContextAsync(
     StartEchoClientAsync,
     context => RpcEchoAsync(context.Client, iterations));
 await RunWithContextAsync(
-    "fast rpc echo steady",
-    iterations,
-    StartEchoClientAsync,
-    context => FastRpcEchoAsync(context.Client, iterations));
-await RunWithContextAsync(
     "request batch steady",
     RoundUp(iterations, RequestBatchSize),
     StartEchoClientAsync,
     context => RequestBatchAsync(context.Client, iterations));
-await RunWithContextAsync(
-    "fast request batch steady",
-    RoundUp(iterations, RequestBatchSize),
-    StartEchoClientAsync,
-    context => FastRequestBatchAsync(context.Client, iterations));
 await RunWithContextAsync(
     "pull stream steady",
     streamBytes,
@@ -151,7 +138,6 @@ static async Task FrameRoundtripAsync(int iterations)
   {
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = i + 1,
       Kind = SocketMessageKind.Request,
       Service = "bench",
@@ -176,12 +162,6 @@ static async Task RpcEchoScenarioAsync(int iterations)
   await RpcEchoAsync(context.Client, iterations);
 }
 
-static async Task FastRpcEchoScenarioAsync(int iterations)
-{
-  await using var context = await StartEchoClientAsync();
-  await FastRpcEchoAsync(context.Client, iterations);
-}
-
 static async Task RpcEchoAsync(SocketPeer client, int iterations)
 {
   var payload = CreatePayload();
@@ -193,27 +173,10 @@ static async Task RpcEchoAsync(SocketPeer client, int iterations)
   }
 }
 
-static async Task FastRpcEchoAsync(SocketPeer client, int iterations)
-{
-  var payload = CreatePayload();
-  for (var i = 0; i < iterations; i++)
-  {
-    var result = await client.RequestFastAsync(FastEchoOperation, payload, TimeSpan.FromSeconds(10));
-    if (!result.Succeeded || !result.Payload.Span.SequenceEqual(payload))
-      throw new InvalidOperationException("Fast RPC echo returned invalid data.");
-  }
-}
-
 static async Task RequestBatchScenarioAsync(int iterations)
 {
   await using var context = await StartEchoClientAsync();
   await RequestBatchAsync(context.Client, iterations);
-}
-
-static async Task FastRequestBatchScenarioAsync(int iterations)
-{
-  await using var context = await StartEchoClientAsync();
-  await FastRequestBatchAsync(context.Client, iterations);
 }
 
 static async Task RequestBatchAsync(SocketPeer client, int iterations)
@@ -230,23 +193,6 @@ static async Task RequestBatchAsync(SocketPeer client, int iterations)
     var results = await client.RequestBatchAsync(items, TimeSpan.FromSeconds(10));
     if (results.Count != RequestBatchSize || results.Any(result => !result.Succeeded || !result.Payload.AsSpan().SequenceEqual(payload)))
       throw new InvalidOperationException("Batch returned invalid data.");
-  }
-}
-
-static async Task FastRequestBatchAsync(SocketPeer client, int iterations)
-{
-  var payload = CreatePayload();
-  var items = Enumerable
-      .Range(0, RequestBatchSize)
-      .Select(index => new SocketFastBatchItem(index, FastEchoOperation, payload))
-      .ToArray();
-  var batches = Math.Max(1, RoundUp(iterations, RequestBatchSize) / RequestBatchSize);
-
-  for (var i = 0; i < batches; i++)
-  {
-    var results = await client.RequestFastBatchAsync(items, TimeSpan.FromSeconds(10));
-    if (results.Count != RequestBatchSize || results.Any(result => !result.Succeeded || !result.Payload.AsSpan().SequenceEqual(payload)))
-      throw new InvalidOperationException("Fast batch returned invalid data.");
   }
 }
 
@@ -376,13 +322,6 @@ static async ValueTask<SocketListener> StartEchoListenerAsync()
         {
           Succeeded = true,
           Payload = request.Payload
-        }),
-        OnFastRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse
-        {
-          Succeeded = request.OperationId == FastEchoOperation,
-          Payload = request.OperationId == FastEchoOperation ? request.Payload : ReadOnlyMemory<byte>.Empty,
-          ErrorCode = request.OperationId == FastEchoOperation ? null : SocketProtocolError.UnsupportedOperation,
-          ErrorMessage = request.OperationId == FastEchoOperation ? null : "Unknown fast operation."
         })
       });
   return listener;
@@ -439,7 +378,6 @@ static bool IsReleaseBuild()
 sealed class BenchmarkHandler : ISocketPeerHandler
 {
   public Func<SocketPeer, SocketRequest, CancellationToken, ValueTask<SocketResponse>> OnRequest { get; init; }
-  public Func<SocketPeer, SocketFastRequest, CancellationToken, ValueTask<SocketResponse>> OnFastRequest { get; init; }
   public Func<SocketPeer, SocketStreamRequest, CancellationToken, ValueTask<SocketStreamResponse>> OnStream { get; init; }
 
   public ValueTask<SocketResponse> HandleRequestAsync(
@@ -449,15 +387,6 @@ sealed class BenchmarkHandler : ISocketPeerHandler
   {
     return OnRequest?.Invoke(peer, request, cancellationToken)
         ?? ValueTask.FromResult(SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "No handler."));
-  }
-
-  public ValueTask<SocketResponse> HandleFastRequestAsync(
-      SocketPeer peer,
-      SocketFastRequest request,
-      CancellationToken cancellationToken)
-  {
-    return OnFastRequest?.Invoke(peer, request, cancellationToken)
-        ?? ValueTask.FromResult(SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "No fast handler."));
   }
 
   public ValueTask<SocketStreamResponse> HandleStreamAsync(

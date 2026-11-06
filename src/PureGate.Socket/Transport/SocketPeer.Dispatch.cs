@@ -55,13 +55,9 @@ public sealed partial class SocketPeer
   // what keeps two peers that flood each other from deadlocking.
   bool Dispatch(SocketFrame frame)
   {
-    if (frame.Version != Options.ProtocolVersion)
-      throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
-
     switch (frame.Kind)
     {
       case SocketMessageKind.Request:
-      case SocketMessageKind.FastRequest:
       case SocketMessageKind.StreamRequest:
       case SocketMessageKind.Event:
         // Message credits guarantee the queue has room; a full queue means the peer overran its credit.
@@ -69,7 +65,6 @@ public sealed partial class SocketPeer
           throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Peer sent more messages than its credit allows.");
         return false;
       case SocketMessageKind.Response:
-      case SocketMessageKind.FastResponse:
         DispatchResponse(frame);
         break;
       case SocketMessageKind.StreamStart:
@@ -87,7 +82,6 @@ public sealed partial class SocketPeer
       case SocketMessageKind.Ping:
         SendControlInBackground(new SocketFrame
         {
-          Version = Options.ProtocolVersion,
           MessageId = frame.MessageId,
           Kind = SocketMessageKind.Pong,
           Ok = true
@@ -135,7 +129,6 @@ public sealed partial class SocketPeer
 
         await WriteFrameAsync(new SocketFrame
         {
-          Version = Options.ProtocolVersion,
           MessageId = Interlocked.Increment(ref NextMessageId),
           Kind = SocketMessageKind.Ping
         }, Lifetime.Token);
@@ -166,7 +159,6 @@ public sealed partial class SocketPeer
       using var timeout = new CancellationTokenSource(CancelFrameTimeout);
       await WriteFrameAsync(new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         MessageId = messageId,
         Kind = SocketMessageKind.Cancel
       }, timeout.Token);

@@ -40,25 +40,25 @@ public sealed class CompositeSocketObserver : ISocketObserver
       Try(() => observer.ListenerAcceptFailed(localEndPoint, exception));
   }
 
-  public void ClientConnectStarted(IPEndPoint remoteEndPoint)
+  public void ClientConnectStarted(EndPoint remoteEndPoint)
   {
     foreach (var observer in Observers)
       Try(() => observer.ClientConnectStarted(remoteEndPoint));
   }
 
-  public void ClientConnectFailed(IPEndPoint remoteEndPoint, Exception exception)
+  public void ClientConnectFailed(EndPoint remoteEndPoint, Exception exception)
   {
     foreach (var observer in Observers)
       Try(() => observer.ClientConnectFailed(remoteEndPoint, exception));
   }
 
-  public void ClientReconnectScheduled(IPEndPoint remoteEndPoint, TimeSpan delay)
+  public void ClientReconnectScheduled(EndPoint remoteEndPoint, TimeSpan delay)
   {
     foreach (var observer in Observers)
       Try(() => observer.ClientReconnectScheduled(remoteEndPoint, delay));
   }
 
-  public void ClientKeepConnectedLoopFailed(IPEndPoint remoteEndPoint, Exception exception)
+  public void ClientKeepConnectedLoopFailed(EndPoint remoteEndPoint, Exception exception)
   {
     foreach (var observer in Observers)
       Try(() => observer.ClientKeepConnectedLoopFailed(remoteEndPoint, exception));

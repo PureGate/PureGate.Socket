@@ -47,46 +47,12 @@ public sealed partial class SocketPeer
   {
     return await RequestFrameAsync(new SocketFrame
     {
-      Version = Options.ProtocolVersion,
       Kind = SocketMessageKind.Request,
       Service = service ?? string.Empty,
       Operation = operation ?? string.Empty,
       IdempotencyKey = idempotencyKey ?? string.Empty,
       Payload = payload ?? []
     }, timeout, cancellationToken);
-  }
-
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-  public async ValueTask<SocketRequestResult> RequestFastAsync(
-      int operationId,
-      byte[] payload,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    return await RequestFrameAsync(new SocketFrame
-    {
-      Version = Options.ProtocolVersion,
-      Kind = SocketMessageKind.FastRequest,
-      OperationId = operationId,
-      Payload = payload ?? []
-    }, timeout, cancellationToken);
-  }
-
-  public async ValueTask<IReadOnlyList<SocketFastBatchResult>> RequestFastBatchAsync(
-      IEnumerable<SocketFastBatchItem> items,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    var batch = ValidateFastBatch(items);
-    var result = await RequestFastAsync(
-        InternalFastBatchOperationId,
-        SocketFastBatchCodec.SerializeItems(batch),
-        timeout,
-        cancellationToken);
-    if (!result.Succeeded)
-      throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
-
-    return SocketFastBatchCodec.DeserializeResults(result.Payload.Span);
   }
 
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
@@ -108,6 +74,7 @@ public sealed partial class SocketPeer
 
     var messageId = Interlocked.Increment(ref NextMessageId);
     var pending = RentPendingRequest(messageId);
+    var sentTicks = Environment.TickCount64;
     var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
     var requestTimeout = RentRequestCancellation();
     requestTimeout.CancelAfter(effectiveTimeout);
@@ -151,6 +118,8 @@ public sealed partial class SocketPeer
       var result = await pending.Task;
       if (result.ErrorCode is SocketProtocolError.Timeout or SocketProtocolError.Cancelled)
         SendCancelInBackground(messageId);
+      if (result.ErrorCode == SocketProtocolError.Timeout)
+        _ = CheckLivenessAsync(sentTicks);
 
       return result;
     }
@@ -170,6 +139,8 @@ public sealed partial class SocketPeer
             ErrorMessage = "Request timed out."
           };
       SendCancelInBackground(messageId);
+      if (result.ErrorCode == SocketProtocolError.Timeout)
+        _ = CheckLivenessAsync(sentTicks);
       return result;
     }
     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -246,16 +217,15 @@ public sealed partial class SocketPeer
         throw new InvalidOperationException("Could not register socket stream request.");
       registered = true;
 
-      // OperationId carries the initial stream window: how many bytes the producer may send before the
+      // The value carries the initial stream window: how many bytes the producer may send before the
       // first grant.
       var request = new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         MessageId = messageId,
         Kind = SocketMessageKind.StreamRequest,
         Service = service ?? string.Empty,
         Operation = operation ?? string.Empty,
-        OperationId = Options.StreamWindowBytes,
+        Value = Options.StreamWindowBytes,
         DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout),
         Payload = payload ?? []
       };
@@ -326,7 +296,6 @@ public sealed partial class SocketPeer
     ThrowIfClosed();
     var frame = new SocketFrame
     {
-      Version = Options.ProtocolVersion,
       MessageId = Interlocked.Increment(ref NextMessageId),
       Kind = SocketMessageKind.Event,
       Service = service ?? string.Empty,
@@ -419,7 +388,6 @@ public sealed partial class SocketPeer
         closeTimeout.CancelAfter(CloseFrameTimeout);
         await WriteFrameAsync(new SocketFrame
         {
-          Version = Options.ProtocolVersion,
           Kind = SocketMessageKind.Close
         }, closeTimeout.Token);
       }

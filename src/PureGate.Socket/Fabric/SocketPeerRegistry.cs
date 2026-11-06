@@ -130,46 +130,6 @@ public sealed class SocketPeerRegistry : ISocketObserver
     return await Get(nodeId, selectionPolicy).RequestAsync<TRequest, TResponse>(service, operation, payload, cancellationToken);
   }
 
-  public async ValueTask<SocketRequestResult> RequestFastAsync(
-      string nodeId,
-      int operationId,
-      byte[] payload,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    return await Get(nodeId).RequestFastAsync(operationId, payload, timeout, cancellationToken);
-  }
-
-  public async ValueTask<SocketRequestResult> RequestFastAsync(
-      string nodeId,
-      SocketPeerSelectionPolicy selectionPolicy,
-      int operationId,
-      byte[] payload,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    return await Get(nodeId, selectionPolicy).RequestFastAsync(operationId, payload, timeout, cancellationToken);
-  }
-
-  public async ValueTask<IReadOnlyList<SocketFastBatchResult>> RequestFastBatchAsync(
-      string nodeId,
-      IEnumerable<SocketFastBatchItem> items,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    return await Get(nodeId).RequestFastBatchAsync(items, timeout, cancellationToken);
-  }
-
-  public async ValueTask<IReadOnlyList<SocketFastBatchResult>> RequestFastBatchAsync(
-      string nodeId,
-      SocketPeerSelectionPolicy selectionPolicy,
-      IEnumerable<SocketFastBatchItem> items,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    return await Get(nodeId, selectionPolicy).RequestFastBatchAsync(items, timeout, cancellationToken);
-  }
-
   public async ValueTask SendEventAsync<TPayload>(
       string nodeId,
       string service,

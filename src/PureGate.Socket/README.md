@@ -14,7 +14,7 @@ See [CLUSTER_GUIDE.md](CLUSTER_GUIDE.md) for the socket-side contract future Pur
 - Bidirectional request/response.
 - Pull-based streaming requests.
 - Wire-level request batching.
-- Fire-and-forget event frames.
+- Fire-and-forget event frames, handled in order per connection by default (`EventOrdering`).
 - Wire-level event batching.
 - Checked event batching with per-item results.
 - Heartbeat and idle timeout.
@@ -36,7 +36,8 @@ See [CLUSTER_GUIDE.md](CLUSTER_GUIDE.md) for the socket-side contract future Pur
 - Composite observer for combining registry, metrics, and logging.
 - Accept/handshake failure observer hook.
 - Graceful close frame on peer disposal.
-- Reconnecting single-peer client wrapper.
+- Reconnecting single-peer client wrapper, by IP address or host name (resolved on every reconnect).
+- Fast detection of half-open connections: a request timeout triggers a liveness ping (`LivenessProbeTimeout`).
 - Optional background keep-connected client loop with bounded jittered backoff.
 - Explicit idempotent request retry policy.
 - Protocol-level idempotency keys.

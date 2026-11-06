@@ -15,14 +15,6 @@ public sealed class NoSocketAuthorizer : ISocketAuthorizer
     return ValueTask.FromResult(SocketAuthorizationResult.Allowed);
   }
 
-  public ValueTask<SocketAuthorizationResult> AuthorizeFastRequestAsync(
-      SocketPeer peer,
-      SocketFastRequest request,
-      CancellationToken cancellationToken)
-  {
-    return ValueTask.FromResult(SocketAuthorizationResult.Allowed);
-  }
-
   public ValueTask<SocketAuthorizationResult> AuthorizeStreamAsync(
       SocketPeer peer,
       SocketStreamRequest request,

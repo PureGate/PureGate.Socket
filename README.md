@@ -7,11 +7,13 @@ Targets **.NET 10**.
 ## Features
 
 - **Request/response**: typed (`RequestAsync<TRequest, TResponse>`) or raw calls, with per-request options.
-- **Fast requests**: a compact frame path for high-throughput calls, plus fast batches.
 - **Events**: fire-and-forget messages, singly or in batches.
 - **Streams**: pull-style binary streams opened from a client request.
 - **Batching**: send many requests or events in a single round trip.
+- **Flow control**: senders wait when the remote is busy instead of overrunning it; stream windows size themselves to the link.
+- **Ordered events**: events from one connection are handled in order by default.
 - **Idempotency**: a built-in cache so retried requests are not executed twice.
+- **Compact wire protocol**: a request costs a few header bytes after its method's first use; see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Chunking and compression**: large payloads are split into frames and can be compressed.
 - **Security**: pluggable authentication and authorization (`ISocketAuthenticator`, `ISocketAuthorizer`), with an HMAC authenticator included. TLS is available through `TlsSocketStreamFilter`.
 - **Serialization**: JSON codec by default, raw codec for byte payloads, or implement `ISocketMessageCodec`.

@@ -54,65 +54,8 @@ public sealed partial class SocketPeer
       ObserveRequestCompleted(frame, response);
       await WriteFrameAsync(new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         MessageId = frame.MessageId,
         Kind = SocketMessageKind.Response,
-        Ok = response.Succeeded,
-        ErrorCode = response.ErrorCode,
-        ErrorMessage = response.ErrorMessage
-      }, response.Payload, Lifetime.Token);
-    }
-    finally
-    {
-      ActiveRequests.TryRemove(frame.MessageId, out _);
-      EndActiveRequest(active);
-    }
-  }
-
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-  async ValueTask DispatchFastRequestAsync(SocketFrame frame)
-  {
-    SocketResponse response;
-    var active = new ActiveRequest();
-    var requestTimeout = active.Source;
-    if (frame.DeadlineMs > 0)
-      requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(frame.DeadlineMs));
-
-    ActiveRequests[frame.MessageId] = active;
-    try
-    {
-      try
-      {
-        ObserveRequestStarted(frame);
-        var request = new SocketFastRequest(
-            frame.MessageId,
-            frame.OperationId,
-            frame.PayloadMemory);
-        response = request.OperationId == InternalFastBatchOperationId
-            ? await HandleFastBatchRequestAsync(request, requestTimeout.Token)
-            : await HandleFastRequestAsync(request, requestTimeout.Token);
-      }
-      catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
-      {
-        response = DeadlineOrCancelled(frame, active);
-      }
-      catch (Exception) when (Lifetime.IsCancellationRequested)
-      {
-        return;
-      }
-      catch (Exception ex)
-      {
-        response = HandlerFailure(string.Empty, FastOperationName(frame.OperationId), ex);
-      }
-
-      response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Fast request was not handled.");
-      ObserveRequestCompleted(frame, response);
-      await WriteFrameAsync(new SocketFrame
-      {
-        Version = Options.ProtocolVersion,
-        MessageId = frame.MessageId,
-        Kind = SocketMessageKind.FastResponse,
-        OperationId = frame.OperationId,
         Ok = response.Succeeded,
         ErrorCode = response.ErrorCode,
         ErrorMessage = response.ErrorMessage
@@ -132,12 +75,6 @@ public sealed partial class SocketPeer
         : SocketResponse.Failed(SocketProtocolError.Cancelled, "Request was cancelled.");
   }
 
-  // Fast requests have no service or operation names, so failures are reported under the operation ID.
-  static string FastOperationName(int operationId)
-  {
-    return operationId.ToString(System.Globalization.CultureInfo.InvariantCulture);
-  }
-
   // Turns a handler exception into the response the remote peer sees. A SocketProtocolException is a
   // deliberate, wire-safe error, so its code and message are kept. Any other exception is reported to the
   // observer in full and sent as a generic message unless IncludeExceptionDetails is set.
@@ -150,83 +87,6 @@ public sealed partial class SocketPeer
     return SocketResponse.Failed(
         SocketProtocolError.HandlerFailed,
         Options.IncludeExceptionDetails ? exception.Message : "The remote handler failed.");
-  }
-
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-  async ValueTask<SocketResponse> HandleFastRequestAsync(
-      SocketFastRequest request,
-      CancellationToken cancellationToken)
-  {
-    var authorization = await Options.Authorizer.AuthorizeFastRequestAsync(this, request, cancellationToken);
-    if (!authorization.Succeeded)
-      return SocketResponse.Failed(SocketProtocolError.Unauthorized, authorization.Error);
-
-    return await Handler.HandleFastRequestAsync(this, request, cancellationToken);
-  }
-
-  async ValueTask<SocketResponse> HandleFastBatchRequestAsync(
-      SocketFastRequest batchRequest,
-      CancellationToken cancellationToken)
-  {
-    var count = SocketFastBatchCodec.ReadItemCount(batchRequest.Payload, out var offset);
-    var results = new SocketFastBatchCodec.ResultWriter(count);
-    for (var i = 0; i < count; i++)
-    {
-      var item = SocketFastBatchCodec.ReadItem(batchRequest.Payload, ref offset);
-      await HandleFastBatchRequestItemAsync(item, results, cancellationToken);
-    }
-
-    SocketFastBatchCodec.EnsureConsumed(batchRequest.Payload, offset);
-
-    return new SocketResponse
-    {
-      Succeeded = true,
-      Payload = results.ToArray()
-    };
-  }
-
-  async ValueTask HandleFastBatchRequestItemAsync(
-      SocketFastBatchItemView item,
-      SocketFastBatchCodec.ResultWriter results,
-      CancellationToken cancellationToken)
-  {
-    try
-    {
-      if (item.OperationId == InternalFastBatchOperationId)
-      {
-        results.WriteResult(
-            item.Id,
-            false,
-            ReadOnlyMemory<byte>.Empty,
-            SocketProtocolError.ProtocolError,
-            "Nested fast batch messages are not supported.");
-        return;
-      }
-
-      var request = new SocketFastRequest(item.Id, item.OperationId, item.Payload);
-      var response = await HandleFastRequestAsync(request, cancellationToken)
-          ?? SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Fast request was not handled.");
-      results.WriteResult(
-          item.Id,
-          response.Succeeded,
-          response.Payload,
-          response.ErrorCode,
-          response.ErrorMessage);
-    }
-    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-    {
-      throw;
-    }
-    catch (Exception ex)
-    {
-      var failure = HandlerFailure(string.Empty, FastOperationName(item.OperationId), ex);
-      results.WriteResult(
-          item.Id,
-          false,
-          ReadOnlyMemory<byte>.Empty,
-          failure.ErrorCode,
-          failure.ErrorMessage);
-    }
   }
 
   [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
@@ -484,15 +344,6 @@ public sealed partial class SocketPeer
   }
 
   static SocketBatchItem[] ValidateBatch(IEnumerable<SocketBatchItem> items)
-  {
-    var batch = items?.ToArray() ?? [];
-    if (batch.Length == 0)
-      throw new ArgumentException("Batch must contain at least one item.", nameof(items));
-
-    return batch;
-  }
-
-  static SocketFastBatchItem[] ValidateFastBatch(IEnumerable<SocketFastBatchItem> items)
   {
     var batch = items?.ToArray() ?? [];
     if (batch.Length == 0)

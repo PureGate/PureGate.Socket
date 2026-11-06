@@ -14,7 +14,6 @@ public sealed partial class SocketPeer : IAsyncDisposable
   const string BatchRequestOperation = "batch.request";
   const string BatchEventOperation = "batch.event";
   const string BatchEventRequestOperation = "batch.event.request";
-  const int InternalFastBatchOperationId = int.MinValue;
 
   readonly TcpClient Client;
   readonly Stream Stream;
@@ -66,7 +65,8 @@ public sealed partial class SocketPeer : IAsyncDisposable
         stream,
         Options.MaxFrameSizeBytes,
         Options.PayloadCompression,
-        Options.CompressionMinPayloadBytes);
+        Options.CompressionMinPayloadBytes,
+        useMethodTable: true);
     State = SocketPeerState.Connected;
     ConnectedTask = Task.Run(NotifyConnectedAsync);
     ReadTask = Task.Run(ReadLoopAsync);

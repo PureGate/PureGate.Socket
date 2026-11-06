@@ -19,6 +19,14 @@ public sealed partial class SocketPeer
   int QueuedHandlerFrames;
   int ActiveHandlerWorkers;
 
+  // Event ordering (SocketEventOrdering). Events are routed through lanes: a lane lets one event run at a
+  // time and holds the rest in arrival order. Sequential mode has one lane per connection, PerOperation
+  // one per service and operation. A held event still counts as queued (against MaxQueuedHandlers and
+  // the sender's message credit) and goes through the same worker pool, so concurrency and flow control
+  // limits stay exact. Requests never wait behind events.
+  readonly Lock LaneSync = new();
+  readonly Dictionary<(string Service, string Operation), EventLane> EventLanes = new();
+
   bool TryEnqueueHandlerFrame(SocketFrame frame)
   {
     if (Interlocked.Increment(ref QueuedHandlerFrames) > Options.MaxQueuedHandlers)
@@ -27,9 +35,90 @@ public sealed partial class SocketPeer
       return false;
     }
 
+    if (frame.Kind == SocketMessageKind.Event && HoldInLane(frame))
+      return true;
+
+    PushHandlerFrame(frame);
+    return true;
+  }
+
+  void PushHandlerFrame(SocketFrame frame)
+  {
     HandlerQueue.Enqueue(frame);
     TryStartHandlerWorker();
-    return true;
+  }
+
+  (string Service, string Operation) LaneKey(SocketFrame frame)
+  {
+    return Options.EventOrdering == SocketEventOrdering.PerOperation
+        ? (frame.Service, frame.Operation)
+        : (string.Empty, string.Empty);
+  }
+
+  // True when the event has to wait for an earlier one in its lane; false when it may run now (its lane
+  // is then marked busy until ReleaseLane).
+  bool HoldInLane(SocketFrame frame)
+  {
+    if (Options.EventOrdering == SocketEventOrdering.Concurrent)
+      return false;
+
+    var key = LaneKey(frame);
+    lock (LaneSync)
+    {
+      if (EventLanes.TryGetValue(key, out var lane))
+      {
+        lane.Waiting.Enqueue(frame);
+        return true;
+      }
+
+      EventLanes[key] = new EventLane();
+      return false;
+    }
+  }
+
+  // An event finished: start the next one in its lane, or retire the lane.
+  void ReleaseLane(SocketFrame frame)
+  {
+    if (Options.EventOrdering == SocketEventOrdering.Concurrent)
+      return;
+
+    var key = LaneKey(frame);
+    SocketFrame next;
+    lock (LaneSync)
+    {
+      if (!EventLanes.TryGetValue(key, out var lane))
+        return;
+
+      if (!lane.Waiting.TryDequeue(out next))
+      {
+        EventLanes.Remove(key);
+        return;
+      }
+    }
+
+    PushHandlerFrame(next);
+  }
+
+  void DrainEventLanes()
+  {
+    lock (LaneSync)
+    {
+      foreach (var lane in EventLanes.Values)
+      {
+        while (lane.Waiting.TryDequeue(out var frame))
+        {
+          Interlocked.Decrement(ref QueuedHandlerFrames);
+          frame.ReleasePayload();
+        }
+      }
+
+      EventLanes.Clear();
+    }
+  }
+
+  sealed class EventLane
+  {
+    public Queue<SocketFrame> Waiting { get; } = new();
   }
 
   void TryStartHandlerWorker()
@@ -89,14 +178,19 @@ public sealed partial class SocketPeer
         case SocketMessageKind.Request:
           await DispatchRequestAsync(frame);
           break;
-        case SocketMessageKind.FastRequest:
-          await DispatchFastRequestAsync(frame);
-          break;
         case SocketMessageKind.StreamRequest:
           await DispatchStreamRequestAsync(frame);
           break;
         case SocketMessageKind.Event:
-          await DispatchEventAsync(frame);
+          try
+          {
+            await DispatchEventAsync(frame);
+          }
+          finally
+          {
+            ReleaseLane(frame);
+          }
+
           break;
       }
     }
@@ -123,6 +217,8 @@ public sealed partial class SocketPeer
       Interlocked.Decrement(ref QueuedHandlerFrames);
       frame.ReleasePayload();
     }
+
+    DrainEventLanes();
   }
 
   // Completes once every running handler has finished. Only meaningful after the peer has closed.

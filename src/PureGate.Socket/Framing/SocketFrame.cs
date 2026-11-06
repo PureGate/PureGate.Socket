@@ -6,11 +6,12 @@ sealed class SocketFrame
 {
   SocketPayload PayloadValue;
 
-  public int Version { get; set; }
   public long MessageId { get; set; }
   public SocketMessageKind Kind { get; set; }
   public SocketMessageKind OriginalKind { get; set; }
-  public int OperationId { get; set; }
+  // A small integer whose meaning depends on the kind: credit amount (Credit), initial stream window
+  // (StreamRequest), message window (handshake proof and ready).
+  public int Value { get; set; }
   public string Service { get; set; }
   public string Operation { get; set; }
   public string IdempotencyKey { get; set; }

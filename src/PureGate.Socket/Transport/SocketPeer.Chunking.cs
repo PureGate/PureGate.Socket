@@ -49,7 +49,7 @@ public sealed partial class SocketPeer
       return null;
 
     RemoveIncomingChunks(key, incoming);
-    return incoming.ToFrame();
+    return incoming.ToFrame(Reader);
   }
 
   void RemoveIncomingChunks(ChunkKey key, IncomingChunkedFrame incoming)
@@ -84,7 +84,7 @@ public sealed partial class SocketPeer
 
   void ValidateChunk(SocketFrame frame)
   {
-    if (frame.OriginalKind is not (SocketMessageKind.Request or SocketMessageKind.Response or SocketMessageKind.Event or SocketMessageKind.StreamItem or SocketMessageKind.FastRequest or SocketMessageKind.FastResponse))
+    if (frame.OriginalKind is not (SocketMessageKind.Request or SocketMessageKind.Response or SocketMessageKind.Event or SocketMessageKind.StreamRequest or SocketMessageKind.StreamItem))
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid chunk message kind.");
     if (frame.ChunkCount <= 0 || frame.ChunkIndex < 0 || frame.ChunkIndex >= frame.ChunkCount)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid chunk index.");
@@ -129,11 +129,7 @@ public sealed partial class SocketPeer
       if (frame.ChunkIndex != NextIndex
           || frame.ChunkCount != ChunkCount
           || frame.TotalPayloadLength != TotalLength
-          || frame.OriginalKind != FirstFrame.OriginalKind
-          || frame.OperationId != FirstFrame.OperationId
-          || frame.Service != FirstFrame.Service
-          || frame.Operation != FirstFrame.Operation
-          || frame.IdempotencyKey != FirstFrame.IdempotencyKey)
+          || frame.OriginalKind != FirstFrame.OriginalKind)
       {
         return false;
       }
@@ -179,25 +175,19 @@ public sealed partial class SocketPeer
       Buffer = grown;
     }
 
-    public SocketFrame ToFrame()
+    // The chunks together are the encoded body of the original frame (header and payload), so it is
+    // decoded like any other frame. Its payload stays in the reassembly buffer instead of being copied.
+    public SocketFrame ToFrame(SocketFrameReader reader)
     {
-      var frame = new SocketFrame
-      {
-        Version = FirstFrame.Version,
-        MessageId = FirstFrame.MessageId,
-        Kind = FirstFrame.OriginalKind,
-        OperationId = FirstFrame.OperationId,
-        Service = FirstFrame.Service,
-        Operation = FirstFrame.Operation,
-        IdempotencyKey = FirstFrame.IdempotencyKey,
-        Flags = FirstFrame.Flags,
-        DeadlineMs = FirstFrame.DeadlineMs,
-        Ok = FirstFrame.Ok,
-        ErrorCode = FirstFrame.ErrorCode,
-        ErrorMessage = FirstFrame.ErrorMessage
-      };
-      frame.SetPayload(SocketPayload.Wrap(Buffer, 0, TotalLength));
+      var buffer = Buffer;
       Buffer = null;
+      var frame = reader.DecodeBody(new System.Buffers.ReadOnlySequence<byte>(buffer, 0, TotalLength), buffer);
+      if (frame.Kind != FirstFrame.OriginalKind || frame.MessageId != FirstFrame.MessageId)
+      {
+        frame.ReleasePayload();
+        throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Reassembled frame does not match its chunks.");
+      }
+
       return frame;
     }
   }

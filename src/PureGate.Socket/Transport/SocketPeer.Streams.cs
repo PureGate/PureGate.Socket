@@ -80,8 +80,8 @@ public sealed partial class SocketPeer
       {
         ObserveRequestStarted(frame);
 
-        // OperationId carries the consumer's initial window.
-        if (frame.OperationId <= 0)
+        // The value carries the consumer's initial window.
+        if (frame.Value <= 0)
         {
           observedResponse = SocketResponse.Failed(SocketProtocolError.ProtocolError, "Stream request carries no flow-control window.");
           await WriteStreamStartFailedAsync(frame.MessageId, observedResponse.ErrorCode, observedResponse.ErrorMessage, requestTimeout.Token);
@@ -117,11 +117,10 @@ public sealed partial class SocketPeer
         }
 
         // Registered before StreamStart so no grant from the consumer can arrive before the window exists.
-        var window = new StreamSendWindow(frame.OperationId);
+        var window = new StreamSendWindow(frame.Value);
         OutgoingStreams[frame.MessageId] = window;
         await WriteFrameAsync(new SocketFrame
         {
-          Version = Options.ProtocolVersion,
           MessageId = frame.MessageId,
           Kind = SocketMessageKind.StreamStart,
           Ok = true
@@ -209,7 +208,6 @@ public sealed partial class SocketPeer
           // runs dry (both sides waiting on each other means the window is the bottleneck).
           await WriteFrameAsync(new SocketFrame
           {
-            Version = Options.ProtocolVersion,
             MessageId = messageId,
             Kind = SocketMessageKind.StreamItem,
             Flags = window.IsExhausted ? SocketFrameFlags.WindowExhausted : 0
@@ -221,7 +219,6 @@ public sealed partial class SocketPeer
 
       await WriteFrameAsync(new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         MessageId = messageId,
         Kind = SocketMessageKind.StreamEnd,
         Ok = true
@@ -241,7 +238,6 @@ public sealed partial class SocketPeer
   {
     await WriteFrameAsync(new SocketFrame
     {
-      Version = Options.ProtocolVersion,
       MessageId = messageId,
       Kind = SocketMessageKind.StreamStart,
       Ok = false,
@@ -262,7 +258,6 @@ public sealed partial class SocketPeer
     {
       await WriteFrameAsync(new SocketFrame
       {
-        Version = Options.ProtocolVersion,
         MessageId = messageId,
         Kind = SocketMessageKind.StreamEnd,
         Ok = false,

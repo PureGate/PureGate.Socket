@@ -11,7 +11,7 @@ public sealed class SocketClient : IAsyncDisposable
   readonly SocketFabricOptions Options;
   readonly SocketClientOptions ClientOptions;
   readonly SocketConnector Connector;
-  readonly IPEndPoint EndPoint;
+  readonly EndPoint EndPoint;
   readonly ISocketPeerHandler Handler;
   readonly SemaphoreSlim ConnectLock = new(1, 1);
   readonly CancellationTokenSource Lifetime = new();
@@ -19,8 +19,20 @@ public sealed class SocketClient : IAsyncDisposable
   SocketPeer Peer;
   int Disposed;
 
+  // Connects to host:port, resolving the name again on every reconnect.
   public SocketClient(
-      IPEndPoint endPoint,
+      string host,
+      int port,
+      ISocketPeerHandler handler,
+      SocketFabricOptions options = null,
+      SocketClientOptions clientOptions = null)
+      : this(new DnsEndPoint(host ?? throw new ArgumentNullException(nameof(host)), port), handler, options, clientOptions)
+  {
+  }
+
+  // endPoint is an IPEndPoint or a DnsEndPoint.
+  public SocketClient(
+      EndPoint endPoint,
       ISocketPeerHandler handler,
       SocketFabricOptions options = null,
       SocketClientOptions clientOptions = null)
@@ -101,6 +113,7 @@ public sealed class SocketClient : IAsyncDisposable
       try
       {
         peer = await GetPeerAsync(cancellationToken);
+        var sentTicks = Environment.TickCount64;
         var result = await peer.RequestAsync(
             service,
             operation,
@@ -110,6 +123,11 @@ public sealed class SocketClient : IAsyncDisposable
             cancellationToken);
         if (!ShouldRetry(result, retry, attempt))
           return result;
+
+        // Before retrying a timeout, find out whether the connection is still alive. A half-open one is
+        // closed by the check, so the retry goes out on a fresh connection instead of timing out again.
+        if (result.ErrorCode == SocketProtocolError.Timeout)
+          await peer.CheckLivenessAsync(sentTicks);
       }
       catch (SocketProtocolException ex) when (ShouldRetry(ex, retry, attempt))
       {
@@ -185,25 +203,6 @@ public sealed class SocketClient : IAsyncDisposable
       throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
 
     return result.ReadPayload<TResponse>(Options.Codec);
-  }
-
-  public async ValueTask<SocketRequestResult> RequestFastAsync(
-      int operationId,
-      byte[] payload,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    var peer = await GetPeerAsync(cancellationToken);
-    return await peer.RequestFastAsync(operationId, payload, timeout, cancellationToken);
-  }
-
-  public async ValueTask<IReadOnlyList<SocketFastBatchResult>> RequestFastBatchAsync(
-      IEnumerable<SocketFastBatchItem> items,
-      TimeSpan timeout,
-      CancellationToken cancellationToken = default)
-  {
-    var peer = await GetPeerAsync(cancellationToken);
-    return await peer.RequestFastBatchAsync(items, timeout, cancellationToken);
   }
 
   public async ValueTask SendEventAsync<TPayload>(

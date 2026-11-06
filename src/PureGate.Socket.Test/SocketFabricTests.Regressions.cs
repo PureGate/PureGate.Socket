@@ -15,7 +15,6 @@ namespace PureGate.Socket.Test;
 // ignored with the reason, so the suite stays green while still documenting the open defect.
 public sealed partial class SocketFabricTests
 {
-  const string Phase2EventOrdering = "Phase 2: needs ordered event dispatch (docs/ROADMAP.md).";
 
   [Test]
   [Category("Regression")]
@@ -40,25 +39,26 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  public async Task Bug01_FastAndStreamHandlerOperationCanceled_KeepWorkerAlive()
+  public async Task Bug01_StreamEventAndBatchHandlerOperationCanceled_KeepWorkerAlive()
   {
     await using var listener = await StartListenerAsync(
         new SocketFabricOptions { NodeId = "server", MaxConcurrentHandlers = 1 },
         new DelegateSocketPeerHandler
         {
-          OnFastRequest = (_, _, _) => throw new OperationCanceledException("not ours"),
           OnStream = (_, _, _) => throw new OperationCanceledException("not ours"),
           OnEvent = (_, _, _) => throw new OperationCanceledException("not ours"),
-          OnRequest = (_, _, _) => ValueTask.FromResult(SocketResponse.Success())
+          OnRequest = (_, request, _) => request.Operation == "boom"
+              ? throw new OperationCanceledException("not ours")
+              : ValueTask.FromResult(SocketResponse.Success())
         });
     await using var client = await ConnectAsync(listener);
 
-    var fast = await client.RequestFastAsync(1, [], TimeSpan.FromSeconds(2));
+    var batch = await client.RequestBatchAsync([new SocketBatchItem(1, "test", "boom", [])], TimeSpan.FromSeconds(2));
     var streamError = await TryOpenStreamAsync(client);
     await client.SendEventAsync("test", "event", []);
     var next = await client.RequestAsync("test", "ok", [], TimeSpan.FromSeconds(2));
 
-    Assert.That(fast.ErrorCode, Is.EqualTo(SocketProtocolError.HandlerFailed));
+    Assert.That(batch[0].ErrorCode, Is.EqualTo(SocketProtocolError.HandlerFailed));
     Assert.That(streamError, Is.EqualTo(SocketProtocolError.HandlerFailed));
     Assert.That(next.Succeeded, Is.True, $"worker died: {next.ErrorCode}");
     Assert.That(client.State, Is.EqualTo(SocketPeerState.Connected));
@@ -103,36 +103,54 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  public async Task Bug02_CompressionPreservesFastOperationId()
+  public async Task Bug02_CompressionAndChunkingPreserveEveryHeaderField()
   {
-    var seenOperations = new ConcurrentQueue<int>();
+    var seen = new ConcurrentQueue<(string Service, string Operation, string IdempotencyKey, int Length)>();
+    var options = new SocketFabricOptions
+    {
+      NodeId = "server",
+      PayloadCompression = SocketPayloadCompression.Brotli,
+      MaxFrameSizeBytes = 256 * 1024
+    };
     await using var listener = await StartListenerAsync(
-        new SocketFabricOptions { NodeId = "server", PayloadCompression = SocketPayloadCompression.Brotli },
+        options,
         new DelegateSocketPeerHandler
         {
-          OnFastRequest = (_, request, _) =>
+          OnRequest = (_, request, _) =>
           {
-            seenOperations.Enqueue(request.OperationId);
+            seen.Enqueue((request.Service, request.Operation, request.IdempotencyKey, request.Payload.Length));
             return ValueTask.FromResult(new SocketResponse { Succeeded = true, Payload = request.Payload });
           }
         });
     await using var client = await ConnectAsync(listener, new SocketFabricOptions
     {
       NodeId = "client",
-      PayloadCompression = SocketPayloadCompression.Brotli
+      PayloadCompression = SocketPayloadCompression.Brotli,
+      MaxFrameSizeBytes = 256 * 1024
     });
     var compressible = new byte[64 * 1024];
+    var largeCompressible = new byte[4 * 1024 * 1024];
+    var largeRandom = new byte[1024 * 1024];
+    Random.Shared.NextBytes(largeRandom);
 
-    var single = await client.RequestFastAsync(42, compressible, TimeSpan.FromSeconds(5));
-    var batch = await client.RequestFastBatchAsync(
-        [new SocketFastBatchItem(1, 7, compressible)],
-        TimeSpan.FromSeconds(5));
+    // Compressed into one frame (64 KB and 4 MB of zeros, which compress far below the 256 KB frame
+    // limit), and incompressible data larger than a frame, which is chunked.
+    var small = await client.RequestAsync("svc-a", "op-1", compressible, TimeSpan.FromSeconds(5), idempotencyKey: "key-1");
+    var large = await client.RequestAsync("svc-a", "op-1", largeCompressible, TimeSpan.FromSeconds(5));
+    var random = await client.RequestAsync("svc-b", "op-2", largeRandom, TimeSpan.FromSeconds(5), idempotencyKey: "key-2");
+    var batch = await client.RequestBatchAsync([new SocketBatchItem(1, "svc-c", "op-3", compressible)], TimeSpan.FromSeconds(5));
 
-    Assert.That(single.Succeeded, Is.True);
-    Assert.That(single.Payload.Length, Is.EqualTo(compressible.Length));
-    Assert.That(batch, Has.Count.EqualTo(1));
-    Assert.That(batch[0].Succeeded, Is.True);
-    Assert.That(seenOperations, Is.EqualTo(new[] { 42, 7 }));
+    Assert.That(small.Payload.ToArray(), Is.EqualTo(compressible));
+    Assert.That(large.Payload.ToArray(), Is.EqualTo(largeCompressible));
+    Assert.That(random.Payload.ToArray(), Is.EqualTo(largeRandom));
+    Assert.That(batch[0].Payload, Is.EqualTo(compressible));
+    Assert.That(seen, Is.EqualTo(new[]
+    {
+      ("svc-a", "op-1", "key-1", compressible.Length),
+      ("svc-a", "op-1", "", largeCompressible.Length),
+      ("svc-b", "op-2", "key-2", largeRandom.Length),
+      ("svc-c", "op-3", "", compressible.Length)
+    }));
   }
 
   [Test]
@@ -274,7 +292,6 @@ public sealed partial class SocketFabricTests
     var before = GC.GetTotalAllocatedBytes(precise: true);
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = 1,
       Kind = SocketMessageKind.Chunk,
       OriginalKind = SocketMessageKind.Event,
@@ -307,7 +324,6 @@ public sealed partial class SocketFabricTests
     var before = GC.GetTotalAllocatedBytes(precise: true);
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = 1,
       Kind = SocketMessageKind.Chunk,
       OriginalKind = SocketMessageKind.Event,
@@ -654,16 +670,18 @@ public sealed partial class SocketFabricTests
     await RunRawNoAuthHandshakeAsync(tcp.GetStream());
     var writer = new SocketFrameWriter(tcp.GetStream(), 1024 * 1024);
 
-    // 8 chunks 300 ms apart: 2.4 s in total, well past ChunkTimeout, but never 600 ms without progress.
-    const int chunks = 8;
-    for (var i = 0; i < chunks; i++)
+    // An 800-byte event split into 8 chunks sent 300 ms apart: 2.4 s in total, well past ChunkTimeout,
+    // but never 600 ms without progress.
+    var body = EncodeBody(RawEvent(1, "chunked", new byte[800]));
+    var chunks = SplitIntoChunks(1, SocketMessageKind.Event, body, chunkCount: 8);
+    foreach (var chunk in chunks)
     {
-      await writer.WriteAsync(RawChunk(1, i, chunks, chunks * 100, new byte[100]), CancellationToken.None);
+      await writer.WriteAsync(chunk, CancellationToken.None);
       await Task.Delay(300);
     }
 
     var length = await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-    Assert.That(length, Is.EqualTo(chunks * 100));
+    Assert.That(length, Is.EqualTo(800));
   }
 
   [Test]
@@ -728,8 +746,10 @@ public sealed partial class SocketFabricTests
           if (frame.Kind != SocketMessageKind.Chunk)
             continue;
 
+          // Chunk 0 starts with the encoded frame header and is sent before the caller gives up; every
+          // later chunk is pure payload, so any byte other than 1 there came from the reused buffer.
           chunks++;
-          if (frame.PayloadMemory.Span.IndexOfAnyExcept((byte)1) >= 0)
+          if (frame.ChunkIndex > 0 && frame.PayloadMemory.Span.IndexOfAnyExcept((byte)1) >= 0)
             corrupted++;
         }
 
@@ -832,46 +852,50 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  public async Task FastHandlerFailuresAreReportedUnderTheirOperationId()
+  public async Task HandlerFailuresAreReportedUnderTheirOperation()
   {
     var observer = new HandlerFailedNamesObserver();
     await using var listener = await StartListenerAsync(
         new SocketFabricOptions { NodeId = "server", Observer = observer },
         new DelegateSocketPeerHandler
         {
-          OnFastRequest = (_, _, _) => throw new InvalidOperationException("fast failure")
+          OnRequest = (_, _, _) => throw new InvalidOperationException("failure")
         });
     await using var client = await ConnectAsync(listener);
 
-    await client.RequestFastAsync(7, [], TimeSpan.FromSeconds(5));
-    await client.RequestFastBatchAsync([new SocketFastBatchItem(1, 42, [])], TimeSpan.FromSeconds(5));
+    await client.RequestAsync("test", "single", [], TimeSpan.FromSeconds(5));
+    await client.RequestBatchAsync([new SocketBatchItem(1, "test", "batched", [])], TimeSpan.FromSeconds(5));
     await WaitUntilAsync(() => observer.Operations.Count >= 2, TimeSpan.FromSeconds(5));
 
-    Assert.That(observer.Operations, Is.EquivalentTo(new[] { "7", "42" }));
+    Assert.That(observer.Operations, Is.EquivalentTo(new[] { "single", "batched" }));
   }
 
   [Test]
   [Category("Regression")]
-  public async Task SegmentedFramesDecodeExactlyLikeContiguousOnes()
+  public async Task FramesRoundTripThroughTheCodecWhetherContiguousOrSegmented()
   {
     var frames = new[]
     {
       new SocketFrame
       {
-        Version = 1, Kind = SocketMessageKind.Request, MessageId = 42, OperationId = 3, DeadlineMs = 1500,
+        Kind = SocketMessageKind.Request, MessageId = 42, DeadlineMs = 1500,
         Service = "svc-ü", Operation = "op", IdempotencyKey = "key", Payload = Enumerable.Range(0, 70_000).Select(i => (byte)i).ToArray()
       },
+      new SocketFrame { Kind = SocketMessageKind.Request, MessageId = 43, Service = "svc-ü", Operation = "op", Payload = [1, 2, 3] },
       new SocketFrame
       {
-        Version = 1, Kind = SocketMessageKind.Chunk, OriginalKind = SocketMessageKind.Event, MessageId = 7,
-        ChunkIndex = 1, ChunkCount = 3, TotalPayloadLength = 300, Ok = true, ErrorCode = "e", ErrorMessage = "msg", Payload = new byte[100]
+        Kind = SocketMessageKind.Chunk, OriginalKind = SocketMessageKind.Event, MessageId = 7,
+        ChunkIndex = 1, ChunkCount = 3, TotalPayloadLength = 300, Payload = new byte[100]
       },
-      new SocketFrame { Version = 1, Kind = SocketMessageKind.FastRequest, MessageId = 8, OperationId = -5, Payload = [9, 8, 7] },
-      new SocketFrame { Version = 1, Kind = SocketMessageKind.FastResponse, MessageId = 9, Ok = false, ErrorCode = "code", ErrorMessage = "failure" },
-      new SocketFrame { Version = 1, Kind = SocketMessageKind.StreamItem, MessageId = 10, Payload = new byte[5000] }
+      new SocketFrame { Kind = SocketMessageKind.Ping, MessageId = -1 },
+      new SocketFrame { Kind = SocketMessageKind.Credit, MessageId = 0, Value = 65536 },
+      new SocketFrame { Kind = SocketMessageKind.Response, MessageId = 9, Ok = false, ErrorCode = SocketProtocolError.Timeout, ErrorMessage = "late" },
+      new SocketFrame { Kind = SocketMessageKind.Response, MessageId = 10, Ok = false, ErrorCode = "not_found", ErrorMessage = "no such key" },
+      new SocketFrame { Kind = SocketMessageKind.Response, MessageId = 11, Ok = true, Payload = [5] },
+      new SocketFrame { Kind = SocketMessageKind.StreamItem, MessageId = 12, Payload = new byte[5000] }
     };
     using var encoded = new MemoryStream();
-    var writer = new SocketFrameWriter(encoded, 1024 * 1024);
+    var writer = new SocketFrameWriter(encoded, 1024 * 1024, useMethodTable: true);
     foreach (var frame in frames)
       await writer.WriteAsync(frame, CancellationToken.None);
 
@@ -880,13 +904,24 @@ public sealed partial class SocketFabricTests
 
     for (var i = 0; i < frames.Length; i++)
     {
-      var expected = contiguous[i];
-      var actual = segmented[i];
+      foreach (var actual in new[] { contiguous[i], segmented[i] })
+      {
+        var expected = frames[i];
+        expected.Service ??= string.Empty;
+        expected.Operation ??= string.Empty;
+        expected.IdempotencyKey ??= string.Empty;
+        AssertSameFrame(actual, expected);
+      }
+    }
+  }
+
+  static void AssertSameFrame(SocketFrame actual, SocketFrame expected)
+  {
       Assert.Multiple(() =>
       {
-        Assert.That(actual.Kind, Is.EqualTo(frames[i].Kind));
+        Assert.That(actual.Kind, Is.EqualTo(expected.Kind));
         Assert.That(actual.MessageId, Is.EqualTo(expected.MessageId));
-        Assert.That(actual.OperationId, Is.EqualTo(expected.OperationId));
+        Assert.That(actual.Value, Is.EqualTo(expected.Value));
         Assert.That(actual.DeadlineMs, Is.EqualTo(expected.DeadlineMs));
         Assert.That(actual.OriginalKind, Is.EqualTo(expected.OriginalKind));
         Assert.That(actual.ChunkIndex, Is.EqualTo(expected.ChunkIndex));
@@ -898,9 +933,62 @@ public sealed partial class SocketFabricTests
         Assert.That(actual.IdempotencyKey, Is.EqualTo(expected.IdempotencyKey));
         Assert.That(actual.ErrorCode, Is.EqualTo(expected.ErrorCode));
         Assert.That(actual.ErrorMessage, Is.EqualTo(expected.ErrorMessage));
-        Assert.That(actual.Payload, Is.EqualTo(frames[i].Payload));
+        Assert.That(actual.Payload, Is.EqualTo(expected.Payload));
       });
+  }
+
+  [Test]
+  [Category("Protocol")]
+  public async Task RepeatedMethodsCostOnlyAFewHeaderBytes()
+  {
+    using var encoded = new MemoryStream();
+    var writer = new SocketFrameWriter(encoded, 1024 * 1024, useMethodTable: true);
+    var frame = new SocketFrame { Kind = SocketMessageKind.Request, MessageId = 1, Service = "inventory", Operation = "reserve", DeadlineMs = 10_000, Payload = new byte[64] };
+
+    await writer.WriteAsync(frame, CancellationToken.None);
+    var first = encoded.Length;
+    frame.MessageId = 2;
+    await writer.WriteAsync(frame, CancellationToken.None);
+    var second = encoded.Length - first;
+
+    // Length prefix (4) + kind, flags, id and method number (1 byte each) and deadline (2) + payload.
+    Assert.That(second, Is.EqualTo(4 + 6 + 64));
+    Assert.That(first, Is.GreaterThan(second), "the first use carries the method's definition");
+  }
+
+  [Test]
+  [Category("Protocol")]
+  public async Task MethodsBeyondTheTableLimitAreSentByName()
+  {
+    var seen = 0;
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler
+        {
+          OnRequest = (_, request, _) =>
+          {
+            Interlocked.Increment(ref seen);
+            return ValueTask.FromResult(new SocketResponse { Succeeded = true, Payload = System.Text.Encoding.UTF8.GetBytes(request.Operation) });
+          }
+        });
+    await using var client = await ConnectAsync(listener);
+
+    const int methods = 4096 + 50;
+    var mismatches = 0;
+    for (var i = 0; i < methods; i++)
+    {
+      var operation = $"op-{i}";
+      var result = await client.RequestAsync("test", operation, [], TimeSpan.FromSeconds(5));
+      if (!result.Succeeded || System.Text.Encoding.UTF8.GetString(result.Payload.Span) != operation)
+        mismatches++;
     }
+
+    // Requests for methods defined early still resolve correctly after the table filled up.
+    var early = await client.RequestAsync("test", "op-0", [], TimeSpan.FromSeconds(5));
+
+    Assert.That(mismatches, Is.Zero);
+    Assert.That(System.Text.Encoding.UTF8.GetString(early.Payload.Span), Is.EqualTo("op-0"));
+    Assert.That(seen, Is.EqualTo(methods + 1));
   }
 
   static async ValueTask<List<SocketFrame>> ReadAllFramesAsync(Stream stream, int count)
@@ -964,6 +1052,321 @@ public sealed partial class SocketFabricTests
     {
       throw new NotSupportedException();
     }
+  }
+
+  // Liveness.
+
+  [Test]
+  [Category("Regression")]
+  public async Task HalfOpenConnectionIsClosedSoonAfterARequestTimesOut()
+  {
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler { OnRequest = (_, _, _) => ValueTask.FromResult(SocketResponse.Success()) });
+    await using var proxy = FreezableProxy.Start(listener.EndPoint);
+    await using var client = await new SocketConnector(new SocketFabricOptions
+    {
+      NodeId = "client",
+      LivenessProbeTimeout = TimeSpan.FromMilliseconds(300)
+    }).ConnectAsync(proxy.EndPoint, new DelegateSocketPeerHandler());
+
+    proxy.FreezeExisting();
+    var result = await client.RequestAsync("test", "op", [], TimeSpan.FromMilliseconds(300));
+    await client.Completion.WaitAsync(TimeSpan.FromSeconds(3));
+
+    Assert.That(result.ErrorCode, Is.EqualTo(SocketProtocolError.Timeout));
+    Assert.That(client.State, Is.EqualTo(SocketPeerState.Closed));
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task ClientRetriesOnAFreshConnectionWhenTheOldOneIsHalfOpen()
+  {
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler { OnRequest = (_, _, _) => ValueTask.FromResult(SocketResponse.Success()) });
+    await using var proxy = FreezableProxy.Start(listener.EndPoint);
+    await using var client = new SocketClient(
+        proxy.EndPoint,
+        new DelegateSocketPeerHandler(),
+        new SocketFabricOptions
+        {
+          NodeId = "client",
+          RequestTimeout = TimeSpan.FromMilliseconds(300),
+          LivenessProbeTimeout = TimeSpan.FromMilliseconds(300)
+        });
+    var first = await client.GetPeerAsync();
+
+    proxy.FreezeExisting();
+    var result = await client.RequestAsync("test", "op", 1, new SocketClientRequestOptions
+    {
+      Idempotent = true,
+      MaxAttempts = 2,
+      RetryDelay = TimeSpan.Zero
+    }).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    var second = await client.GetPeerAsync();
+
+    Assert.That(result.Succeeded, Is.True, $"retry failed: {result.ErrorCode}");
+    Assert.That(second, Is.Not.SameAs(first));
+    Assert.That(first.State, Is.EqualTo(SocketPeerState.Closed));
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task SlowButAliveRemoteIsNotClosedByTheLivenessCheck()
+  {
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler
+        {
+          OnRequest = async (_, _, cancellationToken) =>
+          {
+            await Task.Delay(1000, cancellationToken);
+            return SocketResponse.Success();
+          }
+        });
+    await using var client = await ConnectAsync(listener, new SocketFabricOptions
+    {
+      NodeId = "client",
+      LivenessProbeTimeout = TimeSpan.FromMilliseconds(300)
+    });
+
+    var result = await client.RequestAsync("test", "slow", [], TimeSpan.FromMilliseconds(200));
+    await Task.Delay(800);
+    var next = await client.RequestAsync("test", "slow", [], TimeSpan.FromSeconds(5));
+
+    Assert.That(result.ErrorCode, Is.EqualTo(SocketProtocolError.Timeout));
+    Assert.That(client.State, Is.EqualTo(SocketPeerState.Connected));
+    Assert.That(next.Succeeded, Is.True);
+  }
+
+  // A TCP proxy whose current connections can be frozen: they stay open but forward nothing, exactly like a
+  // link whose remote vanished. Connections made after a freeze forward normally.
+  sealed class FreezableProxy : IAsyncDisposable
+  {
+    readonly TcpListener Listener;
+    readonly IPEndPoint Upstream;
+    readonly ConcurrentBag<ProxiedConnection> Connections = [];
+    readonly CancellationTokenSource Lifetime = new();
+    Task AcceptLoop;
+
+    FreezableProxy(IPEndPoint upstream)
+    {
+      Upstream = upstream;
+      Listener = new TcpListener(IPAddress.Loopback, 0);
+    }
+
+    public IPEndPoint EndPoint => (IPEndPoint)Listener.LocalEndpoint;
+
+    public static FreezableProxy Start(IPEndPoint upstream)
+    {
+      var proxy = new FreezableProxy(upstream);
+      proxy.Listener.Start();
+      proxy.AcceptLoop = Task.Run(proxy.AcceptAsync);
+      return proxy;
+    }
+
+    public void FreezeExisting()
+    {
+      foreach (var connection in Connections)
+        connection.Frozen = true;
+    }
+
+    async Task AcceptAsync()
+    {
+      try
+      {
+        while (true)
+        {
+          var downstream = await Listener.AcceptTcpClientAsync(Lifetime.Token);
+          var upstream = new TcpClient(AddressFamily.InterNetwork) { NoDelay = true };
+          await upstream.ConnectAsync(Upstream, Lifetime.Token);
+          var connection = new ProxiedConnection(downstream, upstream);
+          Connections.Add(connection);
+          _ = PumpAsync(connection, downstream.GetStream(), upstream.GetStream());
+          _ = PumpAsync(connection, upstream.GetStream(), downstream.GetStream());
+        }
+      }
+      catch
+      {
+      }
+    }
+
+    async Task PumpAsync(ProxiedConnection connection, NetworkStream from, NetworkStream to)
+    {
+      var buffer = new byte[64 * 1024];
+      try
+      {
+        while (true)
+        {
+          var read = await from.ReadAsync(buffer, Lifetime.Token);
+          if (read == 0)
+            return;
+          if (!connection.Frozen)
+            await to.WriteAsync(buffer.AsMemory(0, read), Lifetime.Token);
+        }
+      }
+      catch
+      {
+      }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+      Lifetime.Cancel();
+      Listener.Stop();
+      foreach (var connection in Connections)
+        connection.Dispose();
+      await AcceptLoop;
+      Lifetime.Dispose();
+    }
+
+    sealed class ProxiedConnection(TcpClient downstream, TcpClient upstream) : IDisposable
+    {
+      public volatile bool Frozen;
+
+      public void Dispose()
+      {
+        downstream.Dispose();
+        upstream.Dispose();
+      }
+    }
+  }
+
+  // Host names.
+
+  [Test]
+  [Category("Regression")]
+  public async Task ConnectorAndClientAcceptHostNames()
+  {
+    var connections = 0;
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions
+        {
+          NodeId = "server",
+          Observer = new DelegateSocketObserver { OnPeerConnected = _ => Interlocked.Increment(ref connections) }
+        },
+        new DelegateSocketPeerHandler
+        {
+          OnRequest = (peer, request, cancellationToken) =>
+          {
+            // The first request closes the server's side, so the client must reconnect (and resolve
+            // the name again) for the retry.
+            if (request.Operation == "close-after")
+              Task.Run(async () =>
+              {
+                await Task.Delay(50);
+                await peer.DisposeAsync();
+              });
+            return ValueTask.FromResult(SocketResponse.Success());
+          }
+        });
+    var port = listener.EndPoint.Port;
+
+    await using var direct = await new SocketConnector(new SocketFabricOptions { NodeId = "client" })
+        .ConnectAsync(new DnsEndPoint("localhost", port), new DelegateSocketPeerHandler());
+    var viaConnector = await direct.RequestAsync("test", "op", [], TimeSpan.FromSeconds(5));
+
+    await using var client = new SocketClient("localhost", port, new DelegateSocketPeerHandler(), new SocketFabricOptions { NodeId = "client" });
+    var first = await client.RequestAsync("test", "close-after", 1);
+    await Task.Delay(300);
+    var second = await client.RequestAsync("test", "op", 1, new SocketClientRequestOptions
+    {
+      Idempotent = true,
+      MaxAttempts = 3,
+      RetryDelay = TimeSpan.FromMilliseconds(50)
+    });
+
+    Assert.That(viaConnector.Succeeded, Is.True);
+    Assert.That(first.Succeeded, Is.True);
+    Assert.That(second.Succeeded, Is.True, second.ErrorCode);
+    Assert.That(Volatile.Read(ref connections), Is.GreaterThanOrEqualTo(3), "the client should have reconnected by name");
+  }
+
+  [Test]
+  [Category("Regression")]
+  public void UnresolvableHostNameFailsToConnect()
+  {
+    var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client", HandshakeTimeout = TimeSpan.FromSeconds(2) });
+
+    Assert.That(
+        async () => await connector.ConnectAsync(new DnsEndPoint("pure-gate-socket-test.invalid", 9), new DelegateSocketPeerHandler()),
+        Throws.InstanceOf<SocketException>().Or.InstanceOf<OperationCanceledException>());
+  }
+
+  // Event ordering.
+
+  [Test]
+  [Category("Regression")]
+  public async Task SlowSequentialEventsDoNotDelayRequests()
+  {
+    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var eventStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler
+        {
+          OnEvent = async (_, _, _) =>
+          {
+            eventStarted.TrySetResult();
+            await release.Task;
+          },
+          OnRequest = (_, _, _) => ValueTask.FromResult(SocketResponse.Success())
+        });
+    await using var client = await ConnectAsync(listener);
+
+    await client.SendEventAsync("test", "slow", [1]);
+    await client.SendEventAsync("test", "slow", [2]);
+    await eventStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    var result = await client.RequestAsync("test", "ok", [], TimeSpan.FromSeconds(2));
+    release.SetResult();
+
+    Assert.That(result.Succeeded, Is.True, "a request waited behind a slow event");
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task PerOperationOrderingKeepsEachOperationInOrderAndRunsOthersAlongside()
+  {
+    const int events = 300;
+    var seen = new ConcurrentQueue<(string Operation, int Sequence)>();
+    var slowBlocked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server", EventOrdering = SocketEventOrdering.PerOperation },
+        new DelegateSocketPeerHandler
+        {
+          OnEvent = async (_, socketEvent, _) =>
+          {
+            var sequence = BinaryPrimitives.ReadInt32BigEndian(socketEvent.Payload.Span);
+            if (socketEvent.Operation == "slow" && sequence == 0)
+            {
+              slowBlocked.TrySetResult();
+              await release.Task;
+            }
+
+            seen.Enqueue((socketEvent.Operation, sequence));
+          }
+        });
+    await using var client = await ConnectAsync(listener);
+
+    for (var i = 0; i < events; i++)
+    {
+      var payload = new byte[4];
+      BinaryPrimitives.WriteInt32BigEndian(payload, i);
+      await client.SendEventAsync("test", i % 2 == 0 ? "slow" : "fast", payload);
+    }
+
+    // "slow" is stuck on its first event; "fast" must still finish every one of its events.
+    await slowBlocked.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    await WaitUntilAsync(() => seen.Count(item => item.Operation == "fast") == events / 2, TimeSpan.FromSeconds(10));
+    var fastDoneWhileSlowBlocked = seen.Count(item => item.Operation == "fast");
+    release.SetResult();
+    await WaitUntilAsync(() => seen.Count == events, TimeSpan.FromSeconds(10));
+
+    Assert.That(fastDoneWhileSlowBlocked, Is.EqualTo(events / 2));
+    Assert.That(seen.Where(item => item.Operation == "slow").Select(item => item.Sequence), Is.Ordered);
+    Assert.That(seen.Where(item => item.Operation == "fast").Select(item => item.Sequence), Is.Ordered);
   }
 
   // Flow control.
@@ -1073,20 +1476,18 @@ public sealed partial class SocketFabricTests
         var writer = new SocketFrameWriter(stream, 1024 * 1024);
         var request = await reader.ReadAsync(CancellationToken.None);
         Assert.That(request.Kind, Is.EqualTo(SocketMessageKind.StreamRequest));
-        Assert.That(request.OperationId, Is.EqualTo(64 * 1024), "the stream request should carry the consumer's window");
+        Assert.That(request.Value, Is.EqualTo(64 * 1024), "the stream request should carry the consumer's window");
         await writer.WriteAsync(new SocketFrame
         {
-          Version = SocketFabricOptions.CurrentProtocolVersion,
           MessageId = request.MessageId,
           Kind = SocketMessageKind.StreamStart,
           Ok = true
         }, CancellationToken.None);
         await writer.WriteAsync(new SocketFrame
         {
-          Version = SocketFabricOptions.CurrentProtocolVersion,
           MessageId = request.MessageId,
           Kind = SocketMessageKind.StreamItem,
-          Payload = new byte[request.OperationId + 1]
+          Payload = new byte[request.Value + 1]
         }, CancellationToken.None);
         await Task.Delay(2000);
       });
@@ -1325,7 +1726,6 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  [Ignore(Phase2EventOrdering)]
   public async Task Stress_EventsFromOnePeerAreHandledInOrder()
   {
     const int events = 2000;
@@ -1521,7 +1921,6 @@ public sealed partial class SocketFabricTests
     Assert.That(hello.Operation, Is.EqualTo("hello"));
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "challenge",
@@ -1536,26 +1935,28 @@ public sealed partial class SocketFabricTests
     Assert.That(proof.Operation, Is.EqualTo("proof"));
     await writer.WriteAsync(new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "ready",
       Ok = true,
-      OperationId = 4096
+      Value = 4096
     }, CancellationToken.None);
     return reader;
   }
 
-  static SocketFrame RawChunk(long messageId, int index, int count, int total, byte[] payload)
+  static SocketFrame RawChunk(
+      long messageId,
+      int index,
+      int count,
+      int total,
+      byte[] payload,
+      SocketMessageKind originalKind = SocketMessageKind.Event)
   {
     return new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = messageId,
       Kind = SocketMessageKind.Chunk,
-      OriginalKind = SocketMessageKind.Event,
-      Service = "events",
-      Operation = "chunked",
+      OriginalKind = originalKind,
       ChunkIndex = index,
       ChunkCount = count,
       TotalPayloadLength = total,
@@ -1563,17 +1964,34 @@ public sealed partial class SocketFabricTests
     };
   }
 
-  static SocketFrame RawEvent(long messageId, string operation)
+  static SocketFrame RawEvent(long messageId, string operation, byte[] payload = null)
   {
     return new SocketFrame
     {
-      Version = SocketFabricOptions.CurrentProtocolVersion,
       MessageId = messageId,
       Kind = SocketMessageKind.Event,
       Service = "events",
       Operation = operation,
-      Payload = [1]
+      Payload = payload ?? [1]
     };
+  }
+
+  // The encoded body of a frame (everything after the 4-byte length prefix), which is what chunks carry.
+  static byte[] EncodeBody(SocketFrame frame)
+  {
+    using var output = new MemoryStream();
+    new SocketFrameWriter(output, 16 * 1024 * 1024).WriteAsync(frame, CancellationToken.None).AsTask().GetAwaiter().GetResult();
+    return output.ToArray()[4..];
+  }
+
+  // Splits an encoded body into chunk frames the way the library does: equal sizes except the last.
+  static List<SocketFrame> SplitIntoChunks(long messageId, SocketMessageKind originalKind, byte[] body, int chunkCount)
+  {
+    var chunkSize = (body.Length + chunkCount - 1) / chunkCount;
+    var count = (body.Length + chunkSize - 1) / chunkSize;
+    return Enumerable.Range(0, count)
+        .Select(index => RawChunk(messageId, index, count, body.Length, body[(index * chunkSize)..Math.Min(body.Length, (index + 1) * chunkSize)], originalKind))
+        .ToList();
   }
 
   sealed class HandlerFailedNamesObserver : Observability.ISocketObserver

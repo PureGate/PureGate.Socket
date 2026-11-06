@@ -42,9 +42,14 @@ public sealed partial class SocketPeer
   // from the frame (the frame's own payload is then empty).
   void ObserveFrameSent(SocketFrame frame, int payloadBytes)
   {
+    ObserveFrameSent(frame.Kind, payloadBytes);
+  }
+
+  void ObserveFrameSent(SocketMessageKind kind, int payloadBytes)
+  {
     try
     {
-      Options.Observer.FrameSent(this, frame.Kind, payloadBytes);
+      Options.Observer.FrameSent(this, kind, payloadBytes);
     }
     catch
     {
