@@ -26,7 +26,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
   readonly CancellationTokenSource Lifetime = new();
   readonly ConcurrentDictionary<long, PendingRequest> PendingRequests = new();
   readonly ConcurrentDictionary<long, PendingStream> PendingStreams = new();
-  readonly ConcurrentDictionary<long, CancellationTokenSource> ActiveRequestCancellations = new();
+  readonly ConcurrentDictionary<long, ActiveRequest> ActiveRequests = new();
   readonly ConcurrentDictionary<ChunkKey, IncomingChunkedFrame> IncomingChunks = new();
   readonly ConcurrentQueue<PendingRequest> PendingRequestPool = new();
   readonly ConcurrentQueue<CancellationTokenSource> RequestCancellationPool = new();

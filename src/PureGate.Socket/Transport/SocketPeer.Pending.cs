@@ -27,6 +27,14 @@ public sealed partial class SocketPeer
       Volatile.Write(ref ArmedMessageId, messageId);
     }
 
+    // Called before the instance goes back to the pool. A request that never got a result (its write threw,
+    // for example) is still armed; disarming it makes any completer still holding its ID fail the swap, so
+    // it cannot complete the instance's next request or complete it twice.
+    public void Disarm()
+    {
+      Interlocked.Exchange(ref ArmedMessageId, 0);
+    }
+
     public void TrySetResult(long messageId, SocketRequestResult result)
     {
       if (messageId != 0 && Interlocked.CompareExchange(ref ArmedMessageId, 0, messageId) == messageId)
@@ -128,8 +136,11 @@ public sealed partial class SocketPeer
 
   void ReturnPendingRequest(PendingRequest pending)
   {
-    if (pending is not null)
-      PendingRequestPool.Enqueue(pending);
+    if (pending is null)
+      return;
+
+    pending.Disarm();
+    PendingRequestPool.Enqueue(pending);
   }
 
   CancellationTokenSource RentRequestCancellation()

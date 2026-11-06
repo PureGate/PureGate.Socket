@@ -253,13 +253,24 @@ public sealed partial class SocketPeer
   // that is simply dropped makes a late Cancel harmless: it only reaches a request that already finished.
   void CancelActiveRequest(long messageId)
   {
-    if (ActiveRequestCancellations.TryGetValue(messageId, out var cancellation))
-      cancellation.Cancel();
+    if (!ActiveRequests.TryGetValue(messageId, out var active))
+      return;
+
+    active.CancelledByRemote = true;
+    active.Source.Cancel();
   }
 
-  static void EndActiveRequest(CancellationTokenSource requestTimeout)
+  static void EndActiveRequest(ActiveRequest active)
   {
     // Stops a pending deadline timer so it does not keep the source alive until the deadline.
-    requestTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
+    active.Source.CancelAfter(Timeout.InfiniteTimeSpan);
+  }
+
+  // One handler invocation on this side. CancelledByRemote tells a Cancel frame from the remote apart from
+  // a deadline or idle timeout, which all cancel the same source.
+  sealed class ActiveRequest
+  {
+    public CancellationTokenSource Source { get; } = new();
+    public volatile bool CancelledByRemote;
   }
 }

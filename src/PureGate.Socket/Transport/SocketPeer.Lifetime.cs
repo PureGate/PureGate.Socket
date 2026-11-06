@@ -14,9 +14,9 @@ public sealed partial class SocketPeer
     HandlerQueue.Writer.TryComplete(exception);
     DrainHandlerQueue();
     IncomingChunks.Clear();
-    foreach (var cancellation in ActiveRequestCancellations.Values)
-      cancellation.Cancel();
-    ActiveRequestCancellations.Clear();
+    foreach (var active in ActiveRequests.Values)
+      active.Source.Cancel();
+    ActiveRequests.Clear();
     foreach (var (messageId, pending) in PendingRequests)
     {
       pending.TrySetResult(messageId, new SocketRequestResult

@@ -67,11 +67,12 @@ public sealed partial class SocketPeer
     SocketResponse observedResponse = null;
     Stream source = null;
     var started = false;
-    var requestTimeout = new CancellationTokenSource();
+    var active = new ActiveRequest();
+    var requestTimeout = active.Source;
     if (frame.DeadlineMs > 0)
       requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(frame.DeadlineMs));
 
-    ActiveRequestCancellations[frame.MessageId] = requestTimeout;
+    ActiveRequests[frame.MessageId] = active;
     try
     {
       try
@@ -122,11 +123,13 @@ public sealed partial class SocketPeer
       }
       catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
       {
-        observedResponse = started
-            ? SocketResponse.Failed(SocketProtocolError.Timeout, "Stream idle timeout elapsed or the stream was cancelled.")
-            : frame.DeadlineMs > 0
-                ? SocketResponse.Failed(SocketProtocolError.Timeout, "Stream deadline elapsed.")
-                : SocketResponse.Failed(SocketProtocolError.Cancelled, "Stream was cancelled.");
+        observedResponse = active.CancelledByRemote
+            ? SocketResponse.Failed(SocketProtocolError.Cancelled, "Stream was cancelled.")
+            : started
+                ? SocketResponse.Failed(SocketProtocolError.Timeout, "Stream idle timeout elapsed.")
+                : frame.DeadlineMs > 0
+                    ? SocketResponse.Failed(SocketProtocolError.Timeout, "Stream deadline elapsed.")
+                    : SocketResponse.Failed(SocketProtocolError.Cancelled, "Stream was cancelled.");
         await WriteStreamEndFailedAsync(
             frame.MessageId,
             observedResponse.ErrorCode,
@@ -147,8 +150,8 @@ public sealed partial class SocketPeer
       ObserveRequestCompleted(
           frame,
           observedResponse ?? SocketResponse.Failed(SocketProtocolError.Cancelled, "Stream did not complete."));
-      ActiveRequestCancellations.TryRemove(frame.MessageId, out _);
-      EndActiveRequest(requestTimeout);
+      ActiveRequests.TryRemove(frame.MessageId, out _);
+      EndActiveRequest(active);
     }
   }
 

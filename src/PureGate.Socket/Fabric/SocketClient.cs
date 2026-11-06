@@ -132,10 +132,19 @@ public sealed class SocketClient : IAsyncDisposable
   // already have replaced it.
   async ValueTask InvalidatePeerAsync(SocketPeer peer)
   {
-    if (peer is null)
+    if (peer is null || Volatile.Read(ref Disposed) != 0)
       return;
 
-    await ConnectLock.WaitAsync();
+    try
+    {
+      await ConnectLock.WaitAsync();
+    }
+    catch (ObjectDisposedException)
+    {
+      // The client was disposed concurrently; it closes its peer itself.
+      return;
+    }
+
     try
     {
       if (!ReferenceEquals(Peer, peer))

@@ -8,20 +8,24 @@ public sealed partial class SocketPeer
   static readonly long ChunkPruneIntervalTicks = TimeSpan.FromSeconds(1).Ticks;
 
   // Only the read loop touches the chunk state below, so it needs no synchronization.
+  // IncomingChunkBytes is the allocated capacity of every reassembly buffer, not the bytes received, so
+  // MaxChunkedBytesInProgress bounds real memory.
   long IncomingChunkBytes;
   long LastChunkPruneTicks = DateTimeOffset.UtcNow.UtcTicks;
 
   // A sender writes the chunks of one message back to back, in order, with equal sizes except the last
-  // (see WriteChunkedFrameAsync). Anything else is a protocol violation and closes the connection.
-  // Memory is committed as bytes arrive, never from the sender's declared sizes.
+  // (see WriteChunkedFrameAsync). A chunk that breaks those rules is a protocol violation and closes the
+  // connection. Memory is committed as bytes arrive, never from the sender's declared sizes.
   SocketFrame ReassembleChunk(SocketFrame frame)
   {
     ValidateChunk(frame);
     var key = new ChunkKey(frame.OriginalKind, frame.MessageId);
     if (!IncomingChunks.TryGetValue(key, out var incoming))
     {
+      // The rest of a message that expired (ChunkTimeout without progress) or whose first chunk never
+      // arrived. Its sender's request times out; dropping the chunk keeps the connection alive.
       if (frame.ChunkIndex != 0)
-        throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Chunked message did not start with its first chunk.");
+        return null;
       if (IncomingChunks.Count >= Options.MaxChunkedMessages)
         throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Too many chunked messages are in progress.");
 
@@ -29,16 +33,18 @@ public sealed partial class SocketPeer
       IncomingChunks[key] = incoming;
     }
 
-    if (IncomingChunkBytes + frame.PayloadLength > Options.MaxChunkedBytesInProgress)
-      throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Chunked messages in progress exceed the configured memory budget.");
-
-    if (!incoming.TryAppend(frame))
+    if (!incoming.IsNextChunk(frame))
     {
       RemoveIncomingChunks(key, incoming);
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Chunk is out of order or inconsistent with its message.");
     }
 
-    IncomingChunkBytes += frame.PayloadLength;
+    var capacity = incoming.PlanCapacity(frame.PayloadLength, Options.MaxChunkedBytesInProgress - IncomingChunkBytes);
+    if (capacity < 0)
+      throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Chunked messages in progress exceed the configured memory budget.");
+
+    IncomingChunkBytes += capacity - incoming.Capacity;
+    incoming.Append(frame, capacity);
     if (!incoming.Completed)
       return null;
 
@@ -49,9 +55,11 @@ public sealed partial class SocketPeer
   void RemoveIncomingChunks(ChunkKey key, IncomingChunkedFrame incoming)
   {
     if (IncomingChunks.TryRemove(key, out _))
-      IncomingChunkBytes -= incoming.ReceivedBytes;
+      IncomingChunkBytes -= incoming.Capacity;
   }
 
+  // A message expires when no chunk for it has arrived for ChunkTimeout. Measuring from the last chunk,
+  // not the first, lets a large transfer take as long as it needs while it keeps making progress.
   void PruneExpiredChunks()
   {
     var now = DateTimeOffset.UtcNow;
@@ -61,7 +69,7 @@ public sealed partial class SocketPeer
     LastChunkPruneTicks = now.UtcTicks;
     foreach (var item in IncomingChunks)
     {
-      if (now - item.Value.CreatedAt > Options.ChunkTimeout)
+      if (now - item.Value.LastActivity > Options.ChunkTimeout)
         RemoveIncomingChunks(item.Key, item.Value);
     }
   }
@@ -104,15 +112,16 @@ public sealed partial class SocketPeer
       if (expectedCount != ChunkCount)
         throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Chunk count does not match the payload length.");
 
-      Buffer = new byte[Math.Min(TotalLength, ChunkSize * 2L)];
-      CreatedAt = DateTimeOffset.UtcNow;
+      Buffer = [];
+      LastActivity = DateTimeOffset.UtcNow;
     }
 
-    public DateTimeOffset CreatedAt { get; }
-    public int ReceivedBytes { get; private set; }
+    public DateTimeOffset LastActivity { get; private set; }
+    public int Capacity => Buffer?.Length ?? 0;
     public bool Completed => NextIndex == ChunkCount;
+    int ReceivedBytes;
 
-    public bool TryAppend(SocketFrame frame)
+    public bool IsNextChunk(SocketFrame frame)
     {
       if (frame.ChunkIndex != NextIndex
           || frame.ChunkCount != ChunkCount
@@ -129,23 +138,33 @@ public sealed partial class SocketPeer
       var expectedLength = NextIndex == ChunkCount - 1
           ? TotalLength - (long)ChunkSize * (ChunkCount - 1)
           : ChunkSize;
-      if (frame.PayloadLength != expectedLength)
-        return false;
+      return frame.PayloadLength == expectedLength;
+    }
 
-      EnsureCapacity(ReceivedBytes + frame.PayloadLength);
+    // The buffer capacity needed to append `length` bytes. It doubles when the budget allows (so a large
+    // message is not copied once per chunk), grows to exactly what is needed when only that fits, and
+    // returns -1 when even that would exceed the budget.
+    public long PlanCapacity(int length, long budgetAvailable)
+    {
+      long required = ReceivedBytes + length;
+      if (required <= Capacity)
+        return Capacity;
+
+      var preferred = Math.Min(TotalLength, Math.Max(required, Capacity * 2L));
+      if (preferred - Capacity <= budgetAvailable)
+        return preferred;
+      return required - Capacity <= budgetAvailable ? required : -1;
+    }
+
+    public void Append(SocketFrame frame, long capacity)
+    {
+      if (capacity > Capacity)
+        Array.Resize(ref Buffer, (int)capacity);
+
       frame.PayloadMemory.Span.CopyTo(Buffer.AsSpan(ReceivedBytes));
       ReceivedBytes += frame.PayloadLength;
       NextIndex++;
-      return true;
-    }
-
-    void EnsureCapacity(int required)
-    {
-      if (required <= Buffer.Length)
-        return;
-
-      var capacity = (int)Math.Min(TotalLength, Math.Max(required, Buffer.Length * 2L));
-      Array.Resize(ref Buffer, capacity);
+      LastActivity = DateTimeOffset.UtcNow;
     }
 
     public SocketFrame ToFrame()

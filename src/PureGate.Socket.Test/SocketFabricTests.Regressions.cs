@@ -10,7 +10,7 @@ using PureGate.Socket.Transport;
 
 namespace PureGate.Socket.Test;
 
-// Regression tests for the defects found in the November 2026 evaluation (docs/ROADMAP.md, Phase 0).
+// Regression tests: each one reproduces a specific defect and fails without its fix.
 // Each test names the bug number it guards. Tests that need the Phase 2 connection-core rework are
 // ignored with the reason, so the suite stays green while still documenting the open defect.
 public sealed partial class SocketFabricTests
@@ -633,6 +633,224 @@ public sealed partial class SocketFabricTests
     Assert.That(client.State, Is.EqualTo(SocketPeerState.Connected));
   }
 
+  // Chunk expiry, chunked-write cancellation, batch error handling and observer reporting.
+
+  [Test]
+  [Category("Regression")]
+  public async Task ChunkedMessageThatKeepsProgressingOutlivesChunkTimeout()
+  {
+    var delivered = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server", ChunkTimeout = TimeSpan.FromMilliseconds(600) },
+        new DelegateSocketPeerHandler
+        {
+          OnEvent = (_, socketEvent, _) =>
+          {
+            delivered.TrySetResult(socketEvent.Payload.Length);
+            return ValueTask.CompletedTask;
+          }
+        });
+    using var tcp = new TcpClient(AddressFamily.InterNetwork);
+    await tcp.ConnectAsync(listener.EndPoint);
+    await RunRawNoAuthHandshakeAsync(tcp.GetStream());
+    var writer = new SocketFrameWriter(tcp.GetStream(), 1024 * 1024);
+
+    // 8 chunks 300 ms apart: 2.4 s in total, well past ChunkTimeout, but never 600 ms without progress.
+    const int chunks = 8;
+    for (var i = 0; i < chunks; i++)
+    {
+      await writer.WriteAsync(RawChunk(1, i, chunks, chunks * 100, new byte[100]), CancellationToken.None);
+      await Task.Delay(300);
+    }
+
+    var length = await delivered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    Assert.That(length, Is.EqualTo(chunks * 100));
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task LateChunkOfExpiredMessageIsDroppedWithoutClosingConnection()
+  {
+    var events = new ConcurrentQueue<string>();
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server", ChunkTimeout = TimeSpan.FromMilliseconds(300) },
+        new DelegateSocketPeerHandler
+        {
+          OnEvent = (_, socketEvent, _) =>
+          {
+            events.Enqueue(socketEvent.Operation);
+            return ValueTask.CompletedTask;
+          }
+        });
+    using var tcp = new TcpClient(AddressFamily.InterNetwork);
+    await tcp.ConnectAsync(listener.EndPoint);
+    await RunRawNoAuthHandshakeAsync(tcp.GetStream());
+    var writer = new SocketFrameWriter(tcp.GetStream(), 1024 * 1024);
+
+    await writer.WriteAsync(RawChunk(1, 0, 2, 200, new byte[100]), CancellationToken.None);
+    await Task.Delay(1300);
+    await writer.WriteAsync(RawChunk(1, 1, 2, 200, new byte[100]), CancellationToken.None);
+    await writer.WriteAsync(RawEvent(2, "after"), CancellationToken.None);
+    await WaitUntilAsync(() => !events.IsEmpty, TimeSpan.FromSeconds(5));
+
+    Assert.That(events, Is.EqualTo(new[] { "after" }), "the expired message must be dropped and the connection must stay open");
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task CancelledChunkedWriteNeverReadsTheCallersBufferAfterReturning()
+  {
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var resume = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    try
+    {
+      var server = Task.Run(async () =>
+      {
+        using var socket = await listener.AcceptTcpClientAsync();
+        var reader = await RunRawNoAuthServerHandshakeAsync(socket.GetStream());
+        await resume.Task;
+        int chunks = 0, corrupted = 0;
+        while (true)
+        {
+          using var idle = new CancellationTokenSource(TimeSpan.FromSeconds(1.5));
+          SocketFrame frame;
+          try
+          {
+            frame = await reader.ReadAsync(idle.Token);
+          }
+          catch (Exception)
+          {
+            break;
+          }
+
+          if (frame is null)
+            break;
+          if (frame.Kind != SocketMessageKind.Chunk)
+            continue;
+
+          chunks++;
+          if (frame.PayloadMemory.Span.IndexOfAnyExcept((byte)1) >= 0)
+            corrupted++;
+        }
+
+        return (chunks, corrupted);
+      });
+
+      await using var client = await new SocketConnector(new SocketFabricOptions { NodeId = "client" })
+          .ConnectAsync((IPEndPoint)listener.LocalEndpoint, new DelegateSocketPeerHandler());
+      var payload = new byte[64 * 1024 * 1024];
+      payload.AsSpan().Fill(1);
+
+      // The server is not reading, so the chunked write blocks; the caller then gives up.
+      using (var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(300)))
+      {
+        try
+        {
+          await client.SendEventAsync("test", "big", payload, cancellation.Token);
+          Assert.Inconclusive("The write finished before the cancellation; socket buffers were large enough to hold it.");
+        }
+        catch (OperationCanceledException)
+        {
+        }
+      }
+
+      // The caller owns its buffer again and reuses it. Nothing sent from here on may contain these bytes.
+      payload.AsSpan().Fill(0xEE);
+      resume.TrySetResult();
+      var (chunks, corrupted) = await server.WaitAsync(TimeSpan.FromSeconds(30));
+
+      Assert.That(corrupted, Is.Zero, "a chunk was copied from the caller's buffer after the caller returned");
+      Assert.That(chunks, Is.GreaterThan(0).And.LessThan(256), "the chunked write should stop at the next chunk boundary");
+    }
+    finally
+    {
+      listener.Stop();
+    }
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task HandlerProtocolErrorInsideEventBatchDoesNotCloseConnection()
+  {
+    var handled = 0;
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler
+        {
+          OnEvent = (_, _, _) =>
+          {
+            Interlocked.Increment(ref handled);
+            throw new SocketProtocolException(SocketProtocolError.ProtocolError, "bad input");
+          },
+          OnRequest = (_, _, _) => ValueTask.FromResult(SocketResponse.Success())
+        });
+    await using var client = await ConnectAsync(listener);
+
+    await client.SendEventBatchAsync([new SocketBatchItem(1, "test", "event", [1]), new SocketBatchItem(2, "test", "event", [2])]);
+    // Both items must run (the batch continues past a failing item), and any close must have happened
+    // before the connection is checked.
+    await WaitUntilAsync(() => Volatile.Read(ref handled) == 2, TimeSpan.FromSeconds(5));
+    await Task.Delay(200);
+    Assert.That(handled, Is.EqualTo(2), "the batch stopped at the first failing item");
+    var result = await client.RequestAsync("test", "ok", [], TimeSpan.FromSeconds(5));
+
+    Assert.That(result.Succeeded, Is.True, $"connection was closed: {result.ErrorCode}");
+    Assert.That(client.State, Is.EqualTo(SocketPeerState.Connected));
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task StreamDisposedByClientIsObservedAsCancelledNotTimeout()
+  {
+    var completed = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions
+        {
+          NodeId = "server",
+          Observer = new DelegateSocketObserver
+          {
+            OnRequestCompleted = (_, _, operation, _, errorCode) =>
+            {
+              if (operation == "pattern")
+                completed.TrySetResult(errorCode);
+            }
+          }
+        },
+        new DelegateSocketPeerHandler
+        {
+          OnStream = (_, _, _) => ValueTask.FromResult(SocketStreamResponse.Success(new PatternStream(64L * 1024 * 1024)))
+        });
+    await using var client = await ConnectAsync(listener);
+
+    var stream = await client.OpenStreamAsync("test", "pattern", [], TimeSpan.FromSeconds(5));
+    await stream.ReadAtLeastAsync(new byte[1024], 1);
+    await stream.DisposeAsync();
+    var errorCode = await completed.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+    Assert.That(errorCode, Is.EqualTo(SocketProtocolError.Cancelled));
+  }
+
+  [Test]
+  [Category("Regression")]
+  public async Task FastHandlerFailuresAreReportedUnderTheirOperationId()
+  {
+    var observer = new HandlerFailedNamesObserver();
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server", Observer = observer },
+        new DelegateSocketPeerHandler
+        {
+          OnFastRequest = (_, _, _) => throw new InvalidOperationException("fast failure")
+        });
+    await using var client = await ConnectAsync(listener);
+
+    await client.RequestFastAsync(7, [], TimeSpan.FromSeconds(5));
+    await client.RequestFastBatchAsync([new SocketFastBatchItem(1, 42, [])], TimeSpan.FromSeconds(5));
+    await WaitUntilAsync(() => observer.Operations.Count >= 2, TimeSpan.FromSeconds(5));
+
+    Assert.That(observer.Operations, Is.EquivalentTo(new[] { "7", "42" }));
+  }
+
   // Stress tests for defects suspected from code reading. They may pass today because the races are
   // narrow; they exist so the Phase 2 rework is checked against them.
 
@@ -690,7 +908,7 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  [Ignore(Phase2EventOrdering + " Confirmed in Phase 0.")]
+  [Ignore(Phase2EventOrdering)]
   public async Task Stress_EventsFromOnePeerAreHandledInOrder()
   {
     const int events = 2000;
@@ -802,7 +1020,7 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Stress")]
-  [Ignore(Phase2FlowControl + " Confirmed in Phase 0: both peers block writing while neither read loop drains.")]
+  [Ignore(Phase2FlowControl + " Both peers block writing while neither read loop drains.")]
   public async Task Stress_BidirectionalFloodDoesNotDeadlock()
   {
     SocketPeer serverPeer = null;
@@ -878,7 +1096,8 @@ public sealed partial class SocketFabricTests
   }
 
   // The server half of a no-auth handshake, for tests that need a remote that misbehaves afterwards.
-  static async ValueTask RunRawNoAuthServerHandshakeAsync(Stream stream)
+  // Returns the reader so the caller keeps reading with it: a new reader would lose buffered bytes.
+  static async ValueTask<SocketFrameReader> RunRawNoAuthServerHandshakeAsync(Stream stream)
   {
     var reader = new SocketFrameReader(stream, 1024 * 1024);
     var writer = new SocketFrameWriter(stream, 1024 * 1024);
@@ -907,6 +1126,47 @@ public sealed partial class SocketFabricTests
       Operation = "ready",
       Ok = true
     }, CancellationToken.None);
+    return reader;
+  }
+
+  static SocketFrame RawChunk(long messageId, int index, int count, int total, byte[] payload)
+  {
+    return new SocketFrame
+    {
+      Version = SocketFabricOptions.CurrentProtocolVersion,
+      MessageId = messageId,
+      Kind = SocketMessageKind.Chunk,
+      OriginalKind = SocketMessageKind.Event,
+      Service = "events",
+      Operation = "chunked",
+      ChunkIndex = index,
+      ChunkCount = count,
+      TotalPayloadLength = total,
+      Payload = payload
+    };
+  }
+
+  static SocketFrame RawEvent(long messageId, string operation)
+  {
+    return new SocketFrame
+    {
+      Version = SocketFabricOptions.CurrentProtocolVersion,
+      MessageId = messageId,
+      Kind = SocketMessageKind.Event,
+      Service = "events",
+      Operation = operation,
+      Payload = [1]
+    };
+  }
+
+  sealed class HandlerFailedNamesObserver : Observability.ISocketObserver
+  {
+    public ConcurrentQueue<string> Operations { get; } = new();
+
+    public void HandlerFailed(SocketPeer peer, string service, string operation, Exception exception)
+    {
+      Operations.Enqueue(operation);
+    }
   }
 
   sealed class DisconnectObserver(Action<string, Exception> onDisconnected) : Observability.ISocketObserver

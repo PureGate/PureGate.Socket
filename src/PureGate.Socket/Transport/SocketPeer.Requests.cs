@@ -14,11 +14,12 @@ public sealed partial class SocketPeer
   async ValueTask DispatchRequestAsync(SocketFrame frame)
   {
     SocketResponse response;
-    var requestTimeout = new CancellationTokenSource();
+    var active = new ActiveRequest();
+    var requestTimeout = active.Source;
     if (frame.DeadlineMs > 0)
       requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(frame.DeadlineMs));
 
-    ActiveRequestCancellations[frame.MessageId] = requestTimeout;
+    ActiveRequests[frame.MessageId] = active;
     try
     {
       try
@@ -36,7 +37,7 @@ public sealed partial class SocketPeer
       }
       catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
       {
-        response = DeadlineOrCancelled(frame);
+        response = DeadlineOrCancelled(frame, active);
       }
       catch (Exception) when (Lifetime.IsCancellationRequested)
       {
@@ -61,19 +62,20 @@ public sealed partial class SocketPeer
     }
     finally
     {
-      ActiveRequestCancellations.TryRemove(frame.MessageId, out _);
-      EndActiveRequest(requestTimeout);
+      ActiveRequests.TryRemove(frame.MessageId, out _);
+      EndActiveRequest(active);
     }
   }
 
   async ValueTask DispatchFastRequestAsync(SocketFrame frame)
   {
     SocketResponse response;
-    var requestTimeout = new CancellationTokenSource();
+    var active = new ActiveRequest();
+    var requestTimeout = active.Source;
     if (frame.DeadlineMs > 0)
       requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(frame.DeadlineMs));
 
-    ActiveRequestCancellations[frame.MessageId] = requestTimeout;
+    ActiveRequests[frame.MessageId] = active;
     try
     {
       try
@@ -89,7 +91,7 @@ public sealed partial class SocketPeer
       }
       catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
       {
-        response = DeadlineOrCancelled(frame);
+        response = DeadlineOrCancelled(frame, active);
       }
       catch (Exception) when (Lifetime.IsCancellationRequested)
       {
@@ -97,7 +99,7 @@ public sealed partial class SocketPeer
       }
       catch (Exception ex)
       {
-        response = HandlerFailure(frame.Service, frame.Operation, ex);
+        response = HandlerFailure(string.Empty, FastOperationName(frame.OperationId), ex);
       }
 
       response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Fast request was not handled.");
@@ -115,16 +117,22 @@ public sealed partial class SocketPeer
     }
     finally
     {
-      ActiveRequestCancellations.TryRemove(frame.MessageId, out _);
-      EndActiveRequest(requestTimeout);
+      ActiveRequests.TryRemove(frame.MessageId, out _);
+      EndActiveRequest(active);
     }
   }
 
-  static SocketResponse DeadlineOrCancelled(SocketFrame frame)
+  static SocketResponse DeadlineOrCancelled(SocketFrame frame, ActiveRequest active)
   {
-    return frame.DeadlineMs > 0
+    return frame.DeadlineMs > 0 && !active.CancelledByRemote
         ? SocketResponse.Failed(SocketProtocolError.Timeout, "Request deadline elapsed.")
         : SocketResponse.Failed(SocketProtocolError.Cancelled, "Request was cancelled.");
+  }
+
+  // Fast requests have no service or operation names, so failures are reported under the operation ID.
+  static string FastOperationName(int operationId)
+  {
+    return operationId.ToString(System.Globalization.CultureInfo.InvariantCulture);
   }
 
   // Turns a handler exception into the response the remote peer sees. A SocketProtocolException is a
@@ -207,7 +215,7 @@ public sealed partial class SocketPeer
     }
     catch (Exception ex)
     {
-      var failure = HandlerFailure(string.Empty, string.Empty, ex);
+      var failure = HandlerFailure(string.Empty, FastOperationName(item.OperationId), ex);
       results.WriteResult(
           item.Id,
           false,
@@ -400,18 +408,38 @@ public sealed partial class SocketPeer
       return;
     }
 
+    // Only the library's own checks decide whether the connection closes. A handler failure, whatever error
+    // code it carries, is reported and the batch continues, exactly as for a single event.
     foreach (var item in items)
     {
-      var result = await HandleBatchEventItemAsync(item, cancellationToken);
-      if (result.Succeeded)
-        continue;
-
-      var closes = result.ErrorCode == SocketProtocolError.ProtocolError
-          || (result.ErrorCode == SocketProtocolError.Unauthorized && Options.CloseOnUnauthorizedEvent);
-      if (closes)
+      if (IsInternalBatch(item.Service, item.Operation))
       {
-        await CloseAsync(new SocketProtocolException(result.ErrorCode, result.ErrorMessage));
+        await CloseAsync(new SocketProtocolException(SocketProtocolError.ProtocolError, "Nested batch messages are not supported."));
         return;
+      }
+
+      var socketEvent = new SocketEvent(item.Service, item.Operation, item.Payload ?? []);
+      var authorization = await Options.Authorizer.AuthorizeEventAsync(this, socketEvent, cancellationToken);
+      if (!authorization.Succeeded)
+      {
+        if (!Options.CloseOnUnauthorizedEvent)
+          continue;
+
+        await CloseAsync(new SocketProtocolException(SocketProtocolError.Unauthorized, authorization.Error));
+        return;
+      }
+
+      try
+      {
+        await Handler.HandleEventAsync(this, socketEvent, cancellationToken);
+      }
+      catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+      {
+        throw;
+      }
+      catch (Exception ex)
+      {
+        ObserveHandlerFailed(item.Service, item.Operation, ex);
       }
     }
   }
