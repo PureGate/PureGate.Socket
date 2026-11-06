@@ -62,8 +62,11 @@ public sealed partial class SocketPeer
   // not the first, lets a large transfer take as long as it needs while it keeps making progress.
   void PruneExpiredChunks()
   {
+    if (IncomingChunks.IsEmpty)
+      return;
+
     var now = DateTimeOffset.UtcNow;
-    if (IncomingChunks.IsEmpty || now.UtcTicks - LastChunkPruneTicks < ChunkPruneIntervalTicks)
+    if (now.UtcTicks - LastChunkPruneTicks < ChunkPruneIntervalTicks)
       return;
 
     LastChunkPruneTicks = now.UtcTicks;
@@ -159,12 +162,21 @@ public sealed partial class SocketPeer
     public void Append(SocketFrame frame, long capacity)
     {
       if (capacity > Capacity)
-        Array.Resize(ref Buffer, (int)capacity);
+        Grow((int)capacity);
 
       frame.PayloadMemory.Span.CopyTo(Buffer.AsSpan(ReceivedBytes));
       ReceivedBytes += frame.PayloadLength;
       NextIndex++;
       LastActivity = DateTimeOffset.UtcNow;
+    }
+
+    // Like Array.Resize, but skips zeroing the new buffer: the received bytes are copied over, and the rest
+    // is filled by later chunks before the payload is handed out (ToFrame only runs once all have arrived).
+    void Grow(int capacity)
+    {
+      var grown = GC.AllocateUninitializedArray<byte>(capacity);
+      Buffer.AsSpan(0, ReceivedBytes).CopyTo(grown);
+      Buffer = grown;
     }
 
     public SocketFrame ToFrame()

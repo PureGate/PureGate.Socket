@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
 
@@ -5,14 +6,27 @@ namespace PureGate.Socket.Transport;
 
 public sealed partial class SocketPeer
 {
+  // Writers that have asked for WriteLock and not yet left: the holder plus everyone queued behind it.
+  int ActiveWriters;
+  // 1 when encoded bytes may be sitting in the pipe unflushed.
+  int FlushPending;
+
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask WriteFrameAsync(SocketFrame frame, CancellationToken cancellationToken)
   {
     await WriteFrameAsync(frame, payloadOverride: default, cancellationToken);
   }
 
+  // Flush coalescing. A writer encodes its frame while holding WriteLock and then flushes only if no other
+  // writer is queued for the lock. If one is, the bytes stay buffered and that writer sends them together
+  // with its own frame in a single flush, so a busy connection makes one system call for many frames.
+  // An idle connection flushes every frame immediately, exactly as before. If a queued writer gives up
+  // (its token fires while waiting) and it was the last one, it schedules the flush itself, so buffered
+  // bytes are never left behind.
+  //
   // Cancellation contract. The caller's token only cancels waiting for the write lock. Once a frame has
-  // the lock, every wire frame is written whole with the connection's own token, so the stream is never
-  // left with a partial frame. Two reasons:
+  // the lock, every wire frame is encoded whole and flushed with the connection's own token, so the stream
+  // is never left with a partial frame. Two reasons:
   // - A frame cancelled half way would leave a partial frame on the wire and corrupt the stream.
   // - The pipe writer is shared by every caller. A token handed to it can trip the next, unrelated write
   //   (one request's timeout could otherwise fail a different caller's write).
@@ -20,18 +34,29 @@ public sealed partial class SocketPeer
   // A caller whose token fires while its frame is being flushed stops waiting and the flush finishes in
   // the background. The payload is usually the caller's own array (SocketFrame.Payload wraps it without
   // copying), so the background write must never read it after the caller has returned:
-  // - A single frame copies the payload into the pipe synchronously, before its first await, so by the
-  //   time the caller can stop waiting the payload is no longer read.
-  // - A chunked frame reads the next slice after each flush. A PayloadLease guards those reads: the
-  //   caller revokes it before returning, and the writer checks it before copying each chunk, then stops.
+  // - A single frame is encoded into the pipe synchronously, before its first await, so by the time the
+  //   caller can stop waiting the payload is no longer read.
+  // - A chunked frame encodes the next slice after each flush. A PayloadLease guards those reads: the
+  //   caller revokes it before returning, and the writer checks it before encoding each chunk, then stops.
   //   The remote discards the partial chunked message when it expires.
   // A payloadOverride buffer is always awaited to the end; it goes back to its owner when this returns.
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask WriteFrameAsync(
       SocketFrame frame,
       ReadOnlyMemory<byte> payloadOverride,
       CancellationToken cancellationToken)
   {
-    await WriteLock.WaitAsync(cancellationToken);
+    Interlocked.Increment(ref ActiveWriters);
+    try
+    {
+      await WriteLock.WaitAsync(cancellationToken);
+    }
+    catch
+    {
+      LeaveWithoutWriting();
+      throw;
+    }
+
     var abandonable = cancellationToken.CanBeCanceled && payloadOverride.IsEmpty;
     var lease = abandonable && frame.PayloadLength > Options.MaxChunkPayloadBytes ? new PayloadLease() : null;
     var write = WriteLockedFrameAsync(frame, payloadOverride, lease);
@@ -58,19 +83,15 @@ public sealed partial class SocketPeer
     }
   }
 
-  // Runs with WriteLock held and releases it when the frame is fully written (or a chunked write stops
-  // because its lease was revoked).
+  // Runs with WriteLock held; FinishWriteAsync releases it.
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask WriteLockedFrameAsync(SocketFrame frame, ReadOnlyMemory<byte> payloadOverride, PayloadLease lease)
   {
-    var cancellationToken = Lifetime.Token;
     try
     {
       try
       {
-        if (payloadOverride.IsEmpty)
-          await Writer.WriteAsync(frame, cancellationToken);
-        else
-          await Writer.WriteAsync(frame, payloadOverride, cancellationToken);
+        Writer.Encode(frame, payloadOverride);
         ObserveFrameSent(frame);
       }
       catch (SocketProtocolException ex)
@@ -82,12 +103,73 @@ public sealed partial class SocketPeer
             frame,
             payloadOverride.IsEmpty ? frame.PayloadMemory : payloadOverride,
             lease,
-            cancellationToken);
+            Lifetime.Token);
+      }
+    }
+    catch
+    {
+      try
+      {
+        await FinishWriteAsync();
+      }
+      catch
+      {
+      }
+
+      throw;
+    }
+
+    await FinishWriteAsync();
+  }
+
+  // Leaves the writer queue while holding WriteLock, flushing if nobody is queued behind, then releases
+  // the lock. FlushPending is raised before leaving so a queued writer that gives up afterwards sees it.
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+  async ValueTask FinishWriteAsync()
+  {
+    try
+    {
+      Volatile.Write(ref FlushPending, 1);
+      if (Interlocked.Decrement(ref ActiveWriters) == 0)
+      {
+        Volatile.Write(ref FlushPending, 0);
+        await Writer.FlushAsync(Lifetime.Token);
       }
     }
     finally
     {
       WriteLock.Release();
+    }
+  }
+
+  // A queued writer that gave up before getting the lock. If it was the last writer and bytes are still
+  // buffered, nobody else will flush them, so it does (in the background, so the caller is not delayed).
+  void LeaveWithoutWriting()
+  {
+    if (Interlocked.Decrement(ref ActiveWriters) == 0 && Volatile.Read(ref FlushPending) != 0)
+      _ = FlushPendingAsync();
+  }
+
+  async Task FlushPendingAsync()
+  {
+    Interlocked.Increment(ref ActiveWriters);
+    try
+    {
+      await WriteLock.WaitAsync(Lifetime.Token);
+    }
+    catch
+    {
+      // The connection is closing; buffered bytes no longer matter.
+      Interlocked.Decrement(ref ActiveWriters);
+      return;
+    }
+
+    try
+    {
+      await FinishWriteAsync();
+    }
+    catch
+    {
     }
   }
 
@@ -126,23 +208,25 @@ public sealed partial class SocketPeer
         ErrorMessage = frame.ErrorMessage
       };
 
-      // The copy into the pipe happens synchronously inside WriteAsync, before it first awaits, so the
-      // payload is only read while the lease is held.
+      // Encoding is synchronous, so the payload is only read while the lease is held.
       if (lease is not null && !lease.TryAcquire())
         throw new OperationCanceledException("The caller cancelled; the rest of the chunked message is not sent.");
 
-      ValueTask write;
       try
       {
-        write = Writer.WriteAsync(chunk, payload.Slice(offset, count), cancellationToken);
+        Writer.Encode(chunk, payload.Slice(offset, count));
       }
       finally
       {
         lease?.Release();
       }
 
-      await write;
       ObserveFrameSent(chunk);
+
+      // Every chunk but the last is flushed here, so a large message never sits whole in the pipe. The
+      // last one is flushed (or coalesced) by FinishWriteAsync like any other frame.
+      if (index < chunkCount - 1)
+        await Writer.FlushAsync(cancellationToken);
     }
   }
 
@@ -164,7 +248,7 @@ public sealed partial class SocketPeer
       Interlocked.CompareExchange(ref State, Free, InUse);
     }
 
-    // Waits out a copy in progress (a few microseconds at most), then forbids further reads.
+    // Waits out an encode in progress (a few microseconds at most), then forbids further reads.
     public void Revoke()
     {
       var spin = new SpinWait();

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
 
@@ -5,6 +6,7 @@ namespace PureGate.Socket.Transport;
 
 public sealed partial class SocketPeer
 {
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketRequestResult> RequestAsync<TRequest>(
       string service,
       string operation,
@@ -20,6 +22,7 @@ public sealed partial class SocketPeer
         cancellationToken);
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<TResponse> RequestAsync<TRequest, TResponse>(
       string service,
       string operation,
@@ -33,6 +36,7 @@ public sealed partial class SocketPeer
     return result.ReadPayload<TResponse>(Options.Codec);
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketRequestResult> RequestAsync(
       string service,
       string operation,
@@ -52,6 +56,7 @@ public sealed partial class SocketPeer
     }, timeout, cancellationToken);
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketRequestResult> RequestFastAsync(
       int operationId,
       byte[] payload,
@@ -84,13 +89,14 @@ public sealed partial class SocketPeer
     return SocketFastBatchCodec.DeserializeResults(result.Payload.Span);
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   async ValueTask<SocketRequestResult> RequestFrameAsync(
       SocketFrame frame,
       TimeSpan timeout,
       CancellationToken cancellationToken)
   {
     ThrowIfClosed();
-    if (!InFlightRequests.Wait(0))
+    if (!TryAcquireInFlight())
     {
       return new SocketRequestResult
       {
@@ -181,7 +187,7 @@ public sealed partial class SocketPeer
       writeCancellation?.Dispose();
       ReturnRequestCancellation(requestTimeout);
       PendingRequests.TryRemove(messageId, out _);
-      InFlightRequests.Release();
+      ReleaseInFlight();
       ReturnPendingRequest(pending);
     }
   }
@@ -208,7 +214,7 @@ public sealed partial class SocketPeer
       CancellationToken cancellationToken = default)
   {
     ThrowIfClosed();
-    if (!InFlightRequests.Wait(0))
+    if (!TryAcquireInFlight())
       throw new SocketProtocolException(SocketProtocolError.Overloaded, "Too many in-flight requests.");
 
     var messageId = Interlocked.Increment(ref NextMessageId);
@@ -246,9 +252,9 @@ public sealed partial class SocketPeer
     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
       if (registered && PendingStreams.TryRemove(messageId, out _))
-        pending.ReleaseInFlight(InFlightRequests);
+        pending.ReleaseInFlight(this);
       if (!registered)
-        pending.ReleaseInFlight(InFlightRequests);
+        pending.ReleaseInFlight(this);
       stream.Complete();
       SendCancelInBackground(messageId);
       throw new SocketProtocolException(SocketProtocolError.Cancelled, "Stream request was cancelled.");
@@ -256,9 +262,9 @@ public sealed partial class SocketPeer
     catch (OperationCanceledException)
     {
       if (registered && PendingStreams.TryRemove(messageId, out _))
-        pending.ReleaseInFlight(InFlightRequests);
+        pending.ReleaseInFlight(this);
       if (!registered)
-        pending.ReleaseInFlight(InFlightRequests);
+        pending.ReleaseInFlight(this);
       stream.Complete();
       SendCancelInBackground(messageId);
       throw new SocketProtocolException(SocketProtocolError.Timeout, "Stream request timed out.");
@@ -266,14 +272,15 @@ public sealed partial class SocketPeer
     catch
     {
       if (registered && PendingStreams.TryRemove(messageId, out _))
-        pending.ReleaseInFlight(InFlightRequests);
+        pending.ReleaseInFlight(this);
       if (!registered)
-        pending.ReleaseInFlight(InFlightRequests);
+        pending.ReleaseInFlight(this);
       stream.Complete();
       throw;
     }
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   public async ValueTask SendEventAsync<TPayload>(
       string service,
       string operation,
@@ -283,6 +290,7 @@ public sealed partial class SocketPeer
     await SendEventAsync(service, operation, Options.Codec.Serialize(payload), cancellationToken);
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   public async ValueTask SendEventAsync(
       string service,
       string operation,

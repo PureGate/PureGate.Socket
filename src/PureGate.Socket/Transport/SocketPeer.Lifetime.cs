@@ -11,7 +11,6 @@ public sealed partial class SocketPeer
 
     State = SocketPeerState.Closed;
     Lifetime.Cancel();
-    HandlerQueue.Writer.TryComplete(exception);
     DrainHandlerQueue();
     IncomingChunks.Clear();
     foreach (var active in ActiveRequests.Values)
@@ -35,7 +34,7 @@ public sealed partial class SocketPeer
       pending.Stream.Complete(new SocketProtocolException(
           SocketProtocolError.ConnectionClosed,
           "Connection closed."));
-      pending.ReleaseInFlight(InFlightRequests);
+      pending.ReleaseInFlight(this);
     }
     PendingStreams.Clear();
     try
@@ -51,12 +50,6 @@ public sealed partial class SocketPeer
     Closed.TrySetResult();
   }
 
-  void DrainHandlerQueue()
-  {
-    while (HandlerQueue.Reader.TryRead(out var frame))
-      frame.ReleasePayload();
-  }
-
   public async ValueTask DisposeAsync()
   {
     await CloseGracefullyAsync();
@@ -64,15 +57,15 @@ public sealed partial class SocketPeer
     {
       await Task.WhenAll(ReadTask, HeartbeatTask);
       await ConnectedTask;
-      await Task.WhenAll(HandlerTasks);
+      await WaitForHandlersAsync();
     }
     catch
     {
     }
 
-    // Lifetime, WriteLock and InFlightRequests are deliberately not disposed: callers that were in flight
-    // when the peer closed still touch them on their way out, and disposing them turned a clean
-    // connection_closed result into an ObjectDisposedException. None of them hold unmanaged resources.
+    // Lifetime and WriteLock are deliberately not disposed: callers that were in flight when the peer
+    // closed still touch them on their way out, and disposing them turned a clean connection_closed
+    // result into an ObjectDisposedException. Neither holds unmanaged resources.
     while (RequestCancellationPool.TryDequeue(out var cancellation))
       cancellation.Dispose();
   }

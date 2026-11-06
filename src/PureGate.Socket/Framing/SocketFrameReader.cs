@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
@@ -15,13 +16,23 @@ sealed class SocketFrameReader(
 {
   readonly PipeReader Reader = PipeReader.Create(stream);
 
+  const int MinimumReadHint = 4096;
+
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   public async ValueTask<SocketFrame> ReadAsync(CancellationToken cancellationToken)
   {
+    var readHint = 0;
     while (true)
     {
-      var result = await Reader.ReadAsync(cancellationToken);
+      // Once a frame's length is known, ask the pipe for more of it per read, so a large frame arrives in a
+      // few big reads instead of many small ones. The hint grows with what has actually arrived (at most
+      // twice the buffered bytes plus 4 KB), so a peer that only announces a large frame cannot make this
+      // side reserve memory for bytes it never sends.
+      var result = readHint > 0
+          ? await Reader.ReadAtLeastAsync(readHint, cancellationToken)
+          : await Reader.ReadAsync(cancellationToken);
       var buffer = result.Buffer;
-      if (TryReadFrame(buffer, out var frame, out var consumed))
+      if (TryReadFrame(buffer, out var frame, out var consumed, out var required))
       {
         Reader.AdvanceTo(consumed);
         return frame;
@@ -36,16 +47,23 @@ sealed class SocketFrameReader(
       }
 
       Reader.AdvanceTo(buffer.Start, buffer.End);
+      readHint = required <= 0
+          ? 0
+          : (int)Math.Min(required, buffer.Length * 2L + MinimumReadHint);
     }
   }
 
+  // required is the total number of bytes the frame in progress needs (length prefix included), or 0 when
+  // even the length prefix has not arrived yet.
   bool TryReadFrame(
       ReadOnlySequence<byte> buffer,
       out SocketFrame frame,
-      out SequencePosition consumed)
+      out SequencePosition consumed,
+      out long required)
   {
     frame = null;
     consumed = buffer.Start;
+    required = 0;
     var reader = new SequenceReader<byte>(buffer);
     if (!reader.TryReadBigEndian(out int length))
       return false;
@@ -54,7 +72,10 @@ sealed class SocketFrameReader(
       throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Frame size is invalid.");
 
     if (reader.Remaining < length)
+    {
+      required = 4L + length;
       return false;
+    }
 
     var payload = buffer.Slice(reader.Position, length);
     consumed = buffer.GetPosition(length, reader.Position);
@@ -64,20 +85,136 @@ sealed class SocketFrameReader(
 
   SocketFrame Decode(ReadOnlySequence<byte> payload)
   {
-    if (payload.IsSingleSegment)
-      return Decode(payload.FirstSpan);
+    return payload.IsSingleSegment
+        ? Decode(payload.FirstSpan)
+        : DecodeSegmented(payload);
+  }
 
-    var length = checked((int)payload.Length);
-    var buffer = ArrayPool<byte>.Shared.Rent(length);
-    try
+  // A frame split across pipe segments (common for large frames). The header is parsed in place and the
+  // payload is copied straight into its final buffer, so the payload is copied once, not twice.
+  SocketFrame DecodeSegmented(ReadOnlySequence<byte> payload)
+  {
+    var reader = new SequenceReader<byte>(payload);
+    var version = ReadInt32(ref reader);
+    var kind = (SocketMessageKind)ReadByte(ref reader);
+    var fast = kind is SocketMessageKind.FastRequest or SocketMessageKind.FastResponse;
+    var messageId = ReadInt64(ref reader);
+    var operationId = ReadInt32(ref reader);
+    var flags = ReadInt32(ref reader);
+    var deadlineMs = ReadInt32(ref reader);
+    var frame = new SocketFrame
     {
-      payload.CopyTo(buffer);
-      return Decode(buffer.AsSpan(0, length));
-    }
-    finally
+      Version = version,
+      Kind = kind,
+      MessageId = messageId,
+      OperationId = operationId,
+      Flags = flags,
+      DeadlineMs = deadlineMs
+    };
+
+    if (fast)
     {
-      ArrayPool<byte>.Shared.Return(buffer);
+      frame.Ok = ReadByte(ref reader) != 0;
+      frame.ErrorCode = kind == SocketMessageKind.FastResponse ? ReadString(ref reader) : string.Empty;
+      frame.ErrorMessage = kind == SocketMessageKind.FastResponse ? ReadString(ref reader) : string.Empty;
     }
+    else
+    {
+      frame.OriginalKind = (SocketMessageKind)ReadByte(ref reader);
+      frame.ChunkIndex = ReadInt32(ref reader);
+      frame.ChunkCount = ReadInt32(ref reader);
+      frame.TotalPayloadLength = ReadInt32(ref reader);
+      frame.Ok = ReadByte(ref reader) != 0;
+      frame.Service = ReadString(ref reader);
+      frame.Operation = ReadString(ref reader);
+      frame.IdempotencyKey = ReadString(ref reader);
+      frame.ErrorCode = ReadString(ref reader);
+      frame.ErrorMessage = ReadString(ref reader);
+    }
+
+    var framePayload = ReadBytes(ref reader, pooled: kind == SocketMessageKind.StreamItem);
+    if (!reader.End)
+    {
+      framePayload.Dispose();
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains trailing bytes.");
+    }
+
+    frame.SetPayload(framePayload);
+    return FinishFrame(frame);
+  }
+
+  static byte ReadByte(ref SequenceReader<byte> reader)
+  {
+    if (!reader.TryRead(out var value))
+      throw Truncated();
+    return value;
+  }
+
+  static int ReadInt32(ref SequenceReader<byte> reader)
+  {
+    if (!reader.TryReadBigEndian(out int value))
+      throw Truncated();
+    return value;
+  }
+
+  static long ReadInt64(ref SequenceReader<byte> reader)
+  {
+    if (!reader.TryReadBigEndian(out long value))
+      throw Truncated();
+    return value;
+  }
+
+  static string ReadString(ref SequenceReader<byte> reader)
+  {
+    var length = ReadInt32(ref reader);
+    if (length < 0)
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame string length is invalid.");
+    if (reader.Remaining < length)
+      throw Truncated();
+    if (length == 0)
+      return string.Empty;
+
+    var value = Encoding.UTF8.GetString(reader.UnreadSequence.Slice(0, length));
+    reader.Advance(length);
+    return value;
+  }
+
+  static SocketPayload ReadBytes(ref SequenceReader<byte> reader, bool pooled)
+  {
+    var length = ReadInt32(ref reader);
+    if (length < 0)
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame payload length is invalid.");
+    if (reader.Remaining < length)
+      throw Truncated();
+    if (length == 0)
+      return SocketPayload.Empty;
+
+    var source = reader.UnreadSequence.Slice(0, length);
+    SocketPayload payload;
+    if (pooled)
+    {
+      payload = SocketPayload.Rent(length);
+      source.CopyTo(MemoryMarshalWritable(payload, length));
+    }
+    else
+    {
+      var value = GC.AllocateUninitializedArray<byte>(length);
+      source.CopyTo(value);
+      payload = SocketPayload.Wrap(value);
+    }
+
+    reader.Advance(length);
+    return payload;
+  }
+
+  static Span<byte> MemoryMarshalWritable(SocketPayload payload, int length)
+  {
+    return System.Runtime.InteropServices.MemoryMarshal.AsMemory(payload.Memory).Span.Slice(0, length);
+  }
+
+  static SocketProtocolException Truncated()
+  {
+    return new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame is truncated.");
   }
 
   SocketFrame Decode(ReadOnlySpan<byte> payload)
@@ -129,27 +266,7 @@ sealed class SocketFrameReader(
       ErrorMessage = errorMessage
     };
     frame.SetPayload(framePayload);
-    try
-    {
-      if ((frame.Flags & ~SocketFrameFlags.Known) != 0)
-        throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Frame contains unsupported flags.");
-
-      if ((frame.Flags & SocketFrameFlags.PayloadCompressed) != 0)
-      {
-        if (compression != SocketPayloadCompression.Brotli)
-          throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Compressed payload is not supported by this peer.");
-
-        frame.Payload = DecompressBrotli(frame.PayloadMemory.ToArray());
-        frame.Flags &= ~SocketFrameFlags.PayloadCompressed;
-      }
-    }
-    catch
-    {
-      frame.ReleasePayload();
-      throw;
-    }
-
-    return frame;
+    return FinishFrame(frame);
   }
 
   SocketFrame DecodeFast(
@@ -185,6 +302,12 @@ sealed class SocketFrameReader(
       ErrorMessage = errorMessage
     };
     frame.SetPayload(framePayload);
+    return FinishFrame(frame);
+  }
+
+  // Shared final step of every decoder: rejects unknown flags and decompresses a compressed payload.
+  SocketFrame FinishFrame(SocketFrame frame)
+  {
     try
     {
       if ((frame.Flags & ~SocketFrameFlags.Known) != 0)
@@ -287,7 +410,9 @@ sealed class SocketFrameReader(
       return payload;
     }
 
-    var value = buffer.Slice(offset, length).ToArray();
+    // Uninitialized: every byte is overwritten by the copy below before anything can read it.
+    var value = GC.AllocateUninitializedArray<byte>(length);
+    buffer.Slice(offset, length).CopyTo(value);
     offset += length;
     return SocketPayload.Wrap(value);
   }

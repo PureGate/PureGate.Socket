@@ -26,7 +26,7 @@ Console.WriteLine();
 
 if (suite is "all" or "matrix")
 {
-  var matrix = await MatrixBenchmarks.RunAsync(quick);
+  var matrix = await MatrixBenchmarks.RunAsync(quick, GetStringArg(args, "--filter", null));
   Console.WriteLine();
   if (jsonPath is not null)
     MatrixBenchmarks.WriteJson(jsonPath, matrix);
@@ -84,8 +84,6 @@ static async Task RunAsync(
     Func<Task> action,
     string unit = "ops")
 {
-  await action();
-  await Task.Delay(100);
   GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
   GC.WaitForPendingFinalizers();
   GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
@@ -119,8 +117,6 @@ static async Task RunWithContextAsync<TContext>(
     where TContext : IAsyncDisposable
 {
   await using var context = await setup();
-  await action(context);
-  await Task.Delay(100);
   GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
   GC.WaitForPendingFinalizers();
   GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);

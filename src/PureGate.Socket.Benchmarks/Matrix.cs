@@ -16,10 +16,26 @@ static class MatrixBenchmarks
 {
   static readonly int[] PayloadSizes = [64, 1024, 64 * 1024, 1024 * 1024];
   static readonly int[] ConnectionCounts = [1, 8, 64];
+  static readonly int[] MultiplexedCallers = [8, 64];
 
-  public static async Task<List<BenchmarkResult>> RunAsync(bool quick)
+  public static async Task<List<BenchmarkResult>> RunAsync(bool quick, string filter = null)
   {
+    Filter = filter;
     var results = new List<BenchmarkResult>();
+    try
+    {
+      await RunScenariosAsync(results, quick);
+    }
+    finally
+    {
+      results.RemoveAll(result => result is null);
+    }
+
+    return results;
+  }
+
+  static async Task RunScenariosAsync(List<BenchmarkResult> results, bool quick)
+  {
     var scale = quick ? 10 : 1;
     using var certificate = CreateCertificate();
 
@@ -36,6 +52,8 @@ static class MatrixBenchmarks
       results.Add(await MeasureSequentialAsync($"fast rpc echo {Size(size)}", Iterations(size) / scale, size, () => PeerEchoSession.StartAsync(Variant.Plain, certificate, fast: true)));
     foreach (var connections in ConnectionCounts)
       results.Add(await MeasureConcurrentAsync($"rpc echo 1KB x{connections} conn", connections, 20_000 / scale, 1024, () => PeerEchoSession.StartAsync(Variant.Plain, certificate)));
+    foreach (var callers in MultiplexedCallers)
+      results.Add(await MeasureMultiplexedAsync($"rpc echo 1KB 1 conn x{callers} callers", callers, 40_000 / scale, 1024, () => PeerEchoSession.StartAsync(Variant.Plain, certificate)));
 
     Console.WriteLine("Matrix: TLS and compression");
     foreach (var variant in new[] { Variant.Tls, Variant.Brotli, Variant.TlsBrotli })
@@ -47,9 +65,7 @@ static class MatrixBenchmarks
 
     Console.WriteLine("Matrix: streams");
     foreach (var variant in new[] { Variant.Plain, Variant.Tls })
-      results.Add(await MeasureStreamAsync($"pull stream 256MB [{variant}]", (quick ? 32L : 256L) * 1024 * 1024, variant, certificate));
-
-    return results;
+      results.Add(await MeasureStreamAsync($"pull stream 2GB [{variant}]", (quick ? 256L : 2048L) * 1024 * 1024, variant, certificate));
   }
 
   static int Iterations(int payloadSize)
@@ -67,10 +83,16 @@ static class MatrixBenchmarks
     return bytes >= 1024 * 1024 ? $"{bytes / (1024 * 1024)}MB" : bytes >= 1024 ? $"{bytes / 1024}KB" : $"{bytes}B";
   }
 
+  // Scenarios whose name does not contain this text are skipped (--filter).
+  static string Filter;
+
   // A scenario that fails is recorded as failed instead of aborting the run, so a broken feature shows
   // up in the report next to the numbers that did complete.
   static async Task<BenchmarkResult> GuardAsync(string name, Func<Task<BenchmarkResult>> run)
   {
+    if (Filter is not null && !name.Contains(Filter, StringComparison.OrdinalIgnoreCase))
+      return null;
+
     try
     {
       return await run().WaitAsync(TimeSpan.FromMinutes(2));
@@ -103,6 +125,38 @@ static class MatrixBenchmarks
     return GuardAsync(name, () => MeasureConcurrentCoreAsync(name, connections, totalOperations, payloadSize, start));
   }
 
+  // Many callers sharing one connection: the usual cluster pattern, where several frames are often queued
+  // for the same socket at once.
+  static Task<BenchmarkResult> MeasureMultiplexedAsync(
+      string name,
+      int callers,
+      int totalOperations,
+      int payloadSize,
+      Func<ValueTask<IEchoSession>> start)
+  {
+    return GuardAsync(name, async () =>
+    {
+      var perCaller = Math.Max(totalOperations / callers, 20);
+      await using var session = await start();
+      var echo = await session.CreateEchoAsync();
+      var payload = CreatePayload(payloadSize, compressible: false);
+      var latencies = new long[perCaller * callers];
+      var measurement = Measurement.Start();
+      await Task.WhenAll(Enumerable.Range(0, callers).Select(caller => Task.Run(async () =>
+      {
+        var offset = caller * perCaller;
+        for (var i = 0; i < perCaller; i++)
+        {
+          var started = Stopwatch.GetTimestamp();
+          await echo(payload);
+          latencies[offset + i] = Stopwatch.GetTimestamp() - started;
+        }
+      })));
+
+      return measurement.Stop(name, latencies.Length, latencies, (long)latencies.Length * payloadSize);
+    });
+  }
+
   static Task<BenchmarkResult> MeasureStreamAsync(string name, long bytes, Variant variant, X509Certificate2 certificate)
   {
     return GuardAsync(name, () => MeasureStreamCoreAsync(name, bytes, variant, certificate));
@@ -119,9 +173,6 @@ static class MatrixBenchmarks
     await using var session = await start();
     var echo = await session.CreateEchoAsync();
     var payload = CreatePayload(payloadSize, compressible);
-    for (var i = 0; i < Math.Max(iterations / 10, 10); i++)
-      await echo(payload);
-
     var latencies = new long[iterations];
     var measurement = Measurement.Start();
     for (var i = 0; i < iterations; i++)
@@ -147,12 +198,6 @@ static class MatrixBenchmarks
     for (var i = 0; i < connections; i++)
       echoes[i] = await session.CreateEchoAsync();
     var payload = CreatePayload(payloadSize, compressible: false);
-    await Task.WhenAll(echoes.Select(echo => Task.Run(async () =>
-    {
-      for (var i = 0; i < 10; i++)
-        await echo(payload);
-    })));
-
     var latencies = new long[perConnection * connections];
     var measurement = Measurement.Start();
     await Task.WhenAll(echoes.Select((echo, connection) => Task.Run(async () =>
@@ -182,7 +227,6 @@ static class MatrixBenchmarks
     await using var client = await new SocketConnector(PeerEchoSession.Options("client", variant, certificate))
         .ConnectAsync(listener.EndPoint, new BenchmarkHandler());
 
-    await ReadAllAsync(client, bytes);
     var measurement = Measurement.Start();
     await ReadAllAsync(client, bytes);
     return measurement.Stop(name, 1, null, bytes, unit: "bytes");

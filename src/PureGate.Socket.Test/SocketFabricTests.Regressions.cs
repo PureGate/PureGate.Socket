@@ -851,6 +851,122 @@ public sealed partial class SocketFabricTests
     Assert.That(observer.Operations, Is.EquivalentTo(new[] { "7", "42" }));
   }
 
+  [Test]
+  [Category("Regression")]
+  public async Task SegmentedFramesDecodeExactlyLikeContiguousOnes()
+  {
+    var frames = new[]
+    {
+      new SocketFrame
+      {
+        Version = 1, Kind = SocketMessageKind.Request, MessageId = 42, OperationId = 3, DeadlineMs = 1500,
+        Service = "svc-ü", Operation = "op", IdempotencyKey = "key", Payload = Enumerable.Range(0, 70_000).Select(i => (byte)i).ToArray()
+      },
+      new SocketFrame
+      {
+        Version = 1, Kind = SocketMessageKind.Chunk, OriginalKind = SocketMessageKind.Event, MessageId = 7,
+        ChunkIndex = 1, ChunkCount = 3, TotalPayloadLength = 300, Ok = true, ErrorCode = "e", ErrorMessage = "msg", Payload = new byte[100]
+      },
+      new SocketFrame { Version = 1, Kind = SocketMessageKind.FastRequest, MessageId = 8, OperationId = -5, Payload = [9, 8, 7] },
+      new SocketFrame { Version = 1, Kind = SocketMessageKind.FastResponse, MessageId = 9, Ok = false, ErrorCode = "code", ErrorMessage = "failure" },
+      new SocketFrame { Version = 1, Kind = SocketMessageKind.StreamItem, MessageId = 10, Payload = new byte[5000] }
+    };
+    using var encoded = new MemoryStream();
+    var writer = new SocketFrameWriter(encoded, 1024 * 1024);
+    foreach (var frame in frames)
+      await writer.WriteAsync(frame, CancellationToken.None);
+
+    var contiguous = await ReadAllFramesAsync(new MemoryStream(encoded.ToArray()), frames.Length);
+    var segmented = await ReadAllFramesAsync(new TrickleStream(encoded.ToArray(), maxBytesPerRead: 7), frames.Length);
+
+    for (var i = 0; i < frames.Length; i++)
+    {
+      var expected = contiguous[i];
+      var actual = segmented[i];
+      Assert.Multiple(() =>
+      {
+        Assert.That(actual.Kind, Is.EqualTo(frames[i].Kind));
+        Assert.That(actual.MessageId, Is.EqualTo(expected.MessageId));
+        Assert.That(actual.OperationId, Is.EqualTo(expected.OperationId));
+        Assert.That(actual.DeadlineMs, Is.EqualTo(expected.DeadlineMs));
+        Assert.That(actual.OriginalKind, Is.EqualTo(expected.OriginalKind));
+        Assert.That(actual.ChunkIndex, Is.EqualTo(expected.ChunkIndex));
+        Assert.That(actual.ChunkCount, Is.EqualTo(expected.ChunkCount));
+        Assert.That(actual.TotalPayloadLength, Is.EqualTo(expected.TotalPayloadLength));
+        Assert.That(actual.Ok, Is.EqualTo(expected.Ok));
+        Assert.That(actual.Service, Is.EqualTo(expected.Service));
+        Assert.That(actual.Operation, Is.EqualTo(expected.Operation));
+        Assert.That(actual.IdempotencyKey, Is.EqualTo(expected.IdempotencyKey));
+        Assert.That(actual.ErrorCode, Is.EqualTo(expected.ErrorCode));
+        Assert.That(actual.ErrorMessage, Is.EqualTo(expected.ErrorMessage));
+        Assert.That(actual.Payload, Is.EqualTo(frames[i].Payload));
+      });
+    }
+  }
+
+  static async ValueTask<List<SocketFrame>> ReadAllFramesAsync(Stream stream, int count)
+  {
+    var reader = new SocketFrameReader(stream, 1024 * 1024);
+    var frames = new List<SocketFrame>();
+    for (var i = 0; i < count; i++)
+      frames.Add(await reader.ReadAsync(CancellationToken.None));
+    return frames;
+  }
+
+  // Returns at most a few bytes per read, so the pipe holds frames in many small segments.
+  sealed class TrickleStream(byte[] data, int maxBytesPerRead) : Stream
+  {
+    int PositionValue;
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => data.Length;
+
+    public override long Position
+    {
+      get => PositionValue;
+      set => throw new NotSupportedException();
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+      return Read(buffer.AsSpan(offset, count));
+    }
+
+    public override int Read(Span<byte> buffer)
+    {
+      var count = Math.Min(Math.Min(buffer.Length, maxBytesPerRead), data.Length - PositionValue);
+      data.AsSpan(PositionValue, count).CopyTo(buffer);
+      PositionValue += count;
+      return count;
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+      return ValueTask.FromResult(Read(buffer.Span));
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+      throw new NotSupportedException();
+    }
+
+    public override void SetLength(long value)
+    {
+      throw new NotSupportedException();
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+      throw new NotSupportedException();
+    }
+  }
+
   // Stress tests for defects suspected from code reading. They may pass today because the races are
   // narrow; they exist so the Phase 2 rework is checked against them.
 

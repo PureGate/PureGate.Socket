@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
@@ -15,18 +16,37 @@ sealed class SocketFrameWriter(
 {
   readonly PipeWriter Writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true));
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   public async ValueTask WriteAsync(SocketFrame frame, CancellationToken cancellationToken)
   {
     await WriteAsync(frame, frame?.PayloadMemory ?? ReadOnlyMemory<byte>.Empty, cancellationToken);
   }
 
-  // The payload written is payloadOverride when it is non-empty, otherwise the frame's own payload.
-  // Compression is decided here, on that payload, and only changes the flags and bytes that are encoded.
-  // The frame itself is never copied or modified, so no header field can be lost along the way.
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   public async ValueTask WriteAsync(
       SocketFrame frame,
       ReadOnlyMemory<byte> payloadOverride,
       CancellationToken cancellationToken)
+  {
+    Encode(frame, payloadOverride);
+    await FlushAsync(cancellationToken);
+  }
+
+  // Sends everything encoded so far.
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+  public async ValueTask FlushAsync(CancellationToken cancellationToken)
+  {
+    var flush = await Writer.FlushAsync(cancellationToken);
+    if (flush.IsCanceled)
+      throw new OperationCanceledException(cancellationToken);
+  }
+
+  // Encodes one frame into the pipe's buffer without sending it. It runs synchronously, so the payload is
+  // no longer read once it returns.
+  // The payload written is payloadOverride when it is non-empty, otherwise the frame's own payload.
+  // Compression is decided here, on that payload, and only changes the flags and bytes that are encoded.
+  // The frame itself is never copied or modified, so no header field can be lost along the way.
+  public void Encode(SocketFrame frame, ReadOnlyMemory<byte> payloadOverride)
   {
     frame ??= new SocketFrame();
     var payload = payloadOverride.IsEmpty ? frame.PayloadMemory : payloadOverride;
@@ -49,9 +69,6 @@ sealed class SocketFrameWriter(
     BinaryPrimitives.WriteInt32BigEndian(buffer.Slice(0, 4), length);
     Encode(frame, flags, payload.Span, buffer.Slice(4, length));
     Writer.Advance(4 + length);
-    var flush = await Writer.FlushAsync(cancellationToken);
-    if (flush.IsCanceled)
-      throw new OperationCanceledException(cancellationToken);
   }
 
   bool ShouldCompress(SocketMessageKind kind, int payloadLength)

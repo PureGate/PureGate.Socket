@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
 
@@ -16,7 +17,7 @@ public sealed partial class SocketPeer
         if (frame is null)
           break;
 
-        LastReceivedTicks = DateTimeOffset.UtcNow.UtcTicks;
+        Volatile.Write(ref LastReceivedTicks, Environment.TickCount64);
         ObserveFrameReceived(frame);
         PruneExpiredChunks();
         if (frame.Kind == SocketMessageKind.Chunk)
@@ -48,6 +49,7 @@ public sealed partial class SocketPeer
     }
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   async ValueTask<bool> DispatchAsync(SocketFrame frame)
   {
     if (frame.Version != Options.ProtocolVersion)
@@ -111,9 +113,10 @@ public sealed partial class SocketPeer
     }
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   async ValueTask<bool> EnqueueHandlerFrameAsync(SocketFrame frame)
   {
-    if (HandlerQueue.Writer.TryWrite(frame))
+    if (TryEnqueueHandlerFrame(frame))
       return false;
 
     // The request was rejected before any handler ran, so the caller can safely retry it.
@@ -146,52 +149,6 @@ public sealed partial class SocketPeer
     throw new SocketProtocolException(SocketProtocolError.Overloaded, "Handler queue is full.");
   }
 
-  async Task HandlerLoopAsync()
-  {
-    try
-    {
-      await foreach (var frame in HandlerQueue.Reader.ReadAllAsync(Lifetime.Token))
-      {
-        try
-        {
-          switch (frame.Kind)
-          {
-            case SocketMessageKind.Request:
-              await DispatchRequestAsync(frame);
-              break;
-            case SocketMessageKind.FastRequest:
-              await DispatchFastRequestAsync(frame);
-              break;
-            case SocketMessageKind.StreamRequest:
-              await DispatchStreamRequestAsync(frame);
-              break;
-            case SocketMessageKind.Event:
-              await DispatchEventAsync(frame);
-              break;
-          }
-        }
-        catch (Exception ex) when (!Lifetime.IsCancellationRequested)
-        {
-          // Dispatch methods turn every handler failure into a response, so what reaches this point is a
-          // transport failure while answering. The connection is unusable; close it.
-          await CloseAsync(ex);
-        }
-        catch
-        {
-          // The connection is closing; there is nobody left to answer.
-        }
-        finally
-        {
-          frame.ReleasePayload();
-        }
-      }
-    }
-    catch (Exception ex) when (ex is not OperationCanceledException)
-    {
-      await CloseAsync(ex);
-    }
-  }
-
   async Task HeartbeatLoopAsync()
   {
     try
@@ -200,7 +157,7 @@ public sealed partial class SocketPeer
       {
         await Task.Delay(Options.HeartbeatInterval, Lifetime.Token);
         PruneExpiredIdempotentRequests();
-        var idle = DateTimeOffset.UtcNow - new DateTimeOffset(Interlocked.Read(ref LastReceivedTicks), TimeSpan.Zero);
+        var idle = TimeSpan.FromMilliseconds(Environment.TickCount64 - Volatile.Read(ref LastReceivedTicks));
         if (idle > Options.IdleTimeout)
           throw new SocketProtocolException(SocketProtocolError.Timeout, "Socket peer idle timeout elapsed.");
 

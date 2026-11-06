@@ -119,10 +119,10 @@ public sealed partial class SocketPeer
       Source.TrySetCanceled();
     }
 
-    public void ReleaseInFlight(SemaphoreSlim inFlightRequests)
+    public void ReleaseInFlight(SocketPeer peer)
     {
       if (Interlocked.Exchange(ref Released, 1) == 0)
-        inFlightRequests.Release();
+        peer.ReleaseInFlight();
     }
   }
 

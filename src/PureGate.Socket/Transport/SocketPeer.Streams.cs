@@ -22,7 +22,7 @@ public sealed partial class SocketPeer
         frame.ErrorCode ?? SocketProtocolError.HandlerFailed,
         frame.ErrorMessage ?? string.Empty));
     pending.Stream.Complete();
-    pending.ReleaseInFlight(InFlightRequests);
+    pending.ReleaseInFlight(this);
   }
 
   async ValueTask DispatchStreamItemAsync(SocketFrame frame)
@@ -59,7 +59,7 @@ public sealed partial class SocketPeer
       pending.Stream.Complete(exception);
     }
 
-    pending.ReleaseInFlight(InFlightRequests);
+    pending.ReleaseInFlight(this);
   }
 
   async ValueTask DispatchStreamRequestAsync(SocketFrame frame)

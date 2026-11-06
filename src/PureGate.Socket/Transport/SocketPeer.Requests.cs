@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using PureGate.Socket.Framing;
 using PureGate.Socket.Protocol;
 
@@ -11,6 +12,7 @@ public sealed partial class SocketPeer
   //   handler_failed response and is reported to the observer. It never escapes into the worker loop.
   // - Once the connection is closing, nothing is sent and nothing is reported.
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask DispatchRequestAsync(SocketFrame frame)
   {
     SocketResponse response;
@@ -67,6 +69,7 @@ public sealed partial class SocketPeer
     }
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask DispatchFastRequestAsync(SocketFrame frame)
   {
     SocketResponse response;
@@ -149,6 +152,7 @@ public sealed partial class SocketPeer
         Options.IncludeExceptionDetails ? exception.Message : "The remote handler failed.");
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   async ValueTask<SocketResponse> HandleFastRequestAsync(
       SocketFastRequest request,
       CancellationToken cancellationToken)
@@ -225,6 +229,7 @@ public sealed partial class SocketPeer
     }
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
   async ValueTask DispatchEventAsync(SocketFrame frame)
   {
     try
@@ -293,6 +298,7 @@ public sealed partial class SocketPeer
     };
   }
 
+  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
   async ValueTask<SocketResponse> HandleRequestAsync(
       SocketRequest request,
       CancellationToken cancellationToken)

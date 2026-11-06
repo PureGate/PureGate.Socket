@@ -13,8 +13,7 @@ Phases 0 (safety net) and 1 (local bug fixes) are done.
 ## Phase 2 — Rework the connection core (biggest speed and correctness lever)
 
 1. **A single writer loop.**
-   - Everything sent goes into one queue. One writer task encodes frames straight into the pipe and flushes only when the queue is empty. Today there is one system call per frame, so batching flushes this way is the main throughput gain.
-   - This also removes the contended write lock.
+   - Everything sent goes into one queue and one writer task encodes it into the pipe. Flushes are already coalesced under the write lock, so the remaining gains are no lock contention and the priority lanes below.
 2. **Priority lanes in that queue.** Control frames (pong, cancel, close, credits) go first, then responses, then requests and events, then stream data and chunks. Large messages are interleaved chunk by chunk, so they no longer block everything else.
 3. **The read loop never waits on the socket or on a consumer.** It only decodes, dispatches and queues. This removes the deadlock when two peers flood each other and each waits to write.
 4. **Credit-based flow control**, like HTTP/2's window updates, per stream and per connection.
@@ -26,7 +25,7 @@ Phases 0 (safety net) and 1 (local bug fixes) are done.
 8. **Fewer thread hops.** An opt-in way to run a short handler directly on the read loop, and a configurable way to complete client requests without an extra hop.
 9. **A raw socket transport.** When there's no TLS, read and write the socket directly (the approach Kestrel uses) instead of going through `NetworkStream`. Keep the stream path for TLS. Adopt this only if the benchmark proves the gain.
 10. **On-demand liveness check.** When a request times out, send a ping with a short deadline. If no pong arrives, close the connection, so `SocketClient` retries on a fresh one instead of a half-open link.
-11. **Benchmark: pipelined scenario and repeated runs.** Add a scenario with many requests in flight per connection, and run each scenario several times, reporting the median and spread.
+11. **Benchmark: repeated runs.** Run each scenario several times and report the median and spread.
 
 **Done when:** the tests currently ignored for Phase 2 pass, CI's 20× repeated runs are clean, and the benchmark shows clear wins on concurrent load.
 

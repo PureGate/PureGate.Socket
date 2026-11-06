@@ -30,16 +30,15 @@ public sealed partial class SocketPeer : IAsyncDisposable
   readonly ConcurrentDictionary<ChunkKey, IncomingChunkedFrame> IncomingChunks = new();
   readonly ConcurrentQueue<PendingRequest> PendingRequestPool = new();
   readonly ConcurrentQueue<CancellationTokenSource> RequestCancellationPool = new();
-  readonly SemaphoreSlim InFlightRequests;
-  readonly Channel<SocketFrame> HandlerQueue;
   readonly TaskCompletionSource Closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
   readonly Task ReadTask;
   readonly Task HeartbeatTask;
   readonly Task ConnectedTask;
-  readonly Task[] HandlerTasks;
 
   long NextMessageId;
-  long LastReceivedTicks = DateTimeOffset.UtcNow.UtcTicks;
+  // Environment.TickCount64 (milliseconds) of the last frame received; cheaper to read than the wall clock.
+  long LastReceivedTicks = Environment.TickCount64;
+  int InFlightCount;
   int ClosedFlag;
 
   // reader must be the reader that ran the handshake. A frame reader buffers ahead, so it may already hold
@@ -65,21 +64,29 @@ public sealed partial class SocketPeer : IAsyncDisposable
         Options.MaxFrameSizeBytes,
         Options.PayloadCompression,
         Options.CompressionMinPayloadBytes);
-    InFlightRequests = new SemaphoreSlim(Options.MaxInFlightRequests, Options.MaxInFlightRequests);
-    HandlerQueue = Channel.CreateBounded<SocketFrame>(new BoundedChannelOptions(Options.MaxQueuedHandlers)
-    {
-      FullMode = BoundedChannelFullMode.Wait,
-      SingleReader = false,
-      SingleWriter = true
-    });
     State = SocketPeerState.Connected;
     ConnectedTask = Task.Run(NotifyConnectedAsync);
     ReadTask = Task.Run(ReadLoopAsync);
     HeartbeatTask = Task.Run(HeartbeatLoopAsync);
-    HandlerTasks = Enumerable
-        .Range(0, Options.MaxConcurrentHandlers)
-        .Select(_ => Task.Run(HandlerLoopAsync))
-        .ToArray();
+  }
+
+  // The in-flight limit is only ever checked without waiting, so a counter replaces the semaphore (which
+  // took a lock on every request).
+  bool TryAcquireInFlight()
+  {
+    while (true)
+    {
+      var current = Volatile.Read(ref InFlightCount);
+      if (current >= Options.MaxInFlightRequests)
+        return false;
+      if (Interlocked.CompareExchange(ref InFlightCount, current + 1, current) == current)
+        return true;
+    }
+  }
+
+  void ReleaseInFlight()
+  {
+    Interlocked.Decrement(ref InFlightCount);
   }
 
   public string LocalNodeId { get; }
