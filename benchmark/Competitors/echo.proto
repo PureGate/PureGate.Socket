@@ -1,0 +1,4 @@
+syntax = "proto3";
+option csharp_namespace = "Bench.Grpc";
+message Blob { bytes data = 1; }
+service Echo { rpc Echo (Blob) returns (Blob); }

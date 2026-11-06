@@ -12,19 +12,72 @@ PureGate.Socket gives two processes one connection that both of them can use: ei
 dotnet add package PureGate.Socket
 ```
 
-Requires .NET 10.
+## Features
 
-## Why use it
+Everything two .NET services need to talk over one long-lived connection, in a single package with no dependencies.
 
-Raw sockets give you a byte stream. Everything a real service needs on top of that is the hard part, and it's what this library does:
+**Messaging**
+- Request/response, typed or raw bytes
+- Fire-and-forget events, handled in order per connection
+- Pull-based binary streams of any size
+- Batches: many requests or events in one round trip
+- Both ends are peers: a server calls its clients as easily as they call it
+- Large messages chunked automatically, with optional Brotli compression
 
-- **Calls, events and streams on one connection.** Typed request/response, fire-and-forget events, batches and pull-based binary streams, all multiplexed. Both ends are peers, so a server can call its clients as easily as they call it.
-- **Backpressure that can't deadlock.** Senders wait when the receiver's queue is full instead of overrunning it. Each stream has its own window that grows to fit the link, so a slow reader holds back only its own stream. Two peers flooding each other keep making progress.
-- **Bounded memory.** Each connection has a memory budget covering everything it holds for the remote. A message that doesn't fit is refused cleanly instead of buffered until the process runs out of memory, and compressed payloads can't expand past their limits.
-- **Failure handling built in.** Timeouts that travel with the request, cancellation that reaches the remote handler, half-open connection detection, a reconnecting client, and retries with an idempotency cache so a retried call never runs twice.
-- **Security.** Mutual HMAC authentication with a secret per node pair, TLS and mutual TLS with node IDs bound to certificates, per-message authorization, and limits that hold before a peer has authenticated.
-- **Production visibility.** Metrics through `System.Diagnostics.Metrics`, ready for OpenTelemetry: request latency, connections, bytes, queues, memory and flow control.
-- **Cheap on the wire and in memory.** After a method's first use, a request costs a few header bytes. Typed messages are serialized straight into pooled buffers.
+**Under load**
+- Credit-based flow control: a busy receiver slows its senders instead of being overrun
+- A window per stream that grows to fit the link, so a slow reader holds back only its own stream
+- A memory budget per connection: a message that doesn't fit is refused, not buffered
+- Bounded handler concurrency and queues
+
+**When things fail**
+- Deadlines travel with the request, and cancelling a call cancels the remote handler
+- Half-open connections detected in seconds
+- A client that reconnects on its own, by address or host name
+- Idempotent retries that the server runs once
+
+**Security**
+- Mutual HMAC authentication with a secret per pair of nodes
+- TLS and mutual TLS, with node IDs bound to certificates
+- Authorization per request, stream and event
+- Limits on handshakes and connections before a peer authenticates
+
+**Operations**
+- OpenTelemetry-ready metrics and observer hooks
+- A peer registry to reach a node by ID or broadcast to all
+- Pluggable serialization: JSON (source-generated for AOT), raw bytes, or your own codec
+- Fuzz, chaos and soak tested, with a public API that changes only on purpose
+
+**Speed**
+- 77% of a bare socket's call rate, and over half a million calls a second on one shared connection
+- Faster than gRPC, SignalR and StreamJsonRpc in every column of the [benchmark](#performance), with the fewest allocations
+
+**Compared with the alternatives**
+
+|                                | PureGate.Socket        | gRPC                               | SignalR                  | StreamJsonRpc                |
+|--------------------------------|------------------------|------------------------------------|--------------------------|------------------------------|
+| Either side can call the other | ✓                      | Through streams only               | ✓                        | ✓                            |
+| Hosting                        | Any process, plain TCP | ASP.NET Core, HTTP/2               | ASP.NET Core, WebSockets | Any stream                   |
+| Contract                       | Plain C# types         | `.proto` files and code generation | Hub methods              | Interfaces or method names   |
+| Runtime dependencies           | None                   | gRPC, Protobuf, ASP.NET Core       | ASP.NET Core             | Several packages             |
+
+## Performance
+
+Echoing a 1 KB payload with libraries' recommended fast setup:
+
+| Library                     | Sequential calls/s |       p50 |       p99 | 64 callers calls/s | Alloc per call |
+|-----------------------------|-------------------:|----------:|----------:|-------------------:|---------------:|
+| Raw socket (ceiling)        |             47,558 |     20 µs |     36 µs |                n/a |          128 B |
+| **PureGate.Socket**         |         **36,668** | **26 µs** | **39 µs** |        **548,710** |    **3,253 B** |
+| gRPC (HTTP/2)               |              6,063 |    161 µs |    236 µs |            120,166 |       10,345 B |
+| SignalR (MessagePack)       |             24,335 |     37 µs |     65 µs |            329,210 |        4,422 B |
+| StreamJsonRpc (MessagePack) |             27,067 |     32 µs |     50 µs |            279,519 |        5,162 B |
+
+- **Lowest latency:** 77% of a bare socket's call rate, with the best p50 and p99 of the four libraries. That's 1.35× StreamJsonRpc, 1.5× SignalR and 6× gRPC.
+- **Highest throughput on one connection:** with 64 callers sharing a single connection, 1.7× SignalR, 2× StreamJsonRpc and 4.6× gRPC.
+- **Least memory:** the fewest bytes allocated per call, counting both client and server.
+
+Measured on Windows, 20 cores, .NET 10, over loopback with client and server in one process. "Sequential" makes one call at a time; "64 callers" share one connection. Numbers vary by machine; the [benchmark](https://github.com/PureGate/PureGate.Socket/tree/main/benchmark/Competitors) and its methodology are in the repository, so you can run it yourself.
 
 ## Quick start
 
@@ -202,6 +255,7 @@ Every limit is an option on `SocketFabricOptions`.
 
 - [Library guide](https://github.com/PureGate/PureGate.Socket/blob/main/src/PureGate.Socket/README.md): flow control, the memory budget, serialization and the full list of metrics.
 - [Wire protocol](https://github.com/PureGate/PureGate.Socket/blob/main/docs/PROTOCOL.md): the frame format, the handshake, and flow control on the wire.
+- [Competitor benchmark](https://github.com/PureGate/PureGate.Socket/tree/main/benchmark/Competitors): PureGate.Socket against gRPC, SignalR and StreamJsonRpc, with results.
 - [Roadmap](https://github.com/PureGate/PureGate.Socket/blob/main/docs/ROADMAP.md) and [releasing](https://github.com/PureGate/PureGate.Socket/blob/main/docs/RELEASING.md).
 - The [tests](https://github.com/PureGate/PureGate.Socket/tree/main/src/PureGate.Socket.Test) are working examples of every feature.
 

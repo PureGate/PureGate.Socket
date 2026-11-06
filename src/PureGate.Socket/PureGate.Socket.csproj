@@ -13,7 +13,7 @@
   <!-- Package. The Publish Nuget Package workflow publishes VersionPrefix. Source Link comes with the SDK, so the symbols map back to this repository. -->
   <PropertyGroup>
     <PackageId>PureGate.Socket</PackageId>
-    <VersionPrefix>1.0.1</VersionPrefix>
+    <VersionPrefix>1.0.2</VersionPrefix>
     <Authors>Ahmed Yasin Koculu</Authors>
     <Copyright>Copyright (c) 2026 Ahmed Yasin Koculu</Copyright>
     <Description>A dependency-free TCP messaging fabric for .NET: multiplexed request/response, events, batches and pull streams over framed TCP, with credit-based flow control, per-connection memory budgets, HMAC and TLS authentication, and System.Diagnostics.Metrics.</Description>
