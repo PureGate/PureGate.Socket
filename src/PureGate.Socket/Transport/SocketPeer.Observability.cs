@@ -60,6 +60,17 @@ public sealed partial class SocketPeer
     }
   }
 
+  void ObserveHandlerFailed(string service, string operation, Exception exception)
+  {
+    try
+    {
+      Options.Observer.HandlerFailed(this, service, operation, exception);
+    }
+    catch
+    {
+    }
+  }
+
   void ObserveRequestCompleted(SocketFrame frame, SocketResponse response)
   {
     try

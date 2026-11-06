@@ -85,8 +85,9 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
           client.GetStream(),
           Options.NodeId,
           timeout.Token);
-      var remoteNodeId = await RunServerHandshakeAsync(stream, timeout.Token);
-      var peer = new SocketPeer(client, stream, Options.NodeId, remoteNodeId, Options, handler);
+      var reader = SocketPeer.CreateReader(stream, Options);
+      var remoteNodeId = await RunServerHandshakeAsync(stream, reader, timeout.Token);
+      var peer = new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, Options, handler);
       lock (Sync)
         Peers.Add(peer);
       _ = Task.Run(async () =>
@@ -135,9 +136,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     }
   }
 
-  async ValueTask<string> RunServerHandshakeAsync(Stream stream, CancellationToken cancellationToken)
+  async ValueTask<string> RunServerHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
   {
-    var reader = new SocketFrameReader(stream, Options.MaxFrameSizeBytes);
     var writer = new SocketFrameWriter(
         stream,
         Options.MaxFrameSizeBytes);

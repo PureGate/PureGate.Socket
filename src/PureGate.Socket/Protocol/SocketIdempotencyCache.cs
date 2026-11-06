@@ -23,6 +23,12 @@ sealed class SocketIdempotencyCache
     Entries.TryRemove(key, out _);
   }
 
+  // Removes the key only while it still maps to this entry, so a newer attempt is never evicted.
+  public void Remove(SocketIdempotencyKey key, SocketIdempotencyEntry entry)
+  {
+    Entries.TryRemove(new KeyValuePair<SocketIdempotencyKey, SocketIdempotencyEntry>(key, entry));
+  }
+
   public bool Contains(SocketIdempotencyKey key)
   {
     return Entries.ContainsKey(key);
@@ -70,8 +76,8 @@ sealed class SocketIdempotencyEntry
     Source.TrySetResult(response);
   }
 
-  public void TrySetException(Exception exception)
+  public void TrySetCanceled()
   {
-    Source.TrySetException(exception);
+    Source.TrySetCanceled();
   }
 }

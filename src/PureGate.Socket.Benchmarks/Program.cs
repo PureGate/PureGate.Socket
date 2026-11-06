@@ -10,15 +10,30 @@ const int DefaultIterations = 5_000;
 const int RequestBatchSize = 64;
 const int FastEchoOperation = 1;
 
-var iterations = GetIntArg(args, "--iterations", DefaultIterations);
-var streamBytes = GetIntArg(args, "--stream-bytes", 32 * 1024 * 1024);
+var quick = args.Contains("--quick");
+var iterations = GetIntArg(args, "--iterations", quick ? 500 : DefaultIterations);
+var streamBytes = GetIntArg(args, "--stream-bytes", quick ? 4 * 1024 * 1024 : 32 * 1024 * 1024);
 var concurrentClients = GetIntArg(args, "--clients", Environment.ProcessorCount);
+var suite = GetStringArg(args, "--suite", "all");
+var jsonPath = GetStringArg(args, "--json", null);
 
 Console.WriteLine("PureGate.Socket benchmarks");
 Console.WriteLine($"Runtime: {Environment.Version}");
 Console.WriteLine($"Configuration: {(IsReleaseBuild() ? "Release" : "Debug")}");
+Console.WriteLine($"Suite: {suite}{(quick ? " (quick)" : string.Empty)}");
 Console.WriteLine($"Iterations: {iterations:N0}");
 Console.WriteLine();
+
+if (suite is "all" or "matrix")
+{
+  var matrix = await MatrixBenchmarks.RunAsync(quick);
+  Console.WriteLine();
+  if (jsonPath is not null)
+    MatrixBenchmarks.WriteJson(jsonPath, matrix);
+}
+
+if (suite is not ("all" or "classic"))
+  return;
 
 Console.WriteLine("Whole scenario");
 await RunAsync("frame roundtrip", iterations, () => FrameRoundtripAsync(iterations));
@@ -408,6 +423,12 @@ static int GetIntArg(string[] args, string name, int defaultValue)
   return int.TryParse(args[index + 1], out var value) && value > 0
       ? value
       : defaultValue;
+}
+
+static string GetStringArg(string[] args, string name, string defaultValue)
+{
+  var index = Array.IndexOf(args, name);
+  return index < 0 || index + 1 >= args.Length ? defaultValue : args[index + 1];
 }
 
 static bool IsReleaseBuild()

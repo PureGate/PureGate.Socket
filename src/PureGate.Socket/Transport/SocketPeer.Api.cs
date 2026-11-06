@@ -95,13 +95,13 @@ public sealed partial class SocketPeer
       return new SocketRequestResult
       {
         Succeeded = false,
-        ErrorCode = SocketProtocolError.ProtocolError,
+        ErrorCode = SocketProtocolError.Overloaded,
         ErrorMessage = "Too many in-flight requests."
       };
     }
 
     var messageId = Interlocked.Increment(ref NextMessageId);
-    var pending = RentPendingRequest();
+    var pending = RentPendingRequest(messageId);
     var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
     var requestTimeout = RentRequestCancellation();
     requestTimeout.CancelAfter(effectiveTimeout);
@@ -133,7 +133,7 @@ public sealed partial class SocketPeer
 
       var result = await pending.Task;
       if (result.ErrorCode is SocketProtocolError.Timeout or SocketProtocolError.Cancelled)
-        await SendCancelAsync(messageId);
+        SendCancelInBackground(messageId);
 
       return result;
     }
@@ -152,12 +152,12 @@ public sealed partial class SocketPeer
             ErrorCode = SocketProtocolError.Timeout,
             ErrorMessage = "Request timed out."
           };
-      await SendCancelAsync(messageId);
+      SendCancelInBackground(messageId);
       return result;
     }
     catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
-      await SendCancelAsync(messageId);
+      SendCancelInBackground(messageId);
       return new SocketRequestResult
       {
         Succeeded = false,
@@ -209,12 +209,12 @@ public sealed partial class SocketPeer
   {
     ThrowIfClosed();
     if (!InFlightRequests.Wait(0))
-      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Too many in-flight requests.");
+      throw new SocketProtocolException(SocketProtocolError.Overloaded, "Too many in-flight requests.");
 
     var messageId = Interlocked.Increment(ref NextMessageId);
     var stream = new SocketPullStream(
         Options.MaxStreamBufferChunks,
-        () => _ = SendCancelAsync(messageId).AsTask());
+        () => SendCancelInBackground(messageId));
     var pending = new PendingStream(stream);
     var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
     using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Lifetime.Token);
@@ -250,7 +250,7 @@ public sealed partial class SocketPeer
       if (!registered)
         pending.ReleaseInFlight(InFlightRequests);
       stream.Complete();
-      await SendCancelAsync(messageId);
+      SendCancelInBackground(messageId);
       throw new SocketProtocolException(SocketProtocolError.Cancelled, "Stream request was cancelled.");
     }
     catch (OperationCanceledException)
@@ -260,7 +260,7 @@ public sealed partial class SocketPeer
       if (!registered)
         pending.ReleaseInFlight(InFlightRequests);
       stream.Complete();
-      await SendCancelAsync(messageId);
+      SendCancelInBackground(messageId);
       throw new SocketProtocolException(SocketProtocolError.Timeout, "Stream request timed out.");
     }
     catch
@@ -351,17 +351,23 @@ public sealed partial class SocketPeer
     return SocketBatchCodec.DeserializeResults(result.Payload.Span);
   }
 
+  static readonly TimeSpan CloseFrameTimeout = TimeSpan.FromSeconds(2);
+
   public async ValueTask CloseGracefullyAsync(CancellationToken cancellationToken = default)
   {
     if (State != SocketPeerState.Closed && !Lifetime.IsCancellationRequested)
     {
       try
       {
+        // The close frame is a courtesy. If the write side is blocked (for example a peer that stopped
+        // reading), give up after a short wait; closing the socket below unblocks every pending writer.
+        using var closeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        closeTimeout.CancelAfter(CloseFrameTimeout);
         await WriteFrameAsync(new SocketFrame
         {
           Version = Options.ProtocolVersion,
           Kind = SocketMessageKind.Close
-        }, cancellationToken);
+        }, closeTimeout.Token);
       }
       catch
       {

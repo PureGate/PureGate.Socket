@@ -92,15 +92,19 @@ public sealed class SocketClient : IAsyncDisposable
     var idempotencyKey = retry.Idempotent
         ? string.IsNullOrEmpty(retry.IdempotencyKey) ? Guid.NewGuid().ToString("N") : retry.IdempotencyKey
         : string.Empty;
+    var serialized = Options.Codec.Serialize(payload);
     for (var attempt = 1; ; attempt++)
     {
+      // The connection is shared by every caller of this client, so a retry never closes it. A timeout
+      // retries on the same connection; a dead connection is replaced by GetPeerAsync on the next attempt.
+      SocketPeer peer = null;
       try
       {
-        var peer = await GetPeerAsync(cancellationToken);
+        peer = await GetPeerAsync(cancellationToken);
         var result = await peer.RequestAsync(
             service,
             operation,
-            peer.Codec.Serialize(payload),
+            serialized,
             TimeSpan.Zero,
             idempotencyKey,
             cancellationToken);
@@ -112,15 +116,38 @@ public sealed class SocketClient : IAsyncDisposable
       }
       catch (IOException) when (ShouldRetry(retry, attempt))
       {
+        await InvalidatePeerAsync(peer);
       }
       catch (SocketException) when (ShouldRetry(retry, attempt))
       {
+        await InvalidatePeerAsync(peer);
       }
 
-      await CloseAsync();
       if (retry.RetryDelay > TimeSpan.Zero)
         await Task.Delay(retry.RetryDelay, cancellationToken);
     }
+  }
+
+  // Drops a peer whose transport failed, but only if it is still the current one: another caller may
+  // already have replaced it.
+  async ValueTask InvalidatePeerAsync(SocketPeer peer)
+  {
+    if (peer is null)
+      return;
+
+    await ConnectLock.WaitAsync();
+    try
+    {
+      if (!ReferenceEquals(Peer, peer))
+        return;
+      Peer = null;
+    }
+    finally
+    {
+      ConnectLock.Release();
+    }
+
+    await peer.DisposeAsync();
   }
 
   public async ValueTask<TResponse> RequestAsync<TRequest, TResponse>(
@@ -148,8 +175,7 @@ public sealed class SocketClient : IAsyncDisposable
     if (!result.Succeeded)
       throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
 
-    var peer = await GetPeerAsync(cancellationToken);
-    return result.ReadPayload<TResponse>(peer.Codec);
+    return result.ReadPayload<TResponse>(Options.Codec);
   }
 
   public async ValueTask<SocketRequestResult> RequestFastAsync(
@@ -394,7 +420,9 @@ public sealed class SocketClient : IAsyncDisposable
 
   static bool IsRetryable(string errorCode)
   {
-    return errorCode is SocketProtocolError.ConnectionClosed or SocketProtocolError.Timeout;
+    return errorCode is SocketProtocolError.ConnectionClosed
+        or SocketProtocolError.Timeout
+        or SocketProtocolError.Overloaded;
   }
 
   static bool ShouldRetry(SocketClientRequestOptions retry, int attempt)

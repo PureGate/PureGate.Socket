@@ -88,6 +88,12 @@ public sealed class CompositeSocketObserver : ISocketObserver
       Try(() => observer.RequestCompleted(peer, service, operation, succeeded, errorCode));
   }
 
+  public void HandlerFailed(SocketPeer peer, string service, string operation, Exception exception)
+  {
+    foreach (var observer in Observers)
+      Try(() => observer.HandlerFailed(peer, service, operation, exception));
+  }
+
   static void Try(Action action)
   {
     try

@@ -18,6 +18,11 @@ public sealed record SocketBatchResult(
 
 static class SocketBatchCodec
 {
+  // Smallest encoding of one entry: every length-prefixed field present but empty. A declared count larger
+  // than the remaining bytes allow is rejected before anything is allocated for it.
+  const int MinItemBytes = 4 + 4 + 4 + 4;
+  const int MinResultBytes = 4 + 1 + 4 + 4 + 4;
+
   public static byte[] SerializeItems(IReadOnlyList<SocketBatchItem> items)
   {
     using var output = new MemoryStream();
@@ -40,7 +45,7 @@ static class SocketBatchCodec
   {
     var offset = 0;
     var count = ReadInt32(payload, ref offset);
-    if (count < 0)
+    if (count < 0 || count > (payload.Length - offset) / MinItemBytes)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid batch item count.");
 
     var items = new SocketBatchItem[count];
@@ -80,7 +85,7 @@ static class SocketBatchCodec
   {
     var offset = 0;
     var count = ReadInt32(payload, ref offset);
-    if (count < 0)
+    if (count < 0 || count > (payload.Length - offset) / MinResultBytes)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid batch result count.");
 
     var results = new SocketBatchResult[count];

@@ -15,6 +15,7 @@ public sealed class SocketFabricOptions
   public int MaxDecompressedPayloadSizeBytes { get; init; } = 128 * 1024 * 1024;
   public int MaxChunkPayloadBytes { get; init; } = 256 * 1024;
   public int MaxChunkedMessages { get; init; } = 1024;
+  public long MaxChunkedBytesInProgress { get; init; } = 256L * 1024 * 1024;
   public int MaxInFlightRequests { get; init; } = 1024;
   public int MaxConcurrentHandlers { get; init; } = 16;
   public int MaxQueuedHandlers { get; init; } = 4096;
@@ -27,6 +28,18 @@ public sealed class SocketFabricOptions
   public TimeSpan IdempotencyTtl { get; init; } = TimeSpan.FromMinutes(10);
   public TimeSpan ChunkTimeout { get; init; } = TimeSpan.FromSeconds(30);
   public TimeSpan HandshakeTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+  // Longest gap allowed between two stream chunks once a stream has started. The open timeout only
+  // covers the time until the stream starts.
+  public TimeSpan StreamIdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
+
+  // When false (the default), handler exception messages are replaced with a generic message before
+  // they are sent to the remote peer. The full exception always reaches ISocketObserver.HandlerFailed.
+  public bool IncludeExceptionDetails { get; init; }
+
+  // Whether an event rejected by the authorizer closes the connection. Events have no response, so
+  // closing is the only signal the sender gets.
+  public bool CloseOnUnauthorizedEvent { get; init; } = true;
   public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(15);
   public TimeSpan IdleTimeout { get; init; } = TimeSpan.FromSeconds(45);
   public ISocketMessageCodec Codec { get; init; } = JsonSocketMessageCodec.Shared;
@@ -57,6 +70,7 @@ public sealed class SocketFabricOptions
       MaxDecompressedPayloadSizeBytes = Math.Clamp(MaxDecompressedPayloadSizeBytes, 1024, 1024 * 1024 * 1024),
       MaxChunkPayloadBytes = Math.Clamp(MaxChunkPayloadBytes, 1, Math.Max(1, MaxFrameSizeBytes / 4)),
       MaxChunkedMessages = Math.Clamp(MaxChunkedMessages, 1, 100_000),
+      MaxChunkedBytesInProgress = Math.Clamp(MaxChunkedBytesInProgress, 1024, 16L * 1024 * 1024 * 1024),
       MaxInFlightRequests = Math.Clamp(MaxInFlightRequests, 1, 100_000),
       MaxConcurrentHandlers = Math.Clamp(MaxConcurrentHandlers, 1, 1024),
       MaxQueuedHandlers = Math.Clamp(MaxQueuedHandlers, 1, 100_000),
@@ -69,6 +83,9 @@ public sealed class SocketFabricOptions
       IdempotencyTtl = IdempotencyTtl <= TimeSpan.Zero ? TimeSpan.FromMinutes(10) : IdempotencyTtl,
       ChunkTimeout = ChunkTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : ChunkTimeout,
       HandshakeTimeout = HandshakeTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(5) : HandshakeTimeout,
+      StreamIdleTimeout = StreamIdleTimeout <= TimeSpan.Zero ? TimeSpan.FromSeconds(30) : StreamIdleTimeout,
+      IncludeExceptionDetails = IncludeExceptionDetails,
+      CloseOnUnauthorizedEvent = CloseOnUnauthorizedEvent,
       HeartbeatInterval = heartbeatInterval,
       IdleTimeout = idleTimeout,
       Codec = Codec ?? JsonSocketMessageCodec.Shared,

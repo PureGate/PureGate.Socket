@@ -17,9 +17,9 @@ public sealed partial class SocketPeer
     foreach (var cancellation in ActiveRequestCancellations.Values)
       cancellation.Cancel();
     ActiveRequestCancellations.Clear();
-    foreach (var pending in PendingRequests.Values)
+    foreach (var (messageId, pending) in PendingRequests)
     {
-      pending.TrySetResult(new SocketRequestResult
+      pending.TrySetResult(messageId, new SocketRequestResult
       {
         Succeeded = false,
         ErrorCode = SocketProtocolError.ConnectionClosed,
@@ -69,9 +69,10 @@ public sealed partial class SocketPeer
     catch
     {
     }
-    Lifetime.Dispose();
-    WriteLock.Dispose();
-    InFlightRequests.Dispose();
+
+    // Lifetime, WriteLock and InFlightRequests are deliberately not disposed: callers that were in flight
+    // when the peer closed still touch them on their way out, and disposing them turned a clean
+    // connection_closed result into an ObjectDisposedException. None of them hold unmanaged resources.
     while (RequestCancellationPool.TryDequeue(out var cancellation))
       cancellation.Dispose();
   }

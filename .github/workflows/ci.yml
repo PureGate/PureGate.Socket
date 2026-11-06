@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build PureGate.Socket.slnx -c Release
+
+      - name: Test
+        run: dotnet test src/PureGate.Socket.Test -c Release --no-build --blame-hang-timeout 2m
+
+      # Races only show up across many runs, so run the suite repeatedly.
+      - name: Test (repeated x20)
+        shell: bash
+        run: |
+          for i in $(seq 1 20); do
+            echo "::group::run $i"
+            dotnet test src/PureGate.Socket.Test -c Release --no-build --blame-hang-timeout 2m || exit 1
+            echo "::endgroup::"
+          done
+
+      - name: Benchmark smoke run
+        run: dotnet run -c Release --no-build --project src/PureGate.Socket.Benchmarks -- --quick --json artifacts/bench-${{ matrix.os }}.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.os }}
+          path: artifacts/

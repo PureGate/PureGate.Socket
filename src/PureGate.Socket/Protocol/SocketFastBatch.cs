@@ -23,6 +23,10 @@ readonly record struct SocketFastBatchItemView(
 
 static class SocketFastBatchCodec
 {
+  // Smallest encoding of one entry; see SocketBatchCodec.
+  const int MinItemBytes = 4 + 4 + 4;
+  const int MinResultBytes = 4 + 1 + 4 + 4 + 4;
+
   public static byte[] SerializeItems(IReadOnlyList<SocketFastBatchItem> items)
   {
     using var output = new MemoryStream();
@@ -44,7 +48,7 @@ static class SocketFastBatchCodec
   {
     var offset = 0;
     var count = ReadInt32(payload, ref offset);
-    if (count < 0)
+    if (count < 0 || count > (payload.Length - offset) / MinItemBytes)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid fast batch item count.");
 
     var items = new SocketFastBatchItem[count];
@@ -64,7 +68,7 @@ static class SocketFastBatchCodec
   {
     offset = 0;
     var count = ReadInt32(payload.Span, ref offset);
-    if (count < 0)
+    if (count < 0 || count > (payload.Length - offset) / MinItemBytes)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid fast batch item count.");
 
     return count;
@@ -107,7 +111,7 @@ static class SocketFastBatchCodec
   {
     var offset = 0;
     var count = ReadInt32(payload, ref offset);
-    if (count < 0)
+    if (count < 0 || count > (payload.Length - offset) / MinResultBytes)
       throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Invalid fast batch result count.");
 
     var results = new SocketFastBatchResult[count];

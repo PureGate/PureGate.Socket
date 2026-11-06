@@ -10,6 +10,7 @@ sealed class SocketPullStream : Stream
   SocketStreamChunk Current;
   int Offset;
   int Completed;
+  int Disposed;
 
   public SocketPullStream(int maxBufferedChunks, Action onDispose)
   {
@@ -33,6 +34,11 @@ sealed class SocketPullStream : Stream
     set => throw new NotSupportedException();
   }
 
+  // Threading contract: the producer side (WriteChunkAsync, Complete) runs on the connection's read loop
+  // or close path; the consumer side (ReadAsync, Dispose) runs on the caller's thread. Only the consumer
+  // ever touches Current or reads from the channel. The producer side only writes to and completes the
+  // channel, so it can never release a buffer the consumer is still copying from.
+
   public async ValueTask WriteChunkAsync(
       SocketPayload payload,
       CancellationToken cancellationToken)
@@ -41,6 +47,12 @@ sealed class SocketPullStream : Stream
     try
     {
       await Chunks.Writer.WriteAsync(chunk, cancellationToken);
+    }
+    catch (ChannelClosedException)
+    {
+      // The consumer disposed the stream; chunks still in flight before the producer sees the cancel
+      // are dropped. This must not fault the read loop, which would close the whole connection.
+      chunk.Dispose();
     }
     catch
     {
@@ -51,15 +63,14 @@ sealed class SocketPullStream : Stream
 
   public void Complete()
   {
-    Interlocked.Exchange(ref Completed, 1);
+    Volatile.Write(ref Completed, 1);
     Chunks.Writer.TryComplete();
   }
 
+  // Data already buffered is still delivered; the consumer sees the exception after the last chunk.
   public void Complete(Exception exception)
   {
-    Interlocked.Exchange(ref Completed, 1);
-    Current.Dispose();
-    DrainChunks();
+    Volatile.Write(ref Completed, 1);
     Chunks.Writer.TryComplete(exception);
   }
 
@@ -76,6 +87,7 @@ sealed class SocketPullStream : Stream
     while (Offset >= Current.Length)
     {
       Current.Dispose();
+      Current = default;
       if (!await Chunks.Reader.WaitToReadAsync(cancellationToken))
         return 0;
 
@@ -93,12 +105,16 @@ sealed class SocketPullStream : Stream
 
   protected override void Dispose(bool disposing)
   {
-    if (disposing && Interlocked.Exchange(ref Completed, 1) == 0)
+    if (disposing && Interlocked.Exchange(ref Disposed, 1) == 0)
     {
+      // Only tell the producer to stop if it has not already finished.
+      var notifyProducer = Interlocked.Exchange(ref Completed, 1) == 0;
       Chunks.Writer.TryComplete();
       Current.Dispose();
+      Current = default;
       DrainChunks();
-      OnDispose?.Invoke();
+      if (notifyProducer)
+        OnDispose?.Invoke();
     }
 
     base.Dispose(disposing);

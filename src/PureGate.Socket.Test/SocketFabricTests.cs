@@ -15,7 +15,7 @@ using PureGate.Socket.Transport;
 
 namespace PureGate.Socket.Test;
 
-public sealed class SocketFabricTests
+public sealed partial class SocketFabricTests
 {
   [Test]
   public async Task RequestAsync_ReturnsResponse()

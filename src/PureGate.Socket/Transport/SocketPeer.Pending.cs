@@ -5,10 +5,14 @@ namespace PureGate.Socket.Transport;
 
 public sealed partial class SocketPeer
 {
+  // Pooled, so one instance serves many requests over its life. A completer (the read loop, the close
+  // path) can hold a reference across the moment the instance is returned and re-rented. To make a stale
+  // completion impossible, the instance is armed with its request's message ID and completion atomically
+  // swaps that exact ID for 0. A completer holding an old ID loses the swap and does nothing.
   sealed class PendingRequest : IValueTaskSource<SocketRequestResult>
   {
     ManualResetValueTaskSourceCore<SocketRequestResult> Source;
-    int Completed;
+    long ArmedMessageId;
 
     public PendingRequest()
     {
@@ -17,21 +21,28 @@ public sealed partial class SocketPeer
 
     public ValueTask<SocketRequestResult> Task => new(this, Source.Version);
 
-    public void Reset()
+    public void Arm(long messageId)
     {
-      Completed = 0;
       Source.Reset();
+      Volatile.Write(ref ArmedMessageId, messageId);
     }
 
-    public void TrySetResult(SocketRequestResult result)
+    public void TrySetResult(long messageId, SocketRequestResult result)
     {
-      if (Interlocked.CompareExchange(ref Completed, 1, 0) == 0)
+      if (messageId != 0 && Interlocked.CompareExchange(ref ArmedMessageId, 0, messageId) == messageId)
         Source.SetResult(result);
+    }
+
+    // Used only by the timeout and cancellation callbacks, whose registrations are disposed before the
+    // instance goes back to the pool, so the currently armed ID is always theirs.
+    void TrySetCurrentResult(SocketRequestResult result)
+    {
+      TrySetResult(Volatile.Read(ref ArmedMessageId), result);
     }
 
     public void TrySetTimeout()
     {
-      TrySetResult(new SocketRequestResult
+      TrySetCurrentResult(new SocketRequestResult
       {
         Succeeded = false,
         ErrorCode = SocketProtocolError.Timeout,
@@ -41,7 +52,7 @@ public sealed partial class SocketPeer
 
     public void TrySetCancelled()
     {
-      TrySetResult(new SocketRequestResult
+      TrySetCurrentResult(new SocketRequestResult
       {
         Succeeded = false,
         ErrorCode = SocketProtocolError.Cancelled,
@@ -107,11 +118,11 @@ public sealed partial class SocketPeer
     }
   }
 
-  PendingRequest RentPendingRequest()
+  PendingRequest RentPendingRequest(long messageId)
   {
     if (!PendingRequestPool.TryDequeue(out var pending))
       pending = new PendingRequest();
-    pending.Reset();
+    pending.Arm(messageId);
     return pending;
   }
 

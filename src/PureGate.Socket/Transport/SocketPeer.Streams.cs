@@ -65,100 +65,129 @@ public sealed partial class SocketPeer
   async ValueTask DispatchStreamRequestAsync(SocketFrame frame)
   {
     SocketResponse observedResponse = null;
-    var requestTimeout = RentRequestCancellation();
+    Stream source = null;
+    var started = false;
+    var requestTimeout = new CancellationTokenSource();
     if (frame.DeadlineMs > 0)
       requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(frame.DeadlineMs));
 
     ActiveRequestCancellations[frame.MessageId] = requestTimeout;
     try
     {
-      ObserveRequestStarted(frame);
-      var streamRequest = new SocketStreamRequest(
-          frame.MessageId,
-          frame.Service,
-          frame.Operation,
-          frame.PayloadMemory);
-      var authorization = await Options.Authorizer.AuthorizeStreamAsync(this, streamRequest, requestTimeout.Token);
-      if (!authorization.Succeeded)
+      try
       {
-        observedResponse = SocketResponse.Failed(SocketProtocolError.Unauthorized, authorization.Error);
-        await WriteStreamStartFailedAsync(frame.MessageId, SocketProtocolError.Unauthorized, authorization.Error, requestTimeout.Token);
-        return;
-      }
-
-      var response = await Handler.HandleStreamAsync(this, streamRequest, requestTimeout.Token)
-          ?? SocketStreamResponse.Failed(SocketProtocolError.UnsupportedOperation, "Stream request was not handled.");
-
-      if (!response.Succeeded)
-      {
-        observedResponse = SocketResponse.Failed(response.ErrorCode, response.ErrorMessage);
-        await WriteStreamStartFailedAsync(
+        ObserveRequestStarted(frame);
+        var streamRequest = new SocketStreamRequest(
             frame.MessageId,
-            response.ErrorCode,
-            response.ErrorMessage,
-            requestTimeout.Token);
-        return;
+            frame.Service,
+            frame.Operation,
+            frame.PayloadMemory);
+        var authorization = await Options.Authorizer.AuthorizeStreamAsync(this, streamRequest, requestTimeout.Token);
+        if (!authorization.Succeeded)
+        {
+          observedResponse = SocketResponse.Failed(SocketProtocolError.Unauthorized, authorization.Error);
+          await WriteStreamStartFailedAsync(frame.MessageId, SocketProtocolError.Unauthorized, authorization.Error, requestTimeout.Token);
+          return;
+        }
+
+        var response = await Handler.HandleStreamAsync(this, streamRequest, requestTimeout.Token)
+            ?? SocketStreamResponse.Failed(SocketProtocolError.UnsupportedOperation, "Stream request was not handled.");
+        source = response.Stream;
+
+        if (!response.Succeeded)
+        {
+          observedResponse = SocketResponse.Failed(response.ErrorCode, response.ErrorMessage);
+          await WriteStreamStartFailedAsync(
+              frame.MessageId,
+              response.ErrorCode,
+              response.ErrorMessage,
+              requestTimeout.Token);
+          return;
+        }
+
+        await WriteFrameAsync(new SocketFrame
+        {
+          Version = Options.ProtocolVersion,
+          MessageId = frame.MessageId,
+          Kind = SocketMessageKind.StreamStart,
+          Ok = true
+        }, requestTimeout.Token);
+
+        // The caller's deadline covered opening the stream. From here on the stream may run as long as it
+        // keeps making progress: the idle timer is re-armed after every chunk.
+        started = true;
+        requestTimeout.CancelAfter(Options.StreamIdleTimeout);
+        await WriteStreamItemsAsync(frame.MessageId, source ?? Stream.Null, requestTimeout);
+        observedResponse = SocketResponse.Success();
       }
-
-      await WriteFrameAsync(new SocketFrame
+      catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
       {
-        Version = Options.ProtocolVersion,
-        MessageId = frame.MessageId,
-        Kind = SocketMessageKind.StreamStart,
-        Ok = true
-      }, requestTimeout.Token);
-
-      await WriteStreamItemsAsync(frame.MessageId, response.Stream ?? Stream.Null, requestTimeout.Token);
-      observedResponse = SocketResponse.Success();
-    }
-    catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
-    {
-      observedResponse = SocketResponse.Failed(
-          frame.DeadlineMs > 0 ? SocketProtocolError.Timeout : SocketProtocolError.Cancelled,
-          frame.DeadlineMs > 0 ? "Stream deadline elapsed." : "Stream was cancelled.");
-      await WriteStreamEndFailedAsync(
-          frame.MessageId,
-          observedResponse.ErrorCode,
-          observedResponse.ErrorMessage);
-    }
-    catch (Exception ex) when (ex is not OperationCanceledException)
-    {
-      observedResponse = SocketResponse.Failed(SocketProtocolError.HandlerFailed, ex.Message);
-      await WriteStreamEndFailedAsync(frame.MessageId, observedResponse.ErrorCode, observedResponse.ErrorMessage);
+        observedResponse = started
+            ? SocketResponse.Failed(SocketProtocolError.Timeout, "Stream idle timeout elapsed or the stream was cancelled.")
+            : frame.DeadlineMs > 0
+                ? SocketResponse.Failed(SocketProtocolError.Timeout, "Stream deadline elapsed.")
+                : SocketResponse.Failed(SocketProtocolError.Cancelled, "Stream was cancelled.");
+        await WriteStreamEndFailedAsync(
+            frame.MessageId,
+            observedResponse.ErrorCode,
+            observedResponse.ErrorMessage);
+      }
+      catch (Exception) when (Lifetime.IsCancellationRequested)
+      {
+      }
+      catch (Exception ex)
+      {
+        observedResponse = HandlerFailure(frame.Service, frame.Operation, ex);
+        await WriteStreamEndFailedAsync(frame.MessageId, observedResponse.ErrorCode, observedResponse.ErrorMessage);
+      }
     }
     finally
     {
+      await DisposeStreamSourceAsync(source);
       ObserveRequestCompleted(
           frame,
           observedResponse ?? SocketResponse.Failed(SocketProtocolError.Cancelled, "Stream did not complete."));
       ActiveRequestCancellations.TryRemove(frame.MessageId, out _);
-      ReturnRequestCancellation(requestTimeout);
+      EndActiveRequest(requestTimeout);
+    }
+  }
+
+  static async ValueTask DisposeStreamSourceAsync(Stream source)
+  {
+    if (source is null)
+      return;
+
+    try
+    {
+      await source.DisposeAsync();
+    }
+    catch
+    {
     }
   }
 
   async ValueTask WriteStreamItemsAsync(
       long messageId,
       Stream source,
-      CancellationToken cancellationToken)
+      CancellationTokenSource idleTimeout)
   {
+    var cancellationToken = idleTimeout.Token;
     var buffer = ArrayPool<byte>.Shared.Rent(Options.StreamChunkBytes);
     try
     {
-      await using (source)
+      while (true)
       {
-        while (true)
-        {
-          var read = await source.ReadAsync(buffer.AsMemory(0, Options.StreamChunkBytes), cancellationToken);
-          if (read == 0)
-            break;
+        var read = await source.ReadAsync(buffer.AsMemory(0, Options.StreamChunkBytes), cancellationToken);
+        if (read == 0)
+          break;
 
-          await WriteFrameAsync(new SocketFrame
-          {
-            Version = Options.ProtocolVersion,
-            MessageId = messageId,
-            Kind = SocketMessageKind.StreamItem
-          }, buffer.AsMemory(0, read), cancellationToken);
-        }
+        await WriteFrameAsync(new SocketFrame
+        {
+          Version = Options.ProtocolVersion,
+          MessageId = messageId,
+          Kind = SocketMessageKind.StreamItem
+        }, buffer.AsMemory(0, read), cancellationToken);
+        idleTimeout.CancelAfter(Options.StreamIdleTimeout);
       }
 
       await WriteFrameAsync(new SocketFrame

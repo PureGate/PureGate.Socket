@@ -20,67 +20,46 @@ sealed class SocketFrameWriter(
     await WriteAsync(frame, frame?.PayloadMemory ?? ReadOnlyMemory<byte>.Empty, cancellationToken);
   }
 
+  // The payload written is payloadOverride when it is non-empty, otherwise the frame's own payload.
+  // Compression is decided here, on that payload, and only changes the flags and bytes that are encoded.
+  // The frame itself is never copied or modified, so no header field can be lost along the way.
   public async ValueTask WriteAsync(
       SocketFrame frame,
       ReadOnlyMemory<byte> payloadOverride,
       CancellationToken cancellationToken)
   {
-    var prepared = PrepareFrame(frame);
-    var payload = payloadOverride;
-    if (payloadOverride.IsEmpty && prepared.PayloadLength > 0)
-      payload = prepared.PayloadMemory;
-    if (ReferenceEquals(prepared, frame))
-      prepared = PrepareFrame(prepared, payload);
-    else
-      payload = prepared.PayloadMemory;
+    frame ??= new SocketFrame();
+    var payload = payloadOverride.IsEmpty ? frame.PayloadMemory : payloadOverride;
+    var flags = frame.Flags;
+    if (ShouldCompress(frame.Kind, payload.Length))
+    {
+      var compressed = CompressBrotli(payload.Span);
+      if (compressed.Length < payload.Length)
+      {
+        payload = compressed;
+        flags |= SocketFrameFlags.PayloadCompressed;
+      }
+    }
 
-    var length = GetEncodedLength(prepared, payload.Length);
+    var length = GetEncodedLength(frame, payload.Length);
     if (length > maxFrameSizeBytes)
       throw new SocketProtocolException(SocketProtocolError.PayloadTooLarge, "Frame exceeds the configured maximum size.");
 
     var buffer = Writer.GetSpan(4 + length);
     BinaryPrimitives.WriteInt32BigEndian(buffer.Slice(0, 4), length);
-    Encode(prepared, payload.Span, buffer.Slice(4, length));
+    Encode(frame, flags, payload.Span, buffer.Slice(4, length));
     Writer.Advance(4 + length);
     var flush = await Writer.FlushAsync(cancellationToken);
     if (flush.IsCanceled)
       throw new OperationCanceledException(cancellationToken);
   }
 
-  SocketFrame PrepareFrame(SocketFrame frame)
+  bool ShouldCompress(SocketMessageKind kind, int payloadLength)
   {
-    return PrepareFrame(frame, frame?.PayloadMemory ?? ReadOnlyMemory<byte>.Empty);
-  }
-
-  SocketFrame PrepareFrame(SocketFrame frame, ReadOnlyMemory<byte> payloadMemory)
-  {
-    frame ??= new SocketFrame();
-    if (compression != SocketPayloadCompression.Brotli || frame.Kind == SocketMessageKind.Chunk)
-      return frame;
-
-    var payload = payloadMemory;
-    if (payload.Length < compressionMinPayloadBytes)
-      return frame;
-
-    var compressed = CompressBrotli(payload.Span);
-    if (compressed.Length >= payload.Length)
-      return frame;
-
-    return new SocketFrame
-    {
-      Version = frame.Version,
-      MessageId = frame.MessageId,
-      Kind = frame.Kind,
-      Service = frame.Service,
-      Operation = frame.Operation,
-      IdempotencyKey = frame.IdempotencyKey,
-      Flags = frame.Flags | SocketFrameFlags.PayloadCompressed,
-      DeadlineMs = frame.DeadlineMs,
-      Ok = frame.Ok,
-      ErrorCode = frame.ErrorCode,
-      ErrorMessage = frame.ErrorMessage,
-      Payload = compressed
-    };
+    return compression == SocketPayloadCompression.Brotli
+        && kind != SocketMessageKind.Chunk
+        && payloadLength > 0
+        && payloadLength >= compressionMinPayloadBytes;
   }
 
   static byte[] CompressBrotli(ReadOnlySpan<byte> payload)
@@ -139,17 +118,11 @@ sealed class SocketFrameWriter(
         4 + payloadLength;
   }
 
-  static void Encode(SocketFrame frame, Span<byte> buffer)
+  static void Encode(SocketFrame frame, int flags, ReadOnlySpan<byte> payload, Span<byte> buffer)
   {
-    Encode(frame, frame is null ? [] : frame.PayloadMemory.Span, buffer);
-  }
-
-  static void Encode(SocketFrame frame, ReadOnlySpan<byte> payload, Span<byte> buffer)
-  {
-    frame ??= new SocketFrame();
     if (frame.Kind is SocketMessageKind.FastRequest or SocketMessageKind.FastResponse)
     {
-      EncodeFast(frame, payload, buffer);
+      EncodeFast(frame, flags, payload, buffer);
       return;
     }
 
@@ -163,7 +136,7 @@ sealed class SocketFrameWriter(
     WriteByte(buffer, ref offset, (byte)frame.Kind);
     WriteInt64(buffer, ref offset, frame.MessageId);
     WriteInt32(buffer, ref offset, frame.OperationId);
-    WriteInt32(buffer, ref offset, frame.Flags);
+    WriteInt32(buffer, ref offset, flags);
     WriteInt32(buffer, ref offset, frame.DeadlineMs);
     WriteByte(buffer, ref offset, (byte)frame.OriginalKind);
     WriteInt32(buffer, ref offset, frame.ChunkIndex);
@@ -178,14 +151,14 @@ sealed class SocketFrameWriter(
     WriteBytes(buffer, ref offset, payload);
   }
 
-  static void EncodeFast(SocketFrame frame, ReadOnlySpan<byte> payload, Span<byte> buffer)
+  static void EncodeFast(SocketFrame frame, int flags, ReadOnlySpan<byte> payload, Span<byte> buffer)
   {
     var offset = 0;
     WriteInt32(buffer, ref offset, frame.Version);
     WriteByte(buffer, ref offset, (byte)frame.Kind);
     WriteInt64(buffer, ref offset, frame.MessageId);
     WriteInt32(buffer, ref offset, frame.OperationId);
-    WriteInt32(buffer, ref offset, frame.Flags);
+    WriteInt32(buffer, ref offset, flags);
     WriteInt32(buffer, ref offset, frame.DeadlineMs);
     WriteByte(buffer, ref offset, frame.Ok ? (byte)1 : (byte)0);
     if (frame.Kind == SocketMessageKind.FastResponse)

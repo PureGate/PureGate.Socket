@@ -95,3 +95,11 @@ dotnet run -c Release --project PureGate.Socket.Benchmarks -- --iterations 5000 
 ```
 
 The harness measures frame roundtrip, RPC echo, request batching, pull streaming, and concurrent RPC pressure. It reports elapsed time, throughput, allocation deltas, and GC collection counts.
+
+Options:
+
+- `--suite classic|matrix|all` (default `all`). The matrix suite adds a raw-socket ceiling, p50/p99/p99.9 latency, payloads from 64 B to 1 MB, 1/8/64 connections, and TLS and Brotli variants.
+- `--json <path>` writes the matrix results as JSON. The Phase 0 baseline is in `docs/benchmarks/baseline-phase0.json`.
+- `--quick` runs a reduced version, as CI does.
+
+Compare runs on the same machine, and compare medians of several runs: run-to-run noise on concurrent scenarios can exceed 30%.

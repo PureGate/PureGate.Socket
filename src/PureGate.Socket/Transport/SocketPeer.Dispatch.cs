@@ -18,9 +18,9 @@ public sealed partial class SocketPeer
 
         LastReceivedTicks = DateTimeOffset.UtcNow.UtcTicks;
         ObserveFrameReceived(frame);
+        PruneExpiredChunks();
         if (frame.Kind == SocketMessageKind.Chunk)
         {
-          PruneExpiredChunks();
           frame = ReassembleChunk(frame);
           if (frame is null)
             continue;
@@ -116,6 +116,7 @@ public sealed partial class SocketPeer
     if (HandlerQueue.Writer.TryWrite(frame))
       return false;
 
+    // The request was rejected before any handler ran, so the caller can safely retry it.
     if (frame.Kind is SocketMessageKind.Request or SocketMessageKind.FastRequest)
     {
       await WriteFrameAsync(new SocketFrame
@@ -125,7 +126,7 @@ public sealed partial class SocketPeer
         Kind = frame.Kind == SocketMessageKind.FastRequest ? SocketMessageKind.FastResponse : SocketMessageKind.Response,
         OperationId = frame.OperationId,
         Ok = false,
-        ErrorCode = SocketProtocolError.ProtocolError,
+        ErrorCode = SocketProtocolError.Overloaded,
         ErrorMessage = "Handler queue is full."
       }, Lifetime.Token);
       return true;
@@ -135,13 +136,14 @@ public sealed partial class SocketPeer
     {
       await WriteStreamStartFailedAsync(
           frame.MessageId,
-          SocketProtocolError.ProtocolError,
+          SocketProtocolError.Overloaded,
           "Handler queue is full.",
           Lifetime.Token);
       return true;
     }
 
-    throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Handler queue is full.");
+    // Events cannot be rejected individually yet; per-connection flow control arrives in Phase 2.
+    throw new SocketProtocolException(SocketProtocolError.Overloaded, "Handler queue is full.");
   }
 
   async Task HandlerLoopAsync()
@@ -168,6 +170,16 @@ public sealed partial class SocketPeer
               break;
           }
         }
+        catch (Exception ex) when (!Lifetime.IsCancellationRequested)
+        {
+          // Dispatch methods turn every handler failure into a response, so what reaches this point is a
+          // transport failure while answering. The connection is unusable; close it.
+          await CloseAsync(ex);
+        }
+        catch
+        {
+          // The connection is closing; there is nobody left to answer.
+        }
         finally
         {
           frame.ReleasePayload();
@@ -179,6 +191,7 @@ public sealed partial class SocketPeer
       await CloseAsync(ex);
     }
   }
+
   async Task HeartbeatLoopAsync()
   {
     try
@@ -186,7 +199,6 @@ public sealed partial class SocketPeer
       while (!Lifetime.IsCancellationRequested)
       {
         await Task.Delay(Options.HeartbeatInterval, Lifetime.Token);
-        PruneExpiredChunks();
         PruneExpiredIdempotentRequests();
         var idle = DateTimeOffset.UtcNow - new DateTimeOffset(Interlocked.Read(ref LastReceivedTicks), TimeSpan.Zero);
         if (idle > Options.IdleTimeout)
@@ -205,6 +217,16 @@ public sealed partial class SocketPeer
       await CloseAsync(ex);
     }
   }
+
+  static readonly TimeSpan CancelFrameTimeout = TimeSpan.FromSeconds(5);
+
+  // A cancel frame is best effort: the caller already has its timeout or cancelled result and should not
+  // wait behind a write lock held by a blocked write.
+  void SendCancelInBackground(long messageId)
+  {
+    _ = SendCancelAsync(messageId).AsTask();
+  }
+
   async ValueTask SendCancelAsync(long messageId)
   {
     if (State == SocketPeerState.Closed || Lifetime.IsCancellationRequested)
@@ -212,21 +234,32 @@ public sealed partial class SocketPeer
 
     try
     {
+      using var timeout = new CancellationTokenSource(CancelFrameTimeout);
       await WriteFrameAsync(new SocketFrame
       {
         Version = Options.ProtocolVersion,
         MessageId = messageId,
         Kind = SocketMessageKind.Cancel
-      }, CancellationToken.None);
+      }, timeout.Token);
     }
     catch
     {
     }
   }
 
+  // Server-side handler cancellation sources are never pooled and never disposed. The read loop can look
+  // one up just as its request ends; with pooling, that late Cancel either hit a disposed source (faulting
+  // the read loop and closing the connection) or cancelled an unrelated request that reused it. A source
+  // that is simply dropped makes a late Cancel harmless: it only reaches a request that already finished.
   void CancelActiveRequest(long messageId)
   {
     if (ActiveRequestCancellations.TryGetValue(messageId, out var cancellation))
       cancellation.Cancel();
+  }
+
+  static void EndActiveRequest(CancellationTokenSource requestTimeout)
+  {
+    // Stops a pending deadline timer so it does not keep the source alive until the deadline.
+    requestTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
   }
 }

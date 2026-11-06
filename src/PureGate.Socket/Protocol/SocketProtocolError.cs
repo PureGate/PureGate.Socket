@@ -11,4 +11,8 @@ public static class SocketProtocolError
   public const string ProtocolError = "protocol_error";
   public const string HandlerFailed = "handler_failed";
   public const string ConnectionClosed = "connection_closed";
+
+  // The work was rejected before it started because a local or remote limit was reached.
+  // Nothing was executed, so the call is safe to retry after backing off.
+  public const string Overloaded = "overloaded";
 }

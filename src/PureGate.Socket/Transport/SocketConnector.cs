@@ -33,8 +33,9 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
           client.GetStream(),
           Options.NodeId,
           timeout.Token);
-      var remoteNodeId = await RunClientHandshakeAsync(stream, timeout.Token);
-      return new SocketPeer(client, stream, Options.NodeId, remoteNodeId, Options, handler);
+      var reader = SocketPeer.CreateReader(stream, Options);
+      var remoteNodeId = await RunClientHandshakeAsync(stream, reader, timeout.Token);
+      return new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, Options, handler);
     }
     catch
     {
@@ -44,9 +45,8 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     }
   }
 
-  async ValueTask<string> RunClientHandshakeAsync(Stream stream, CancellationToken cancellationToken)
+  async ValueTask<string> RunClientHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
   {
-    var reader = new SocketFrameReader(stream, Options.MaxFrameSizeBytes);
     var writer = new SocketFrameWriter(
         stream,
         Options.MaxFrameSizeBytes);

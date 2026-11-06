@@ -42,9 +42,12 @@ public sealed partial class SocketPeer : IAsyncDisposable
   long LastReceivedTicks = DateTimeOffset.UtcNow.UtcTicks;
   int ClosedFlag;
 
+  // reader must be the reader that ran the handshake. A frame reader buffers ahead, so it may already hold
+  // frames the remote sent right after the handshake; a fresh reader would silently lose them.
   internal SocketPeer(
       TcpClient client,
       Stream stream,
+      SocketFrameReader reader,
       string localNodeId,
       string remoteNodeId,
       SocketFabricOptions options,
@@ -56,11 +59,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
     RemoteNodeId = remoteNodeId ?? string.Empty;
     Options = options.Normalize();
     Handler = handler ?? EmptySocketPeerHandler.Shared;
-    Reader = new SocketFrameReader(
-        stream,
-        Options.MaxFrameSizeBytes,
-        Options.PayloadCompression,
-        Options.MaxDecompressedPayloadSizeBytes);
+    Reader = reader ?? throw new ArgumentNullException(nameof(reader));
     Writer = new SocketFrameWriter(
         stream,
         Options.MaxFrameSizeBytes,
@@ -89,4 +88,13 @@ public sealed partial class SocketPeer : IAsyncDisposable
   public SocketPeerState State { get; private set; } = SocketPeerState.Connecting;
   public Task Completion => Closed.Task;
   public ISocketMessageCodec Codec => Options.Codec;
+
+  internal static SocketFrameReader CreateReader(Stream stream, SocketFabricOptions options)
+  {
+    return new SocketFrameReader(
+        stream,
+        options.MaxFrameSizeBytes,
+        options.PayloadCompression,
+        options.MaxDecompressedPayloadSizeBytes);
+  }
 }

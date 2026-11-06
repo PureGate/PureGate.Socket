@@ -5,41 +5,49 @@ namespace PureGate.Socket.Transport;
 
 public sealed partial class SocketPeer
 {
+  // Error handling contract for every dispatch path below:
+  // - Cancellation caused by the request's own deadline or a Cancel frame becomes a timeout/cancelled response.
+  // - Anything else a handler throws (including an OperationCanceledException it raised itself) becomes a
+  //   handler_failed response and is reported to the observer. It never escapes into the worker loop.
+  // - Once the connection is closing, nothing is sent and nothing is reported.
+
   async ValueTask DispatchRequestAsync(SocketFrame frame)
   {
     SocketResponse response;
-    var requestTimeout = RentRequestCancellation();
+    var requestTimeout = new CancellationTokenSource();
     if (frame.DeadlineMs > 0)
       requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(frame.DeadlineMs));
 
     ActiveRequestCancellations[frame.MessageId] = requestTimeout;
     try
     {
-      ObserveRequestStarted(frame);
-      var request = new SocketRequest(
-          frame.MessageId,
-          frame.Service,
-          frame.Operation,
-          frame.PayloadMemory,
-          frame.IdempotencyKey);
-      response = string.IsNullOrEmpty(request.IdempotencyKey)
-          ? await HandleRequestAsync(request, requestTimeout.Token)
-          : await HandleIdempotentRequestAsync(request, requestTimeout.Token);
-    }
-    catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
-    {
-      response = frame.DeadlineMs > 0
-          ? SocketResponse.Failed(SocketProtocolError.Timeout, "Request deadline elapsed.")
-          : SocketResponse.Failed(SocketProtocolError.Cancelled, "Request was cancelled.");
-    }
-    catch (Exception ex) when (ex is not OperationCanceledException)
-    {
-      response = SocketResponse.Failed(SocketProtocolError.HandlerFailed, ex.Message);
-    }
+      try
+      {
+        ObserveRequestStarted(frame);
+        var request = new SocketRequest(
+            frame.MessageId,
+            frame.Service,
+            frame.Operation,
+            frame.PayloadMemory,
+            frame.IdempotencyKey);
+        response = string.IsNullOrEmpty(request.IdempotencyKey)
+            ? await HandleRequestAsync(request, requestTimeout.Token)
+            : await HandleIdempotentRequestAsync(request, requestTimeout.Token);
+      }
+      catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
+      {
+        response = DeadlineOrCancelled(frame);
+      }
+      catch (Exception) when (Lifetime.IsCancellationRequested)
+      {
+        return;
+      }
+      catch (Exception ex)
+      {
+        response = HandlerFailure(frame.Service, frame.Operation, ex);
+      }
 
-    response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Request was not handled.");
-    try
-    {
+      response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Request was not handled.");
       ObserveRequestCompleted(frame, response);
       await WriteFrameAsync(new SocketFrame
       {
@@ -54,43 +62,45 @@ public sealed partial class SocketPeer
     finally
     {
       ActiveRequestCancellations.TryRemove(frame.MessageId, out _);
-      ReturnRequestCancellation(requestTimeout);
+      EndActiveRequest(requestTimeout);
     }
   }
 
   async ValueTask DispatchFastRequestAsync(SocketFrame frame)
   {
     SocketResponse response;
-    var requestTimeout = RentRequestCancellation();
+    var requestTimeout = new CancellationTokenSource();
     if (frame.DeadlineMs > 0)
       requestTimeout.CancelAfter(TimeSpan.FromMilliseconds(frame.DeadlineMs));
 
     ActiveRequestCancellations[frame.MessageId] = requestTimeout;
     try
     {
-      ObserveRequestStarted(frame);
-      var request = new SocketFastRequest(
-          frame.MessageId,
-          frame.OperationId,
-          frame.PayloadMemory);
-      response = request.OperationId == InternalFastBatchOperationId
-          ? await HandleFastBatchRequestAsync(request, requestTimeout.Token)
-          : await HandleFastRequestAsync(request, requestTimeout.Token);
-    }
-    catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
-    {
-      response = frame.DeadlineMs > 0
-          ? SocketResponse.Failed(SocketProtocolError.Timeout, "Request deadline elapsed.")
-          : SocketResponse.Failed(SocketProtocolError.Cancelled, "Request was cancelled.");
-    }
-    catch (Exception ex) when (ex is not OperationCanceledException)
-    {
-      response = SocketResponse.Failed(SocketProtocolError.HandlerFailed, ex.Message);
-    }
+      try
+      {
+        ObserveRequestStarted(frame);
+        var request = new SocketFastRequest(
+            frame.MessageId,
+            frame.OperationId,
+            frame.PayloadMemory);
+        response = request.OperationId == InternalFastBatchOperationId
+            ? await HandleFastBatchRequestAsync(request, requestTimeout.Token)
+            : await HandleFastRequestAsync(request, requestTimeout.Token);
+      }
+      catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
+      {
+        response = DeadlineOrCancelled(frame);
+      }
+      catch (Exception) when (Lifetime.IsCancellationRequested)
+      {
+        return;
+      }
+      catch (Exception ex)
+      {
+        response = HandlerFailure(frame.Service, frame.Operation, ex);
+      }
 
-    response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Fast request was not handled.");
-    try
-    {
+      response ??= SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Fast request was not handled.");
       ObserveRequestCompleted(frame, response);
       await WriteFrameAsync(new SocketFrame
       {
@@ -106,8 +116,29 @@ public sealed partial class SocketPeer
     finally
     {
       ActiveRequestCancellations.TryRemove(frame.MessageId, out _);
-      ReturnRequestCancellation(requestTimeout);
+      EndActiveRequest(requestTimeout);
     }
+  }
+
+  static SocketResponse DeadlineOrCancelled(SocketFrame frame)
+  {
+    return frame.DeadlineMs > 0
+        ? SocketResponse.Failed(SocketProtocolError.Timeout, "Request deadline elapsed.")
+        : SocketResponse.Failed(SocketProtocolError.Cancelled, "Request was cancelled.");
+  }
+
+  // Turns a handler exception into the response the remote peer sees. A SocketProtocolException is a
+  // deliberate, wire-safe error, so its code and message are kept. Any other exception is reported to the
+  // observer in full and sent as a generic message unless IncludeExceptionDetails is set.
+  SocketResponse HandlerFailure(string service, string operation, Exception exception)
+  {
+    ObserveHandlerFailed(service, operation, exception);
+    if (exception is SocketProtocolException protocolException)
+      return SocketResponse.Failed(protocolException.ErrorCode, protocolException.Message);
+
+    return SocketResponse.Failed(
+        SocketProtocolError.HandlerFailed,
+        Options.IncludeExceptionDetails ? exception.Message : "The remote handler failed.");
   }
 
   async ValueTask<SocketResponse> HandleFastRequestAsync(
@@ -170,18 +201,19 @@ public sealed partial class SocketPeer
           response.ErrorCode,
           response.ErrorMessage);
     }
-    catch (OperationCanceledException)
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
       throw;
     }
     catch (Exception ex)
     {
+      var failure = HandlerFailure(string.Empty, string.Empty, ex);
       results.WriteResult(
           item.Id,
           false,
           ReadOnlyMemory<byte>.Empty,
-          SocketProtocolError.HandlerFailed,
-          ex.Message);
+          failure.ErrorCode,
+          failure.ErrorMessage);
     }
   }
 
@@ -199,7 +231,8 @@ public sealed partial class SocketPeer
       var authorization = await Options.Authorizer.AuthorizeEventAsync(this, socketEvent, Lifetime.Token);
       if (!authorization.Succeeded)
       {
-        await CloseAsync(new SocketProtocolException(SocketProtocolError.Unauthorized, authorization.Error));
+        if (Options.CloseOnUnauthorizedEvent)
+          await CloseAsync(new SocketProtocolException(SocketProtocolError.Unauthorized, authorization.Error));
         return;
       }
 
@@ -208,9 +241,13 @@ public sealed partial class SocketPeer
           socketEvent,
           Lifetime.Token);
     }
-    catch (Exception ex) when (ex is not OperationCanceledException)
+    catch (Exception) when (Lifetime.IsCancellationRequested)
     {
-      await CloseAsync(ex);
+    }
+    catch (Exception ex)
+    {
+      // Events have no response, so a failing handler is reported and the connection stays open.
+      ObserveHandlerFailed(frame.Service, frame.Operation, ex);
     }
   }
 
@@ -219,7 +256,7 @@ public sealed partial class SocketPeer
     if (!PendingRequests.TryGetValue(frame.MessageId, out var pending))
       return;
 
-    pending.TrySetResult(new SocketRequestResult
+    pending.TrySetResult(frame.MessageId, new SocketRequestResult
     {
       Succeeded = frame.Ok,
       Payload = frame.PayloadMemory,
@@ -272,29 +309,44 @@ public sealed partial class SocketPeer
         request.Service,
         request.Operation,
         request.IdempotencyKey);
-    var candidate = new SocketIdempotencyEntry();
-    var entry = Options.IdempotencyCache.GetOrAdd(key, candidate);
-    if (!ReferenceEquals(entry, candidate))
-      return await entry.Task.WaitAsync(cancellationToken);
 
-    try
+    while (true)
     {
-      var response = await HandleRequestAsync(request, cancellationToken)
-          ?? SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Request was not handled.");
-      candidate.TrySetResult(response);
-      return response;
-    }
-    catch (OperationCanceledException ex)
-    {
-      Options.IdempotencyCache.Remove(key);
-      candidate.TrySetException(ex);
-      throw;
-    }
-    catch (Exception ex)
-    {
-      var response = SocketResponse.Failed(SocketProtocolError.HandlerFailed, ex.Message);
-      candidate.TrySetResult(response);
-      return response;
+      var candidate = new SocketIdempotencyEntry();
+      var entry = Options.IdempotencyCache.GetOrAdd(key, candidate);
+      if (!ReferenceEquals(entry, candidate))
+      {
+        try
+        {
+          return await entry.Task.WaitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+          // The attempt that owned this key was cancelled (typically because its connection dropped)
+          // before it produced a response. Its entry is gone, so this attempt takes over.
+          continue;
+        }
+      }
+
+      try
+      {
+        var response = await HandleRequestAsync(request, cancellationToken)
+            ?? SocketResponse.Failed(SocketProtocolError.UnsupportedOperation, "Request was not handled.");
+        candidate.TrySetResult(response);
+        return response;
+      }
+      catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+      {
+        Options.IdempotencyCache.Remove(key, candidate);
+        candidate.TrySetCanceled();
+        throw;
+      }
+      catch (Exception ex)
+      {
+        var response = HandlerFailure(request.Service, request.Operation, ex);
+        candidate.TrySetResult(response);
+        return response;
+      }
     }
   }
 
@@ -321,13 +373,14 @@ public sealed partial class SocketPeer
           response.ErrorCode,
           response.ErrorMessage);
     }
-    catch (OperationCanceledException)
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
       throw;
     }
     catch (Exception ex)
     {
-      return BatchFailed(item.Id, SocketProtocolError.HandlerFailed, ex.Message);
+      var failure = HandlerFailure(item.Service, item.Operation, ex);
+      return BatchFailed(item.Id, failure.ErrorCode, failure.ErrorMessage);
     }
   }
 
@@ -335,12 +388,31 @@ public sealed partial class SocketPeer
       SocketEvent batchEvent,
       CancellationToken cancellationToken)
   {
-    var items = SocketBatchCodec.DeserializeItems(batchEvent.Payload.Span);
+    IReadOnlyList<SocketBatchItem> items;
+    try
+    {
+      items = SocketBatchCodec.DeserializeItems(batchEvent.Payload.Span);
+    }
+    catch (SocketProtocolException ex)
+    {
+      // A malformed internal envelope is a protocol violation, not a handler failure.
+      await CloseAsync(ex);
+      return;
+    }
+
     foreach (var item in items)
     {
       var result = await HandleBatchEventItemAsync(item, cancellationToken);
-      if (!result.Succeeded)
-        throw new SocketProtocolException(result.ErrorCode, result.ErrorMessage);
+      if (result.Succeeded)
+        continue;
+
+      var closes = result.ErrorCode == SocketProtocolError.ProtocolError
+          || (result.ErrorCode == SocketProtocolError.Unauthorized && Options.CloseOnUnauthorizedEvent);
+      if (closes)
+      {
+        await CloseAsync(new SocketProtocolException(result.ErrorCode, result.ErrorMessage));
+        return;
+      }
     }
   }
 
@@ -361,13 +433,14 @@ public sealed partial class SocketPeer
       await Handler.HandleEventAsync(this, socketEvent, cancellationToken);
       return new SocketBatchResult(item.Id, true, [], null, null);
     }
-    catch (OperationCanceledException)
+    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
     {
       throw;
     }
     catch (Exception ex)
     {
-      return BatchFailed(item.Id, SocketProtocolError.HandlerFailed, ex.Message);
+      var failure = HandlerFailure(item.Service, item.Operation, ex);
+      return BatchFailed(item.Id, failure.ErrorCode, failure.ErrorMessage);
     }
   }
 
