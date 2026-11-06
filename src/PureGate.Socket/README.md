@@ -43,11 +43,20 @@ See [CLUSTER_GUIDE.md](CLUSTER_GUIDE.md) for the socket-side contract future Pur
 - Shared idempotency/replay cache with TTL and size bounds.
 - Queue-indexed replay-cache pruning without full-cache scans.
 - Strict malformed-frame rejection.
-- Bounded inbound stream buffering.
+- Credit-based flow control: per-connection message credits and per-stream byte windows that grow automatically when they limit throughput.
 - Stream-specific authorization.
 - Allocation-tight stream chunk writes.
 - Live peer registry for multi-peer services, including multiple sessions per node.
 - Peer selection policies: first, round-robin, random.
+
+## Flow control
+
+Each side controls how much the other may send it:
+
+- **Messages.** A peer may have at most as many requests, events and stream requests waiting at the remote as the remote's handler queue holds (`MaxQueuedHandlers`, exchanged in the handshake). When the remote is busy, `RequestAsync`, `OpenStreamAsync` and `SendEventAsync` wait for room, within their timeout or cancellation token, instead of failing or overrunning the remote. The local `MaxInFlightRequests` limit still fails fast with `overloaded`.
+- **Streams.** A producer sends only what the consumer has room for: `StreamWindowBytes` to start (1 MB by default), with more granted as the application reads. When the consumer runs out of data while the producer is waiting for room, the window doubles, up to `MaxStreamWindowBytes` (64 MB by default). A slow or stalled reader holds back only its own stream, never the connection.
+
+Because nothing a peer sends can exceed what it was granted, the connection's read loop never waits, and two peers flooding each other cannot deadlock. A peer that sends more than it was granted is closed.
 
 ## Security
 

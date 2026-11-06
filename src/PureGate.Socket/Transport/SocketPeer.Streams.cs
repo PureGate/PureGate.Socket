@@ -25,7 +25,8 @@ public sealed partial class SocketPeer
     pending.ReleaseInFlight(this);
   }
 
-  async ValueTask DispatchStreamItemAsync(SocketFrame frame)
+  // Never waits: the window bounds what the producer may send, so the chunk is buffered as it is.
+  void DispatchStreamItem(SocketFrame frame)
   {
     if (!PendingStreams.TryGetValue(frame.MessageId, out var pending))
     {
@@ -33,9 +34,9 @@ public sealed partial class SocketPeer
       return;
     }
 
-    await pending.Stream.WriteChunkAsync(
-        frame.TakePayload(),
-        Lifetime.Token);
+    var producerWaiting = (frame.Flags & SocketFrameFlags.WindowExhausted) != 0;
+    if (!pending.Stream.TryWriteChunk(frame.TakePayload(), producerWaiting))
+      throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Stream data exceeds the granted window.");
   }
 
   void DispatchStreamEnd(SocketFrame frame)
@@ -78,6 +79,15 @@ public sealed partial class SocketPeer
       try
       {
         ObserveRequestStarted(frame);
+
+        // OperationId carries the consumer's initial window.
+        if (frame.OperationId <= 0)
+        {
+          observedResponse = SocketResponse.Failed(SocketProtocolError.ProtocolError, "Stream request carries no flow-control window.");
+          await WriteStreamStartFailedAsync(frame.MessageId, observedResponse.ErrorCode, observedResponse.ErrorMessage, requestTimeout.Token);
+          return;
+        }
+
         var streamRequest = new SocketStreamRequest(
             frame.MessageId,
             frame.Service,
@@ -106,6 +116,9 @@ public sealed partial class SocketPeer
           return;
         }
 
+        // Registered before StreamStart so no grant from the consumer can arrive before the window exists.
+        var window = new StreamSendWindow(frame.OperationId);
+        OutgoingStreams[frame.MessageId] = window;
         await WriteFrameAsync(new SocketFrame
         {
           Version = Options.ProtocolVersion,
@@ -115,10 +128,11 @@ public sealed partial class SocketPeer
         }, requestTimeout.Token);
 
         // The caller's deadline covered opening the stream. From here on the stream may run as long as it
-        // keeps making progress: the idle timer is re-armed after every chunk.
+        // keeps making progress: the idle timer is re-armed after every chunk, and also bounds how long
+        // the producer waits for the consumer to grant more window.
         started = true;
         requestTimeout.CancelAfter(Options.StreamIdleTimeout);
-        await WriteStreamItemsAsync(frame.MessageId, source ?? Stream.Null, requestTimeout);
+        await WriteStreamItemsAsync(frame.MessageId, source ?? Stream.Null, window, requestTimeout);
         observedResponse = SocketResponse.Success();
       }
       catch (OperationCanceledException) when (requestTimeout.IsCancellationRequested && !Lifetime.IsCancellationRequested)
@@ -150,6 +164,7 @@ public sealed partial class SocketPeer
       ObserveRequestCompleted(
           frame,
           observedResponse ?? SocketResponse.Failed(SocketProtocolError.Cancelled, "Stream did not complete."));
+      OutgoingStreams.TryRemove(frame.MessageId, out _);
       ActiveRequests.TryRemove(frame.MessageId, out _);
       EndActiveRequest(active);
     }
@@ -172,6 +187,7 @@ public sealed partial class SocketPeer
   async ValueTask WriteStreamItemsAsync(
       long messageId,
       Stream source,
+      StreamSendWindow window,
       CancellationTokenSource idleTimeout)
   {
     var cancellationToken = idleTimeout.Token;
@@ -184,13 +200,23 @@ public sealed partial class SocketPeer
         if (read == 0)
           break;
 
-        await WriteFrameAsync(new SocketFrame
+        // Send what the window allows, then wait for the consumer to grant more.
+        for (var offset = 0; offset < read;)
         {
-          Version = Options.ProtocolVersion,
-          MessageId = messageId,
-          Kind = SocketMessageKind.StreamItem
-        }, buffer.AsMemory(0, read), cancellationToken);
-        idleTimeout.CancelAfter(Options.StreamIdleTimeout);
+          var allowed = await window.TakeAsync(read - offset, cancellationToken);
+
+          // Telling the consumer that this frame used up the window lets it grow the window when it then
+          // runs dry (both sides waiting on each other means the window is the bottleneck).
+          await WriteFrameAsync(new SocketFrame
+          {
+            Version = Options.ProtocolVersion,
+            MessageId = messageId,
+            Kind = SocketMessageKind.StreamItem,
+            Flags = window.IsExhausted ? SocketFrameFlags.WindowExhausted : 0
+          }, buffer.AsMemory(offset, allowed), cancellationToken);
+          offset += allowed;
+          idleTimeout.CancelAfter(Options.StreamIdleTimeout);
+        }
       }
 
       await WriteFrameAsync(new SocketFrame

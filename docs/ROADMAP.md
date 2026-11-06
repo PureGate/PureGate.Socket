@@ -6,7 +6,7 @@
 
 The order is deliberate. The biggest speed gains come from reworking the connection's core, and that same rework structurally fixes the worst remaining bugs. Every change is judged against the benchmark baseline.
 
-Phases 0 (safety net) and 1 (local bug fixes) are done.
+Phases 0 (safety net) and 1 (local bug fixes) are done, and so is flow control from Phase 2.
 
 ---
 
@@ -15,19 +15,15 @@ Phases 0 (safety net) and 1 (local bug fixes) are done.
 1. **A single writer loop.**
    - Everything sent goes into one queue and one writer task encodes it into the pipe. Flushes are already coalesced under the write lock, so the remaining gains are no lock contention and the priority lanes below.
 2. **Priority lanes in that queue.** Control frames (pong, cancel, close, credits) go first, then responses, then requests and events, then stream data and chunks. Large messages are interleaved chunk by chunk, so they no longer block everything else.
-3. **The read loop never waits on the socket or on a consumer.** It only decodes, dispatches and queues. This removes the deadlock when two peers flood each other and each waits to write.
-4. **Credit-based flow control**, like HTTP/2's window updates, per stream and per connection.
-   - A slow or unread stream stalls only its own stream, not the whole connection.
-   - Event senders wait for credit instead of the receiver closing the connection when its queue is full.
-5. **A pending-request table with generations.** Requests live in a fixed array of slots, and the message ID includes a generation counter. This replaces the `ConcurrentDictionary` lookup on every response.
-6. **A timeout wheel.** One timer per connection replaces a cancellation source and a timer per request, on both the client and server sides.
-7. **Ordered events.** By default, events from one connection are processed in order, with an option to process in parallel by key. Requests stay concurrent.
-8. **Fewer thread hops.** An opt-in way to run a short handler directly on the read loop, and a configurable way to complete client requests without an extra hop.
-9. **A raw socket transport.** When there's no TLS, read and write the socket directly (the approach Kestrel uses) instead of going through `NetworkStream`. Keep the stream path for TLS. Adopt this only if the benchmark proves the gain.
-10. **On-demand liveness check.** When a request times out, send a ping with a short deadline. If no pong arrives, close the connection, so `SocketClient` retries on a fresh one instead of a half-open link.
-11. **Benchmark: repeated runs.** Run each scenario several times and report the median and spread.
+3. **A pending-request table with generations.** Requests live in a fixed array of slots, and the message ID includes a generation counter. This replaces the `ConcurrentDictionary` lookup on every response.
+4. **A timeout wheel.** One timer per connection replaces a cancellation source and a timer per request, on both the client and server sides.
+5. **Ordered events.** By default, events from one connection are processed in order, with an option to process in parallel by key. Requests stay concurrent.
+6. **Fewer thread hops.** An opt-in way to run a short handler directly on the read loop, and a configurable way to complete client requests without an extra hop.
+7. **A raw socket transport.** When there's no TLS, read and write the socket directly (the approach Kestrel uses) instead of going through `NetworkStream`. Keep the stream path for TLS. Adopt this only if the benchmark proves the gain.
+8. **On-demand liveness check.** When a request times out, send a ping with a short deadline. If no pong arrives, close the connection, so `SocketClient` retries on a fresh one instead of a half-open link.
+9. **Benchmark: repeated runs.** Run each scenario several times and report the median and spread.
 
-**Done when:** the tests currently ignored for Phase 2 pass, CI's 20× repeated runs are clean, and the benchmark shows clear wins on concurrent load.
+**Done when:** the ordered-events test passes, CI's 20× repeated runs are clean, and the benchmark shows clear wins on concurrent load.
 
 ## Phase 3 — Wire protocol v2
 

@@ -15,5 +15,9 @@ public enum SocketMessageKind
   StreamItem = 11,
   StreamEnd = 12,
   FastRequest = 13,
-  FastResponse = 14
+  FastResponse = 14,
+
+  // Flow control. MessageId 0 grants message credits for the connection; any other MessageId grants
+  // bytes to that stream. OperationId carries the amount.
+  Credit = 15
 }

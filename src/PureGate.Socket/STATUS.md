@@ -45,7 +45,7 @@
 - Shared idempotency/replay cache with TTL and size bounds.
 - Queue-indexed replay-cache pruning without full-cache scans.
 - Strict malformed-frame rejection.
-- Bounded inbound stream buffering.
+- Credit-based flow control: per-connection message credits and per-stream byte windows that grow automatically when they limit throughput.
 - Stream-specific authorization.
 - Allocation-tight stream chunk writes.
 - Live peer registry for multi-peer services, including multiple sessions per node.

@@ -3,25 +3,65 @@ using PureGate.Socket.Protocol;
 
 namespace PureGate.Socket.Transport;
 
+// The consumer end of a pull stream, with byte-level flow control.
+//
+// The producer may send only as many bytes as this side has granted: the initial window, plus every
+// grant sent since. The read loop therefore accepts each chunk immediately (never waiting for the
+// application to read), and buffered data is bounded by the window. A producer that sends past its grant
+// is breaking the protocol and the connection closes.
+//
+// Grants follow the application's reads: once it has consumed a quarter window since the last grant, that
+// amount is granted back. Granting early keeps three quarters of the window in flight, so the producer's
+// refill reaches the consumer before it runs dry; a steady reader costs about four credit frames per window.
+//
+// The window tunes itself. A producer marks the frame that uses up its window. If the application then runs
+// out of data while the producer is waiting for a grant, each side is waiting on the other: the window,
+// not the network or the producer, is limiting throughput (typically a link with a long round trip, or
+// socket buffers larger than the window). The window then doubles, up to the maximum. A slow reader never
+// runs out of data, so it never grows its window or buffers more.
 sealed class SocketPullStream : Stream
 {
   readonly Channel<SocketStreamChunk> Chunks;
+  readonly Action<long> SendCredit;
   readonly Action OnDispose;
+  readonly long MaxWindow;
   SocketStreamChunk Current;
   int Offset;
   int Completed;
   int Disposed;
 
-  public SocketPullStream(int maxBufferedChunks, Action onDispose)
+  // Producer-visible accounting. Granted is written by the consumer and read by the read loop; Received
+  // is written by the read loop and read by the consumer.
+  long Granted;
+  long Received;
+  // 1 when the latest frame from the producer used up its window, so it is stalled until a grant reaches it.
+  int ProducerWaiting;
+
+  // Consumer-only state.
+  long Window;
+  long Consumed;
+  long ConsumedAtLastGrant;
+
+  public SocketPullStream(
+      long initialWindow,
+      long maxWindow,
+      Action<long> sendCredit,
+      Action onDispose)
   {
-    Chunks = Channel.CreateBounded<SocketStreamChunk>(new BoundedChannelOptions(maxBufferedChunks)
+    Chunks = Channel.CreateUnbounded<SocketStreamChunk>(new UnboundedChannelOptions
     {
-      FullMode = BoundedChannelFullMode.Wait,
       SingleReader = true,
       SingleWriter = false
     });
+    Window = initialWindow;
+    MaxWindow = Math.Max(initialWindow, maxWindow);
+    Granted = initialWindow;
+    SendCredit = sendCredit;
     OnDispose = onDispose;
   }
+
+  // The current window. Read it only from the consumer's thread, or after reading has finished.
+  internal long WindowBytes => Window;
 
   public override bool CanRead => true;
   public override bool CanSeek => false;
@@ -34,31 +74,34 @@ sealed class SocketPullStream : Stream
     set => throw new NotSupportedException();
   }
 
-  // Threading contract: the producer side (WriteChunkAsync, Complete) runs on the connection's read loop
-  // or close path; the consumer side (ReadAsync, Dispose) runs on the caller's thread. Only the consumer
-  // ever touches Current or reads from the channel. The producer side only writes to and completes the
+  // Threading contract: the producer side (TryWriteChunk, Complete) runs on the connection's read loop or
+  // close path; the consumer side (ReadAsync, Dispose) runs on the caller's thread. Only the consumer ever
+  // touches Current or reads from the channel. The producer side only writes to and completes the
   // channel, so it can never release a buffer the consumer is still copying from.
 
-  public async ValueTask WriteChunkAsync(
-      SocketPayload payload,
-      CancellationToken cancellationToken)
+  // Read loop. Returns false when the chunk exceeds the granted window (a protocol violation).
+  public bool TryWriteChunk(SocketPayload payload, bool producerWaiting)
   {
-    var chunk = new SocketStreamChunk(payload);
-    try
+    var received = Volatile.Read(ref Received) + payload.Length;
+    Volatile.Write(ref Received, received);
+    if (received > Interlocked.Read(ref Granted))
     {
-      await Chunks.Writer.WriteAsync(chunk, cancellationToken);
+      payload.Dispose();
+      return false;
     }
-    catch (ChannelClosedException)
+
+    // Tracks the latest frame: data that keeps arriving unflagged means the producer has window to spare.
+    Volatile.Write(ref ProducerWaiting, producerWaiting ? 1 : 0);
+
+    var chunk = new SocketStreamChunk(payload);
+    if (!Chunks.Writer.TryWrite(chunk))
     {
       // The consumer disposed the stream; chunks still in flight before the producer sees the cancel
-      // are dropped. This must not fault the read loop, which would close the whole connection.
+      // are dropped.
       chunk.Dispose();
     }
-    catch
-    {
-      chunk.Dispose();
-      throw;
-    }
+
+    return true;
   }
 
   public void Complete()
@@ -88,19 +131,58 @@ sealed class SocketPullStream : Stream
     {
       Current.Dispose();
       Current = default;
+      if (Chunks.Reader.TryRead(out var next))
+      {
+        Current = next;
+        Offset = 0;
+        continue;
+      }
+
+      OnBufferEmpty();
       if (!await Chunks.Reader.WaitToReadAsync(cancellationToken))
         return 0;
-
-      if (!Chunks.Reader.TryRead(out Current))
-        continue;
-
-      Offset = 0;
     }
 
     var count = Math.Min(buffer.Length, Current.Length - Offset);
     Current.Memory.Slice(Offset, count).CopyTo(buffer);
     Offset += count;
+    OnConsumed(count);
     return count;
+  }
+
+  void OnConsumed(int count)
+  {
+    Consumed += count;
+    if (Consumed - ConsumedAtLastGrant >= Window / 4)
+      Grant(extra: 0);
+  }
+
+  // The application is about to wait for data. If the producer's latest frame used up its window, the
+  // producer is stalled until a grant reaches it while this side waits for its data: the window is the
+  // bottleneck. Double it and grant the increase, plus anything read since the last grant, at once. The
+  // flag is cleared so one stall grows the window once; the next exhausted frame re-arms it.
+  void OnBufferEmpty()
+  {
+    if (Volatile.Read(ref Completed) != 0 || Interlocked.Exchange(ref ProducerWaiting, 0) == 0)
+      return;
+
+    var extra = Math.Min(Window, MaxWindow - Window);
+    Window += extra;
+    Grant(extra);
+  }
+
+  void Grant(long extra)
+  {
+    if (Volatile.Read(ref Completed) != 0)
+      return;
+
+    var amount = Consumed - ConsumedAtLastGrant + extra;
+    if (amount <= 0)
+      return;
+
+    ConsumedAtLastGrant = Consumed;
+    Interlocked.Add(ref Granted, amount);
+    SendCredit(amount);
   }
 
   protected override void Dispose(bool disposing)

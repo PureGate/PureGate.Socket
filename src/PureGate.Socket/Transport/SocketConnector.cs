@@ -34,8 +34,8 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
           Options.NodeId,
           timeout.Token);
       var reader = SocketPeer.CreateReader(stream, Options);
-      var remoteNodeId = await RunClientHandshakeAsync(stream, reader, timeout.Token);
-      return new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, Options, handler);
+      var (remoteNodeId, remoteWindow) = await RunClientHandshakeAsync(stream, reader, timeout.Token);
+      return new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, remoteWindow, Options, handler);
     }
     catch
     {
@@ -45,7 +45,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     }
   }
 
-  async ValueTask<string> RunClientHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
+  async ValueTask<(string NodeId, int MessageWindow)> RunClientHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
   {
     var writer = new SocketFrameWriter(
         stream,
@@ -97,6 +97,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "proof",
+      OperationId = Options.MaxQueuedHandlers,
       Payload = JsonSocketMessageCodec.Shared.Serialize(proof)
     }, cancellationToken);
 
@@ -115,6 +116,6 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     if (!ready.Ok)
       throw new SocketProtocolException(ready.ErrorCode ?? SocketProtocolError.Unauthorized, ready.ErrorMessage ?? "Handshake rejected.");
 
-    return challengeAuth.RemoteNodeId;
+    return (challengeAuth.RemoteNodeId, SocketPeer.ReadHandshakeWindow(ready));
   }
 }

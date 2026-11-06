@@ -15,7 +15,6 @@ namespace PureGate.Socket.Test;
 // ignored with the reason, so the suite stays green while still documenting the open defect.
 public sealed partial class SocketFabricTests
 {
-  const string Phase2FlowControl = "Phase 2: needs the single writer loop and credit-based flow control (docs/ROADMAP.md).";
   const string Phase2EventOrdering = "Phase 2: needs ordered event dispatch (docs/ROADMAP.md).";
 
   [Test]
@@ -222,7 +221,6 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  [Ignore(Phase2FlowControl)]
   public async Task Bug06_UnreadStreamDoesNotStallOtherTraffic()
   {
     await using var listener = await StartListenerAsync(
@@ -328,7 +326,6 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  [Ignore(Phase2FlowControl)]
   public async Task Bug09_EventBurstAppliesBackpressureInsteadOfClosing()
   {
     const int events = 50;
@@ -389,7 +386,7 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Regression")]
-  public async Task LocalOverloadIsReportedAsOverloaded()
+  public async Task LocalInFlightLimitIsOverloadedButFullRemoteQueueMakesSendersWait()
   {
     await using var listener = await StartListenerAsync(
         new SocketFabricOptions { NodeId = "server", MaxConcurrentHandlers = 1, MaxQueuedHandlers = 1 },
@@ -410,8 +407,10 @@ public sealed partial class SocketFabricTests
         .Select(_ => flooding.RequestAsync("test", "flood", [], TimeSpan.FromSeconds(5)).AsTask()));
     await held;
 
-    Assert.That(rejectedLocally.ErrorCode, Is.EqualTo("overloaded"));
-    Assert.That(flood.Select(result => result.ErrorCode), Has.Some.EqualTo("overloaded"));
+    // The local in-flight limit still fails fast. A full remote queue no longer rejects anything: senders
+    // wait for message credit, so every flood request completes once a handler slot frees up.
+    Assert.That(rejectedLocally.ErrorCode, Is.EqualTo(SocketProtocolError.Overloaded));
+    Assert.That(flood.Select(result => result.Succeeded), Has.All.True, string.Join(", ", flood.Select(result => result.ErrorCode)));
   }
 
   [Test]
@@ -967,6 +966,308 @@ public sealed partial class SocketFabricTests
     }
   }
 
+  // Flow control.
+
+  [Test]
+  [Category("FlowControl")]
+  public async Task ProducerNeverSendsPastAnUnreadConsumersWindow()
+  {
+    const int window = 128 * 1024;
+    var observer = new StreamBytesObserver();
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server", Observer = observer },
+        new DelegateSocketPeerHandler
+        {
+          OnStream = (_, _, _) => ValueTask.FromResult(SocketStreamResponse.Success(new PatternStream(8L * 1024 * 1024)))
+        });
+    await using var client = await ConnectAsync(listener, new SocketFabricOptions { NodeId = "client", StreamWindowBytes = window });
+
+    await using var stream = await client.OpenStreamAsync("test", "pattern", [], TimeSpan.FromSeconds(5));
+    await Task.Delay(500);
+    var sentWhileUnread = observer.StreamItemBytes;
+
+    var buffer = new byte[64 * 1024];
+    long position = 0;
+    int read;
+    while ((read = await stream.ReadAsync(buffer)) > 0)
+    {
+      for (var i = 0; i < read; i++)
+      {
+        if (buffer[i] != PatternStream.ByteAt(position + i))
+          Assert.Fail($"corrupted byte at offset {position + i}");
+      }
+
+      position += read;
+    }
+
+    Assert.That(sentWhileUnread, Is.GreaterThan(0).And.LessThanOrEqualTo(window));
+    Assert.That(position, Is.EqualTo(8L * 1024 * 1024));
+  }
+
+  [Test]
+  [Category("FlowControl")]
+  public async Task StreamWindowGrowsWhenItIsTheBottleneck()
+  {
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler
+        {
+          OnStream = (_, _, _) => ValueTask.FromResult(SocketStreamResponse.Success(new PatternStream(16L * 1024 * 1024)))
+        });
+    // Every write from the client (its credit grants) is delayed, as on a link with a long round trip.
+    await using var client = await new SocketConnector(new SocketFabricOptions
+    {
+      NodeId = "client",
+      StreamWindowBytes = 64 * 1024,
+      MaxStreamWindowBytes = 8 * 1024 * 1024,
+      StreamFilter = new DelayedWriteStreamFilter(TimeSpan.FromMilliseconds(10))
+    }).ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
+
+    await using var stream = await client.OpenStreamAsync("test", "pattern", [], TimeSpan.FromSeconds(10));
+    var total = await CountBytesAsync(stream);
+
+    Assert.That(total, Is.EqualTo(16L * 1024 * 1024));
+    Assert.That(((SocketPullStream)stream).WindowBytes, Is.GreaterThan(64 * 1024));
+  }
+
+  [Test]
+  [Category("FlowControl")]
+  public async Task StreamWindowDoesNotGrowForASlowReader()
+  {
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server" },
+        new DelegateSocketPeerHandler
+        {
+          OnStream = (_, _, _) => ValueTask.FromResult(SocketStreamResponse.Success(new PatternStream(2L * 1024 * 1024)))
+        });
+    await using var client = await ConnectAsync(listener, new SocketFabricOptions { NodeId = "client", StreamWindowBytes = 256 * 1024 });
+
+    await using var stream = await client.OpenStreamAsync("test", "pattern", [], TimeSpan.FromSeconds(10));
+    await Task.Delay(200);
+    var buffer = new byte[64 * 1024];
+    long total = 0;
+    int read;
+    while ((read = await stream.ReadAsync(buffer)) > 0)
+    {
+      total += read;
+      await Task.Delay(5);
+    }
+
+    Assert.That(total, Is.EqualTo(2L * 1024 * 1024));
+    Assert.That(((SocketPullStream)stream).WindowBytes, Is.EqualTo(256 * 1024));
+  }
+
+  [Test]
+  [Category("FlowControl")]
+  public async Task ProducerThatOverrunsItsWindowClosesTheConnection()
+  {
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    try
+    {
+      var server = Task.Run(async () =>
+      {
+        using var socket = await listener.AcceptTcpClientAsync();
+        var stream = socket.GetStream();
+        var reader = await RunRawNoAuthServerHandshakeAsync(stream);
+        var writer = new SocketFrameWriter(stream, 1024 * 1024);
+        var request = await reader.ReadAsync(CancellationToken.None);
+        Assert.That(request.Kind, Is.EqualTo(SocketMessageKind.StreamRequest));
+        Assert.That(request.OperationId, Is.EqualTo(64 * 1024), "the stream request should carry the consumer's window");
+        await writer.WriteAsync(new SocketFrame
+        {
+          Version = SocketFabricOptions.CurrentProtocolVersion,
+          MessageId = request.MessageId,
+          Kind = SocketMessageKind.StreamStart,
+          Ok = true
+        }, CancellationToken.None);
+        await writer.WriteAsync(new SocketFrame
+        {
+          Version = SocketFabricOptions.CurrentProtocolVersion,
+          MessageId = request.MessageId,
+          Kind = SocketMessageKind.StreamItem,
+          Payload = new byte[request.OperationId + 1]
+        }, CancellationToken.None);
+        await Task.Delay(2000);
+      });
+
+      await using var client = await new SocketConnector(new SocketFabricOptions { NodeId = "client", StreamWindowBytes = 64 * 1024 })
+          .ConnectAsync((IPEndPoint)listener.LocalEndpoint, new DelegateSocketPeerHandler());
+      await using var stream = await client.OpenStreamAsync("test", "overrun", [], TimeSpan.FromSeconds(5));
+      await client.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+
+      Assert.That(client.State, Is.EqualTo(SocketPeerState.Closed));
+      await server;
+    }
+    finally
+    {
+      listener.Stop();
+    }
+  }
+
+  [Test]
+  [Category("FlowControl")]
+  public async Task RequestThatTimesOutWaitingForCreditDoesNotLeakCredit()
+  {
+    var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server", MaxConcurrentHandlers = 1, MaxQueuedHandlers = 1 },
+        new DelegateSocketPeerHandler
+        {
+          OnRequest = async (_, request, _) =>
+          {
+            if (request.Operation == "hold")
+            {
+              started.TrySetResult();
+              await release.Task;
+            }
+
+            return SocketResponse.Success();
+          }
+        });
+    await using var client = await ConnectAsync(listener);
+
+    // "hold" runs, "queued" takes the only credit, so "starved" has to wait for credit and times out.
+    var hold = client.RequestAsync("test", "hold", [], TimeSpan.FromSeconds(10)).AsTask();
+    await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    var queued = client.RequestAsync("test", "queued", [], TimeSpan.FromSeconds(10)).AsTask();
+    await Task.Delay(100);
+    var starved = await client.RequestAsync("test", "starved", [], TimeSpan.FromMilliseconds(200));
+    release.SetResult();
+    await Task.WhenAll(hold, queued);
+
+    // If the timed-out request had kept a credit, these would stall.
+    var after = await Task.WhenAll(Enumerable.Range(0, 3)
+        .Select(_ => client.RequestAsync("test", "after", [], TimeSpan.FromSeconds(5)).AsTask()));
+
+    Assert.That(starved.ErrorCode, Is.EqualTo(SocketProtocolError.Timeout));
+    Assert.That(after.Select(result => result.Succeeded), Has.All.True);
+  }
+
+  [Test]
+  [Category("FlowControl")]
+  public async Task SendersWaitingForCreditAreReleasedWhenTheConnectionCloses()
+  {
+    var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    await using var listener = await StartListenerAsync(
+        new SocketFabricOptions { NodeId = "server", MaxConcurrentHandlers = 1, MaxQueuedHandlers = 1 },
+        new DelegateSocketPeerHandler
+        {
+          OnRequest = async (_, _, cancellationToken) =>
+          {
+            started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            return SocketResponse.Success();
+          }
+        });
+    var client = await ConnectAsync(listener);
+
+    _ = client.RequestAsync("test", "running", [], TimeSpan.FromSeconds(30)).AsTask();
+    await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    _ = client.RequestAsync("test", "queued", [], TimeSpan.FromSeconds(30)).AsTask();
+    await Task.Delay(100);
+    var waitingRequest = client.RequestAsync("test", "waiting", [], TimeSpan.FromSeconds(30)).AsTask();
+    var waitingEvent = client.SendEventAsync("test", "waiting", [1]).AsTask();
+    await Task.Delay(100);
+    await client.DisposeAsync();
+
+    var result = await waitingRequest.WaitAsync(TimeSpan.FromSeconds(5));
+    var eventError = await Assert.ThrowsAsync<SocketProtocolException>(async () => await waitingEvent.WaitAsync(TimeSpan.FromSeconds(5)));
+
+    Assert.That(result.ErrorCode, Is.EqualTo(SocketProtocolError.ConnectionClosed));
+    Assert.That(eventError.ErrorCode, Is.EqualTo(SocketProtocolError.ConnectionClosed));
+  }
+
+  sealed class StreamBytesObserver : Observability.ISocketObserver
+  {
+    long Bytes;
+
+    public long StreamItemBytes => Interlocked.Read(ref Bytes);
+
+    public void FrameSent(SocketPeer peer, SocketMessageKind kind, int payloadBytes)
+    {
+      if (kind == SocketMessageKind.StreamItem)
+        Interlocked.Add(ref Bytes, payloadBytes);
+    }
+  }
+
+  sealed class DelayedWriteStreamFilter(TimeSpan delay) : ISocketStreamFilter
+  {
+    public ValueTask<Stream> WrapClientAsync(Stream stream, string localNodeId, CancellationToken cancellationToken)
+    {
+      return ValueTask.FromResult<Stream>(new DelayedWriteStream(stream, delay));
+    }
+
+    public ValueTask<Stream> WrapServerAsync(Stream stream, string localNodeId, CancellationToken cancellationToken)
+    {
+      return ValueTask.FromResult(stream);
+    }
+  }
+
+  // Delays every write, so whatever this side sends (here: stream credit grants) arrives late.
+  sealed class DelayedWriteStream(Stream inner, TimeSpan delay) : Stream
+  {
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
+    {
+      get => throw new NotSupportedException();
+      set => throw new NotSupportedException();
+    }
+
+    public override void Flush()
+    {
+      inner.Flush();
+    }
+
+    public override Task FlushAsync(CancellationToken cancellationToken)
+    {
+      return inner.FlushAsync(cancellationToken);
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+      return inner.Read(buffer, offset, count);
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+      return inner.ReadAsync(buffer, cancellationToken);
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+      inner.Write(buffer, offset, count);
+    }
+
+    public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+      await Task.Delay(delay, cancellationToken);
+      await inner.WriteAsync(buffer, cancellationToken);
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+      throw new NotSupportedException();
+    }
+
+    public override void SetLength(long value)
+    {
+      throw new NotSupportedException();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+      if (disposing)
+        inner.Dispose();
+      base.Dispose(disposing);
+    }
+  }
+
   // Stress tests for defects suspected from code reading. They may pass today because the races are
   // narrow; they exist so the Phase 2 rework is checked against them.
 
@@ -1136,7 +1437,6 @@ public sealed partial class SocketFabricTests
 
   [Test]
   [Category("Stress")]
-  [Ignore(Phase2FlowControl + " Both peers block writing while neither read loop drains.")]
   public async Task Stress_BidirectionalFloodDoesNotDeadlock()
   {
     SocketPeer serverPeer = null;
@@ -1240,7 +1540,8 @@ public sealed partial class SocketFabricTests
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "ready",
-      Ok = true
+      Ok = true,
+      OperationId = 4096
     }, CancellationToken.None);
     return reader;
   }

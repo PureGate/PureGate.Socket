@@ -86,8 +86,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
           Options.NodeId,
           timeout.Token);
       var reader = SocketPeer.CreateReader(stream, Options);
-      var remoteNodeId = await RunServerHandshakeAsync(stream, reader, timeout.Token);
-      var peer = new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, Options, handler);
+      var (remoteNodeId, remoteWindow) = await RunServerHandshakeAsync(stream, reader, timeout.Token);
+      var peer = new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, remoteWindow, Options, handler);
       lock (Sync)
         Peers.Add(peer);
       _ = Task.Run(async () =>
@@ -136,7 +136,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     }
   }
 
-  async ValueTask<string> RunServerHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
+  async ValueTask<(string NodeId, int MessageWindow)> RunServerHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
   {
     var writer = new SocketFrameWriter(
         stream,
@@ -185,6 +185,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
       }
 
       var proof = JsonSocketMessageCodec.Shared.Deserialize<SocketHandshakeProof>(proofFrame.PayloadMemory.Span);
+      var remoteWindow = SocketPeer.ReadHandshakeWindow(proofFrame);
       var auth = await Options.Authenticator.AuthenticateProofAsync(
           remoteHello,
           challenge,
@@ -199,9 +200,10 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
         Kind = SocketMessageKind.Event,
         Service = "socket",
         Operation = "ready",
-        Ok = true
+        Ok = true,
+        OperationId = Options.MaxQueuedHandlers
       }, cancellationToken);
-      return auth.RemoteNodeId;
+      return (auth.RemoteNodeId, remoteWindow);
     }
     catch (SocketProtocolException ex)
     {

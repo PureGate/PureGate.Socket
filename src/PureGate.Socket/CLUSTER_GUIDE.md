@@ -105,7 +105,7 @@ The fabric already bounds:
 - handler concurrency
 - handler queue length
 - incoming chunked message count
-- inbound stream buffering
+- stream buffering (flow-control windows)
 
 Cluster services should still design their own domain limits. Socket limits protect the transport; they do not decide storage quotas, replication windows, or membership safety.
 

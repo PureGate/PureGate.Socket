@@ -54,7 +54,10 @@ public sealed partial class SocketPeer
     {
       while (HandlerQueue.TryDequeue(out var frame))
       {
+        // The queue slot is free again: hand the sender its credit back. Credits are returned on pickup,
+        // not on completion, so they track queue space; MaxConcurrentHandlers bounds what is running.
         Interlocked.Decrement(ref QueuedHandlerFrames);
+        ReturnMessageCredit();
         if (Lifetime.IsCancellationRequested)
         {
           frame.ReleasePayload();

@@ -336,7 +336,7 @@ static class MatrixBenchmarks
         MaxQueuedHandlers = 100_000,
         MaxInFlightRequests = 100_000,
         StreamChunkBytes = 128 * 1024,
-        MaxStreamBufferChunks = 64,
+        StreamWindowBytes = 8 * 1024 * 1024,
         RequestTimeout = TimeSpan.FromSeconds(30),
         PayloadCompression = brotli ? SocketPayloadCompression.Brotli : SocketPayloadCompression.None,
         StreamFilter = tls

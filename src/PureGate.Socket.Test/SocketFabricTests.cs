@@ -1805,6 +1805,7 @@ public sealed partial class SocketFabricTests
       Kind = SocketMessageKind.Event,
       Service = "socket",
       Operation = "proof",
+      OperationId = 4096,
       Payload = JsonSocketMessageCodec.Shared.Serialize(new SocketHandshakeProof(
           SocketFabricOptions.CurrentProtocolVersion,
           "raw-client",

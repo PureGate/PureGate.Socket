@@ -135,7 +135,18 @@ public sealed partial class SocketPeer
 
       frame.MessageId = messageId;
       frame.DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout);
-      await WriteFrameAsync(frame, writeToken);
+
+      // Waits while the remote's handler queue is full; the request's own timeout still applies.
+      await MessageCredits.AcquireAsync(writeToken);
+      try
+      {
+        await WriteFrameAsync(frame, writeToken);
+      }
+      catch
+      {
+        RefundUnsentMessage(frame);
+        throw;
+      }
 
       var result = await pending.Task;
       if (result.ErrorCode is SocketProtocolError.Timeout or SocketProtocolError.Cancelled)
@@ -219,7 +230,9 @@ public sealed partial class SocketPeer
 
     var messageId = Interlocked.Increment(ref NextMessageId);
     var stream = new SocketPullStream(
-        Options.MaxStreamBufferChunks,
+        Options.StreamWindowBytes,
+        Options.MaxStreamWindowBytes,
+        amount => SendCreditInBackground(messageId, amount),
         () => SendCancelInBackground(messageId));
     var pending = new PendingStream(stream);
     var effectiveTimeout = timeout <= TimeSpan.Zero ? Options.RequestTimeout : timeout;
@@ -233,16 +246,29 @@ public sealed partial class SocketPeer
         throw new InvalidOperationException("Could not register socket stream request.");
       registered = true;
 
-      await WriteFrameAsync(new SocketFrame
+      // OperationId carries the initial stream window: how many bytes the producer may send before the
+      // first grant.
+      var request = new SocketFrame
       {
         Version = Options.ProtocolVersion,
         MessageId = messageId,
         Kind = SocketMessageKind.StreamRequest,
         Service = service ?? string.Empty,
         Operation = operation ?? string.Empty,
+        OperationId = Options.StreamWindowBytes,
         DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout),
         Payload = payload ?? []
-      }, timeoutSource.Token);
+      };
+      await MessageCredits.AcquireAsync(timeoutSource.Token);
+      try
+      {
+        await WriteFrameAsync(request, timeoutSource.Token);
+      }
+      catch
+      {
+        RefundUnsentMessage(request);
+        throw;
+      }
 
       using var registration = timeoutSource.Token.Register(
           static state => ((PendingStream)state).TrySetCancelled(),
@@ -298,7 +324,7 @@ public sealed partial class SocketPeer
       CancellationToken cancellationToken = default)
   {
     ThrowIfClosed();
-    await WriteFrameAsync(new SocketFrame
+    var frame = new SocketFrame
     {
       Version = Options.ProtocolVersion,
       MessageId = Interlocked.Increment(ref NextMessageId),
@@ -306,7 +332,27 @@ public sealed partial class SocketPeer
       Service = service ?? string.Empty,
       Operation = operation ?? string.Empty,
       Payload = payload ?? []
-    }, cancellationToken);
+    };
+
+    // Waits while the remote's handler queue is full, instead of the remote dropping the connection.
+    try
+    {
+      await MessageCredits.AcquireAsync(cancellationToken);
+    }
+    catch (OperationCanceledException) when (Lifetime.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+    {
+      throw new SocketProtocolException(SocketProtocolError.ConnectionClosed, "Connection is closed.");
+    }
+
+    try
+    {
+      await WriteFrameAsync(frame, cancellationToken);
+    }
+    catch
+    {
+      RefundUnsentMessage(frame);
+      throw;
+    }
   }
 
   public async ValueTask<IReadOnlyList<SocketBatchResult>> RequestBatchAsync(

@@ -43,12 +43,14 @@ public sealed partial class SocketPeer : IAsyncDisposable
 
   // reader must be the reader that ran the handshake. A frame reader buffers ahead, so it may already hold
   // frames the remote sent right after the handshake; a fresh reader would silently lose them.
+  // remoteMessageWindow is the number of handler-bound messages the remote said it can queue.
   internal SocketPeer(
       TcpClient client,
       Stream stream,
       SocketFrameReader reader,
       string localNodeId,
       string remoteNodeId,
+      int remoteMessageWindow,
       SocketFabricOptions options,
       ISocketPeerHandler handler)
   {
@@ -56,6 +58,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
     Stream = stream;
     LocalNodeId = localNodeId ?? string.Empty;
     RemoteNodeId = remoteNodeId ?? string.Empty;
+    MessageCredits = new MessageCredits(remoteMessageWindow);
     Options = options.Normalize();
     Handler = handler ?? EmptySocketPeerHandler.Shared;
     Reader = reader ?? throw new ArgumentNullException(nameof(reader));

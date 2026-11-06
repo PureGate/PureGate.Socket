@@ -30,7 +30,7 @@ public sealed partial class SocketPeer
         var releasePayload = true;
         try
         {
-          releasePayload = await DispatchAsync(frame);
+          releasePayload = Dispatch(frame);
         }
         finally
         {
@@ -49,8 +49,11 @@ public sealed partial class SocketPeer
     }
   }
 
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-  async ValueTask<bool> DispatchAsync(SocketFrame frame)
+  // Runs on the read loop and never waits: frames that need work go to handlers, frames that need a reply
+  // are answered in the background, and everything else is applied in place. What a peer may send is
+  // bounded by the credit it was granted, so the read loop can always keep draining the socket. That is
+  // what keeps two peers that flood each other from deadlocking.
+  bool Dispatch(SocketFrame frame)
   {
     if (frame.Version != Options.ProtocolVersion)
       throw new SocketProtocolException(SocketProtocolError.UnsupportedVersion, "Unsupported protocol version.");
@@ -60,7 +63,11 @@ public sealed partial class SocketPeer
       case SocketMessageKind.Request:
       case SocketMessageKind.FastRequest:
       case SocketMessageKind.StreamRequest:
-        return await EnqueueHandlerFrameAsync(frame);
+      case SocketMessageKind.Event:
+        // Message credits guarantee the queue has room; a full queue means the peer overran its credit.
+        if (!TryEnqueueHandlerFrame(frame))
+          throw new SocketProtocolException(SocketProtocolError.ProtocolError, "Peer sent more messages than its credit allows.");
+        return false;
       case SocketMessageKind.Response:
       case SocketMessageKind.FastResponse:
         DispatchResponse(frame);
@@ -69,21 +76,22 @@ public sealed partial class SocketPeer
         DispatchStreamStart(frame);
         break;
       case SocketMessageKind.StreamItem:
-        await DispatchStreamItemAsync(frame);
+        DispatchStreamItem(frame);
         break;
       case SocketMessageKind.StreamEnd:
         DispatchStreamEnd(frame);
         break;
-      case SocketMessageKind.Event:
-        return await EnqueueHandlerFrameAsync(frame);
+      case SocketMessageKind.Credit:
+        DispatchCredit(frame);
+        break;
       case SocketMessageKind.Ping:
-        await WriteFrameAsync(new SocketFrame
+        SendControlInBackground(new SocketFrame
         {
           Version = Options.ProtocolVersion,
           MessageId = frame.MessageId,
           Kind = SocketMessageKind.Pong,
           Ok = true
-        }, Lifetime.Token);
+        });
         break;
       case SocketMessageKind.Pong:
         break;
@@ -111,42 +119,6 @@ public sealed partial class SocketPeer
     {
       await CloseAsync(ex);
     }
-  }
-
-  [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-  async ValueTask<bool> EnqueueHandlerFrameAsync(SocketFrame frame)
-  {
-    if (TryEnqueueHandlerFrame(frame))
-      return false;
-
-    // The request was rejected before any handler ran, so the caller can safely retry it.
-    if (frame.Kind is SocketMessageKind.Request or SocketMessageKind.FastRequest)
-    {
-      await WriteFrameAsync(new SocketFrame
-      {
-        Version = Options.ProtocolVersion,
-        MessageId = frame.MessageId,
-        Kind = frame.Kind == SocketMessageKind.FastRequest ? SocketMessageKind.FastResponse : SocketMessageKind.Response,
-        OperationId = frame.OperationId,
-        Ok = false,
-        ErrorCode = SocketProtocolError.Overloaded,
-        ErrorMessage = "Handler queue is full."
-      }, Lifetime.Token);
-      return true;
-    }
-
-    if (frame.Kind == SocketMessageKind.StreamRequest)
-    {
-      await WriteStreamStartFailedAsync(
-          frame.MessageId,
-          SocketProtocolError.Overloaded,
-          "Handler queue is full.",
-          Lifetime.Token);
-      return true;
-    }
-
-    // Events cannot be rejected individually yet; per-connection flow control arrives in Phase 2.
-    throw new SocketProtocolException(SocketProtocolError.Overloaded, "Handler queue is full.");
   }
 
   async Task HeartbeatLoopAsync()

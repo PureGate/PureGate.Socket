@@ -11,6 +11,7 @@ public sealed partial class SocketPeer
 
     State = SocketPeerState.Closed;
     Lifetime.Cancel();
+    MessageCredits.Fail(Lifetime.Token);
     DrainHandlerQueue();
     IncomingChunks.Clear();
     foreach (var active in ActiveRequests.Values)

@@ -38,11 +38,13 @@ public sealed partial class SocketPeer
     }
   }
 
-  void ObserveFrameSent(SocketFrame frame)
+  // payloadBytes is the payload actually sent, which for responses and stream chunks is passed separately
+  // from the frame (the frame's own payload is then empty).
+  void ObserveFrameSent(SocketFrame frame, int payloadBytes)
   {
     try
     {
-      Options.Observer.FrameSent(this, frame.Kind, frame.PayloadLength);
+      Options.Observer.FrameSent(this, frame.Kind, payloadBytes);
     }
     catch
     {

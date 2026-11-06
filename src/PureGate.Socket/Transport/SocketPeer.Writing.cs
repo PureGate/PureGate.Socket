@@ -57,6 +57,7 @@ public sealed partial class SocketPeer
       throw;
     }
 
+    frame.WriteStarted = true;
     var abandonable = cancellationToken.CanBeCanceled && payloadOverride.IsEmpty;
     var lease = abandonable && frame.PayloadLength > Options.MaxChunkPayloadBytes ? new PayloadLease() : null;
     var write = WriteLockedFrameAsync(frame, payloadOverride, lease);
@@ -92,7 +93,7 @@ public sealed partial class SocketPeer
       try
       {
         Writer.Encode(frame, payloadOverride);
-        ObserveFrameSent(frame);
+        ObserveFrameSent(frame, payloadOverride.IsEmpty ? frame.PayloadLength : payloadOverride.Length);
       }
       catch (SocketProtocolException ex)
           when (ex.ErrorCode == SocketProtocolError.PayloadTooLarge
@@ -221,7 +222,7 @@ public sealed partial class SocketPeer
         lease?.Release();
       }
 
-      ObserveFrameSent(chunk);
+      ObserveFrameSent(chunk, count);
 
       // Every chunk but the last is flushed here, so a large message never sits whole in the pipe. The
       // last one is flushed (or coalesced) by FinishWriteAsync like any other frame.

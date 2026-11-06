@@ -32,6 +32,10 @@ sealed class SocketFrame
     }
   }
 
+  // Set once the frame holds the connection's write lock. From then on it reaches the wire (or the
+  // connection closes), so a message credit spent on it is not given back.
+  internal bool WriteStarted { get; set; }
+
   public int PayloadLength => PayloadValue.Length;
   public ReadOnlyMemory<byte> PayloadMemory => PayloadValue.Memory;
 

@@ -8,6 +8,7 @@ namespace PureGate.Socket.Protocol;
 public sealed class SocketFabricOptions
 {
   public const int CurrentProtocolVersion = 1;
+  const int MaxWindowLimit = 512 * 1024 * 1024;
 
   public string NodeId { get; init; } = Environment.MachineName;
   public int ProtocolVersion { get; init; } = CurrentProtocolVersion;
@@ -20,7 +21,11 @@ public sealed class SocketFabricOptions
   public int MaxConcurrentHandlers { get; init; } = 16;
   public int MaxQueuedHandlers { get; init; } = 4096;
   public int MaxIdempotencyEntries { get; init; } = 100_000;
-  public int MaxStreamBufferChunks { get; init; } = 16;
+  // Bytes a stream consumer lets its producer send ahead of what the application has read. The window
+  // doubles automatically, up to MaxStreamWindowBytes, when the producer runs out of window while the
+  // consumer is waiting for data (the window, not the network, is then the limit).
+  public int StreamWindowBytes { get; init; } = 1024 * 1024;
+  public int MaxStreamWindowBytes { get; init; } = 64 * 1024 * 1024;
   public int StreamChunkBytes { get; init; } = 64 * 1024;
   public int CompressionMinPayloadBytes { get; init; } = 16 * 1024;
   public SocketPayloadCompression PayloadCompression { get; init; } = SocketPayloadCompression.None;
@@ -75,7 +80,8 @@ public sealed class SocketFabricOptions
       MaxConcurrentHandlers = Math.Clamp(MaxConcurrentHandlers, 1, 1024),
       MaxQueuedHandlers = Math.Clamp(MaxQueuedHandlers, 1, 100_000),
       MaxIdempotencyEntries = Math.Clamp(MaxIdempotencyEntries, 1, 1_000_000),
-      MaxStreamBufferChunks = Math.Clamp(MaxStreamBufferChunks, 1, 1024),
+      StreamWindowBytes = Math.Clamp(StreamWindowBytes, 64 * 1024, MaxWindowLimit),
+      MaxStreamWindowBytes = Math.Clamp(MaxStreamWindowBytes, Math.Clamp(StreamWindowBytes, 64 * 1024, MaxWindowLimit), MaxWindowLimit),
       StreamChunkBytes = Math.Clamp(StreamChunkBytes, 1, Math.Max(1, MaxFrameSizeBytes / 4)),
       CompressionMinPayloadBytes = Math.Clamp(CompressionMinPayloadBytes, 0, 128 * 1024 * 1024),
       PayloadCompression = Enum.IsDefined(PayloadCompression) ? PayloadCompression : SocketPayloadCompression.None,
