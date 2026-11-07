@@ -33,7 +33,11 @@ public sealed class TlsSocketStreamFilter : ISocketStreamFilter
 
     try
     {
+#if NET8_0_OR_GREATER
       return certificate.MatchesHostname(nodeId, allowWildcards: false, allowCommonName: true);
+#else
+      return CertificateHostnames.Matches(certificate, nodeId, allowWildcards: false, allowCommonName: true);
+#endif
     }
     catch (ArgumentException)
     {
@@ -127,7 +131,11 @@ public sealed class TlsSocketStreamFilter : ISocketStreamFilter
 
     var certificate = remote as X509Certificate2;
     var owned = certificate is null;
+#if NET9_0_OR_GREATER
     certificate ??= X509CertificateLoader.LoadCertificate(remote.GetRawCertData());
+#else
+    certificate ??= new X509Certificate2(remote.GetRawCertData());
+#endif
     try
     {
       if (!validation(certificate, remoteNodeId))

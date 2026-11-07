@@ -1,10 +1,32 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFrameworks>net6.0;net7.0;net8.0;net9.0;net10.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- The older frameworks are targeted on purpose for consumers still on them; no end-of-support warning. -->
+    <CheckEolTargetFramework>false</CheckEolTargetFramework>
   </PropertyGroup>
+
+  <!-- .NET 9 and later ship these in the box; older frameworks get them from Microsoft's packages.
+       Pipelines: framing. DiagnosticSource: metrics, including the histogram bucket advice (9.0 and later).
+       System.Text.Json: the source-generation options the handshake uses (8.0 and later). -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="System.IO.Pipelines" Version="10.0.14" />
+    <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="10.0.14" />
+  </ItemGroup>
+
+  <!-- 8.0 is the last Pipelines and System.Text.Json release for .NET 6 and 7. No DiagnosticSource release with
+       the bucket advice lists them, so its .NET Standard 2.0 build is used there. -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net6.0' Or '$(TargetFramework)' == 'net7.0'">
+    <SuppressTfmSupportBuildWarnings>true</SuppressTfmSupportBuildWarnings>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net6.0' Or '$(TargetFramework)' == 'net7.0'">
+    <PackageReference Include="System.IO.Pipelines" Version="8.0.0" />
+    <PackageReference Include="System.Diagnostics.DiagnosticSource" Version="10.0.14" />
+    <PackageReference Include="System.Text.Json" Version="8.0.6" />
+  </ItemGroup>
 
   <!-- Package. Version and the shared metadata are in Directory.Build.props. -->
   <PropertyGroup>

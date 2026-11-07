@@ -16,9 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The library targets .NET 6, 7, 8, 9 and 10, and the tests run on each.
       - uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: |
+            6.0.x
+            7.0.x
+            8.0.x
+            9.0.x
+            10.0.x
 
       - name: Build
         run: dotnet build PureGate.Socket.slnx -c Release
@@ -26,22 +32,26 @@ jobs:
       - name: Test
         run: dotnet test src/PureGate.Socket.Test -c Release --no-build --blame-hang-timeout 2m --collect:"XPlat Code Coverage" --results-directory artifacts/coverage
 
-      # Fails the build when line coverage of the library drops below 85%.
+      # Fails the build when line coverage of the library drops below 85% on any framework.
       - name: Coverage gate
         shell: bash
         run: |
-          file=$(find artifacts/coverage -name coverage.cobertura.xml | head -1)
-          rate=$(grep -oE '<coverage line-rate="[0-9.]+"' "$file" | grep -oE '[0-9]+\.[0-9]+')
-          echo "Line coverage: $rate"
-          awk -v rate="$rate" 'BEGIN { exit !(rate >= 0.85) }' || { echo "::error::Line coverage $rate is below 0.85"; exit 1; }
+          files=$(find artifacts/coverage -name coverage.cobertura.xml)
+          [ "$(echo "$files" | grep -c .)" = "5" ] || { echo "::error::Expected a coverage report per framework, found: $files"; exit 1; }
+          for file in $files; do
+            rate=$(grep -oE '<coverage line-rate="[0-9.]+"' "$file" | grep -oE '[0-9]+\.[0-9]+')
+            echo "Line coverage: $rate ($file)"
+            awk -v rate="$rate" 'BEGIN { exit !(rate >= 0.85) }' || { echo "::error::Line coverage $rate is below 0.85"; exit 1; }
+          done
 
-      # Races only show up across many runs, so run the suite repeatedly.
+      # Races only show up across many runs, so run the suite repeatedly. On .NET 10 only: every framework
+      # would triple the time, and the step above already ran the suite on each.
       - name: Test (repeated x20)
         shell: bash
         run: |
           for i in $(seq 1 20); do
             echo "::group::run $i"
-            dotnet test src/PureGate.Socket.Test -c Release --no-build --blame-hang-timeout 2m || exit 1
+            dotnet test src/PureGate.Socket.Test -c Release --no-build --framework net10.0 --blame-hang-timeout 2m || exit 1
             echo "::endgroup::"
           done
 

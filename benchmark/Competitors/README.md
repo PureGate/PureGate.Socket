@@ -9,12 +9,12 @@ Compares PureGate.Socket with the libraries .NET teams usually pick for service-
 
 Every library echoes the same 1 KB payload, set up the way its documentation recommends for speed, with default options otherwise:
 
-| Library | Setup |
-|---|---|
-| PureGate.Socket | Raw `byte[]` requests |
-| gRPC | Unary call with a protobuf `bytes` message, HTTP/2 without TLS |
-| SignalR | Hub invocation, MessagePack protocol |
-| StreamJsonRpc | `MessagePackFormatter` with `LengthHeaderMessageHandler` |
+| Library         | Setup                                                          |
+|-----------------|----------------------------------------------------------------|
+| PureGate.Socket | Raw `byte[]` requests                                          |
+| gRPC            | Unary call with a protobuf `bytes` message, HTTP/2 without TLS |
+| SignalR         | Hub invocation, MessagePack protocol                           |
+| StreamJsonRpc   | `MessagePackFormatter` with `LengthHeaderMessageHandler`       |
 
 Two scenarios run for each:
 
@@ -32,12 +32,12 @@ dotnet run -c Release --project benchmark/Competitors
 
 On Linux or macOS, use `DOTNET_TieredCompilation=0 dotnet run -c Release --project benchmark/Competitors`.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `--duration <seconds>` | 1 | Measured time per scenario |
-| `--warmup <seconds>` | 0 | Unmeasured calls before each scenario |
-| `--callers <n>` | 64 | Concurrent callers sharing the connection |
-| `--payload <bytes>` | 1024 | Echoed payload size (gRPC allows up to 4 MB) |
+| Option                 | Default | Meaning                                      |
+|------------------------|--------:|----------------------------------------------|
+| `--duration <seconds>` |       1 | Measured time per scenario                   |
+| `--warmup <seconds>`   |       0 | Unmeasured calls before each scenario        |
+| `--callers <n>`        |      64 | Concurrent callers sharing the connection    |
+| `--payload <bytes>`    |    1024 | Echoed payload size (gRPC allows up to 4 MB) |
 
 With the defaults the whole run takes about 10 seconds. With no warmup, the first calls of each library include JIT compilation, the same for all of them. Run it three times and compare medians; single runs vary.
 
@@ -56,14 +56,14 @@ This project isn't part of `PureGate.Socket.slnx`, so the library's build and CI
 
 ## Results
 
-Median of three runs, Windows, 20 cores, .NET 10.0.6, tiered compilation off. Measured with the earlier fixed-count version (10,000 sequential calls; 64 callers × 500 calls), before the time-based options:
+Windows, 20 cores, .NET 10, over loopback with client and server in one process:
 
-| Library | Sequential calls/s | p50 | p99 | 64 callers, one connection | Alloc per call |
-|---|---|---|---|---|---|
-| Raw socket (ceiling) | 46,478 | 20 µs | 42 µs | n/a | 129 B |
-| **PureGate.Socket** | **32,454** | **26 µs** | **51 µs** | **487,713** | **3,265 B** |
-| SignalR (MessagePack) | 21,626 | 38 µs | 82 µs | 296,869 | 4,412 B |
-| StreamJsonRpc (MessagePack) | 21,615 | 32 µs | 69 µs | 258,055 | 5,182 B |
-| gRPC (HTTP/2) | 6,159 | 157 µs | 261 µs | 110,575 | 10,355 B |
+| Library                     | Sequential calls/s |       p50 |       p99 | 64 callers calls/s | Alloc per call |
+|-----------------------------|-------------------:|----------:|----------:|-------------------:|---------------:|
+| Raw socket (ceiling)        |             47,558 |     20 µs |     36 µs |                n/a |          128 B |
+| **PureGate.Socket**         |         **36,668** | **26 µs** | **39 µs** |        **548,710** |    **3,253 B** |
+| gRPC (HTTP/2)               |              6,063 |    161 µs |    236 µs |            120,166 |       10,345 B |
+| SignalR (MessagePack)       |             24,335 |     37 µs |     65 µs |            329,210 |        4,422 B |
+| StreamJsonRpc (MessagePack) |             27,067 |     32 µs |     50 µs |            279,519 |        5,162 B |
 
 Package versions: Grpc.AspNetCore 2.85.0, Microsoft.AspNetCore.SignalR.Client 10.0.14, StreamJsonRpc 2.26.150.
