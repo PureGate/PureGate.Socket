@@ -50,7 +50,7 @@ public sealed partial class SocketFabricTests
     await using var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
     listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
     Assert.That(listener.EndPoint.Port, Is.Not.Zero);
-    Assert.Throws<InvalidOperationException>(() => listener.Bind(new IPEndPoint(IPAddress.Loopback, 0)));
+    Assert.That(() => listener.Bind(new IPEndPoint(IPAddress.Loopback, 0)), Throws.TypeOf<InvalidOperationException>());
 
     var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
     var refused = await Assert.ThrowsAsync<SocketException>(async () =>
@@ -78,7 +78,7 @@ public sealed partial class SocketFabricTests
     await listener.DisposeAsync();
     await listener.DisposeAsync();
     Assert.That(listener.EndPoint, Is.EqualTo(endpoint));
-    Assert.Throws<ObjectDisposedException>(() => listener.Bind(new IPEndPoint(IPAddress.Loopback, 0)));
+    Assert.That(() => listener.Bind(new IPEndPoint(IPAddress.Loopback, 0)), Throws.TypeOf<ObjectDisposedException>());
     await Assert.ThrowsAsync<ObjectDisposedException>(async () => await listener.StartAsync(new DelegateSocketPeerHandler()));
 
     // The port is free again.
