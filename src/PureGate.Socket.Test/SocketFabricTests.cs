@@ -1920,10 +1920,16 @@ public sealed partial class SocketFabricTests
     public Func<SocketPeer, SocketRequest, CancellationToken, ValueTask<SocketResponse>> OnRequest { get; init; }
     public Func<SocketPeer, SocketStreamRequest, CancellationToken, ValueTask<SocketStreamResponse>> OnStream { get; init; }
     public Func<SocketPeer, SocketEvent, CancellationToken, ValueTask> OnEvent { get; init; }
+    public Func<SocketPeer, Exception, ValueTask> OnDisconnect { get; init; }
 
     public ValueTask OnConnectedAsync(SocketPeer peer, CancellationToken cancellationToken)
     {
       return OnConnect?.Invoke(peer, cancellationToken) ?? ValueTask.CompletedTask;
+    }
+
+    public ValueTask OnDisconnectedAsync(SocketPeer peer, Exception exception)
+    {
+      return OnDisconnect?.Invoke(peer, exception) ?? ValueTask.CompletedTask;
     }
 
     public ValueTask<SocketResponse> HandleRequestAsync(

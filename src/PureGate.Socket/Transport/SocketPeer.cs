@@ -74,9 +74,15 @@ public sealed partial class SocketPeer : IAsyncDisposable
         output: Pending);
     SocketMetrics.Opened(this);
     State = SocketPeerState.Connected;
-    ConnectedTask = Task.Run(NotifyConnectedAsync);
+
+    // ConnectedTask is assigned before the read loop starts, because handler workers wait for it, and the
+    // callback starts only after every task is assigned, because it may dispose the peer, which waits for
+    // them.
+    var connected = new Task<Task>(NotifyConnectedAsync, TaskCreationOptions.DenyChildAttach);
+    ConnectedTask = connected.Unwrap();
     ReadTask = Task.Run(ReadLoopAsync);
     HeartbeatTask = Task.Run(HeartbeatLoopAsync);
+    connected.Start(TaskScheduler.Default);
   }
 
   // The in-flight limit is only ever checked without waiting, so a counter replaces the semaphore (which

@@ -141,6 +141,14 @@ public sealed partial class SocketPeer
   {
     try
     {
+      // Handlers start only after OnConnectedAsync has returned. Frames that arrive meanwhile wait in the
+      // queue, and their credit comes back only when a worker takes them, so a sender that keeps going runs
+      // out of credit and waits. The read loop is not held back: responses, credits and pings keep flowing,
+      // so OnConnectedAsync can itself send requests and wait for their responses. Once connected, this is
+      // a single check per worker start.
+      if (!ConnectedTask.IsCompleted)
+        await ConnectedTask;
+
       while (HandlerQueue.TryDequeue(out var frame))
       {
         // The queue slot is free again: hand the sender its credit back. Credits are returned on pickup,

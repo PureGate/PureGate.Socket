@@ -118,16 +118,30 @@ public sealed partial class SocketPeer
     return true;
   }
 
+  // Runs the handler's OnConnectedAsync, which finishes before any other callback of the handler starts:
+  // handler workers wait for this task before they take their first frame, and a close that happens
+  // meanwhile leaves OnDisconnectedAsync to this method. The task never faults.
   async Task NotifyConnectedAsync()
   {
+    // Lets DisposeAsync, called from inside the callback, see that it must not wait for the callback.
+    LifecycleCallback.Value = LifecycleCallbackMarker;
     try
     {
       ObservePeerConnected();
       await Handler.OnConnectedAsync(this, Lifetime.Token);
     }
-    catch (Exception ex) when (ex is not OperationCanceledException)
+    catch (Exception ex)
     {
-      await CloseAsync(ex);
+      // A cancellation because the peer closed is not a failure of the callback.
+      if (ex is not OperationCanceledException || !Lifetime.IsCancellationRequested)
+        await CloseAsync(ex);
+    }
+
+    if (Interlocked.CompareExchange(ref ConnectState, ConnectStateConnected, ConnectStateConnecting) == ConnectStateClosedWhileConnecting)
+    {
+      // The peer closed while the callback ran; CloseAsync left the disconnect callback to run now.
+      await NotifyDisconnectedAsync();
+      Closed.TrySetResult();
     }
   }
 
