@@ -23,6 +23,10 @@ public sealed partial class SocketFabricTests
     var failures = new List<string>();
     foreach (var item in HostnameCases())
     {
+      // Only a malformed case can come without a certificate: this platform refused to create it.
+      if (item.Certificate is null)
+        continue;
+
       using (item.Certificate)
       {
         var port = Outcome(() => CertificateHostnames.Matches(item.Certificate, item.Hostname, allowWildcards: false, allowCommonName: true));
@@ -98,7 +102,7 @@ public sealed partial class SocketFabricTests
     yield return Case("organization next to the common name", Subject(new[] { new[] { (OrganizationOid, "org") }, new[] { (CommonNameOid, "node-b") } }), "node-b", "true");
     yield return Case("BMPString common name", Subject(new[] { new[] { (CommonNameOid, "node-b") } }, UniversalTagNumber.BMPString), "node-b", "true");
     yield return Case("UTF8String common name", Subject(new[] { new[] { (CommonNameOid, "node-b") } }, UniversalTagNumber.UTF8String), "node-b", "true");
-    yield return Case("non-text common name", OctetStringCommonName(), "node-b", "false");
+    yield return Case("non-text common name", UniversalStringCommonName(), "node-b", "false");
 
     // IP addresses match iPAddress entries only, and fall back to the common name when there are none.
     var addresses = new SubjectAlternativeNameBuilder();
@@ -122,19 +126,35 @@ public sealed partial class SocketFabricTests
       w.PopSequence(Context(4, constructed: true));
       w.WriteCharacterString(UniversalTagNumber.IA5String, "node-a", Context(2));
     }));
-    yield return Case("ip of five bytes", Subject(cnNodeB), "node-b", "CryptographicException", RawAltNames(w => w.WriteOctetString(new byte[5], Context(7))));
-    yield return Case("universal tag entry", Subject(cnNodeB), "node-b", "CryptographicException", RawAltNames(w => w.WriteCharacterString(UniversalTagNumber.IA5String, "node-b")));
-    yield return Case("trailing data", Subject(cnNodeB), "node-b", "CryptographicException", new X509Extension("2.5.29.17", new byte[] { 0x30, 0x00, 0x00 }, false));
+    yield return MalformedCase("ip of five bytes", Subject(cnNodeB), "node-b", "CryptographicException", RawAltNames(w => w.WriteOctetString(new byte[5], Context(7))));
+    yield return MalformedCase("universal tag entry", Subject(cnNodeB), "node-b", "CryptographicException", RawAltNames(w => w.WriteCharacterString(UniversalTagNumber.IA5String, "node-b")));
+    yield return MalformedCase("trailing data", Subject(cnNodeB), "node-b", "CryptographicException", new X509Extension("2.5.29.17", new byte[] { 0x30, 0x00, 0x00 }, false));
   }
 
-  static HostnameCase Case(string name, X500DistinguishedName subject, string hostname, string expected, params X509Extension[] extensions)
+  static HostnameCase Case(string name, X500DistinguishedName subject, string hostname, string expected, params X509Extension[] extensions) =>
+    Create(name, subject, hostname, expected, mayBeRejected: false, extensions);
+
+  // A certificate with a malformed subject alternative name. OpenSSL (Linux) may refuse to load such a
+  // certificate at all, and then no peer can present it either, so the case is skipped there. Every other case
+  // must load on every platform.
+  static HostnameCase MalformedCase(string name, X500DistinguishedName subject, string hostname, string expected, params X509Extension[] extensions) =>
+    Create(name, subject, hostname, expected, mayBeRejected: true, extensions);
+
+  static HostnameCase Create(string name, X500DistinguishedName subject, string hostname, string expected, bool mayBeRejected, X509Extension[] extensions)
   {
     using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
     var request = new CertificateRequest(subject, key, HashAlgorithmName.SHA256);
     foreach (var extension in extensions)
       request.CertificateExtensions.Add(extension);
-    var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
-    return new HostnameCase(name, certificate, hostname, expected);
+    try
+    {
+      var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+      return new HostnameCase(name, certificate, hostname, expected);
+    }
+    catch (CryptographicException) when (mayBeRejected)
+    {
+      return new HostnameCase(name, null, hostname, expected);
+    }
   }
 
   static X500DistinguishedName Subject((string Oid, string Value)[][] rdns, UniversalTagNumber type = UniversalTagNumber.PrintableString)
@@ -157,14 +177,24 @@ public sealed partial class SocketFabricTests
     return new X500DistinguishedName(writer.Encode());
   }
 
-  static X500DistinguishedName OctetStringCommonName()
+  // A common name that .NET does not read as text. UniversalString (UCS-4): unlike an OCTET STRING, OpenSSL
+  // accepts it in a name, so the certificate loads on Linux too.
+  static X500DistinguishedName UniversalStringCommonName()
   {
+    var value = System.Text.Encoding.UTF32.GetBytes("node-b");
+    for (var i = 0; i < value.Length; i += 4)
+      Array.Reverse(value, i, 4); // UTF-32 big-endian
+    var encoded = new byte[2 + value.Length];
+    encoded[0] = (byte)UniversalTagNumber.UniversalString;
+    encoded[1] = (byte)value.Length;
+    value.CopyTo(encoded, 2);
+
     var writer = new AsnWriter(AsnEncodingRules.DER);
     writer.PushSequence();
     writer.PushSetOf();
     writer.PushSequence();
     writer.WriteObjectIdentifier(CommonNameOid);
-    writer.WriteOctetString("node-b"u8);
+    writer.WriteEncodedValue(encoded);
     writer.PopSequence();
     writer.PopSetOf();
     writer.PopSequence();
