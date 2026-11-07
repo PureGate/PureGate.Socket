@@ -16,7 +16,8 @@ public sealed partial class SocketPeer : IAsyncDisposable
   const string BatchEventOperation = "batch.event";
   const string BatchEventRequestOperation = "batch.event.request";
 
-  readonly TcpClient Client;
+  // The TcpClient of a connector or the accepted socket of a listener; disposed when the peer closes.
+  readonly IDisposable Connection;
   readonly Stream Stream;
   readonly SocketFabricOptions Options;
   readonly ISocketPeerHandler Handler;
@@ -44,7 +45,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
   // frames the remote sent right after the handshake; a fresh reader would silently lose them.
   // remoteMessageWindow is the number of handler-bound messages the remote said it can queue.
   internal SocketPeer(
-      TcpClient client,
+      IDisposable connection,
       Stream stream,
       SocketFrameReader reader,
       string localNodeId,
@@ -53,7 +54,7 @@ public sealed partial class SocketPeer : IAsyncDisposable
       SocketFabricOptions options,
       ISocketPeerHandler handler)
   {
-    Client = client;
+    Connection = connection;
     Stream = stream;
     LocalNodeId = localNodeId ?? string.Empty;
     RemoteNodeId = remoteNodeId ?? string.Empty;

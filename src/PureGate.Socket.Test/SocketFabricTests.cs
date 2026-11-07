@@ -42,6 +42,62 @@ public sealed partial class SocketFabricTests
   }
 
   [Test]
+  public async Task Bind_ReportsPortAndRefusesConnectionsUntilStarted()
+  {
+    await using var unbound = new SocketListener(new SocketFabricOptions { NodeId = "server" });
+    await Assert.ThrowsAsync<InvalidOperationException>(async () => await unbound.StartAsync(new DelegateSocketPeerHandler()));
+
+    await using var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
+    listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+    Assert.That(listener.EndPoint.Port, Is.Not.Zero);
+    Assert.Throws<InvalidOperationException>(() => listener.Bind(new IPEndPoint(IPAddress.Loopback, 0)));
+
+    var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
+    var refused = await Assert.ThrowsAsync<SocketException>(async () =>
+        await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler()));
+    Assert.That(refused.SocketErrorCode, Is.EqualTo(SocketError.ConnectionRefused));
+
+    await listener.StartAsync(new DelegateSocketPeerHandler
+    {
+      OnRequest = (_, request, _) => ValueTask.FromResult(new SocketResponse { Succeeded = true, Payload = request.Payload })
+    });
+    await Assert.ThrowsAsync<InvalidOperationException>(async () => await listener.StartAsync(new DelegateSocketPeerHandler()));
+
+    await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
+    var response = await client.RequestAsync("test", "echo", [7], TimeSpan.FromSeconds(1));
+    Assert.That(response.Succeeded, Is.True);
+  }
+
+  [Test]
+  public async Task DisposeAsync_ReleasesBoundPortAndIsIdempotent()
+  {
+    var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
+    listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+    var endpoint = listener.EndPoint;
+
+    await listener.DisposeAsync();
+    await listener.DisposeAsync();
+    Assert.That(listener.EndPoint, Is.EqualTo(endpoint));
+    Assert.Throws<ObjectDisposedException>(() => listener.Bind(new IPEndPoint(IPAddress.Loopback, 0)));
+    await Assert.ThrowsAsync<ObjectDisposedException>(async () => await listener.StartAsync(new DelegateSocketPeerHandler()));
+
+    // The port is free again.
+    await using var rebound = new SocketListener(new SocketFabricOptions { NodeId = "server" });
+    rebound.Bind(endpoint);
+
+    // A started listener can be disposed twice too.
+    var started = new SocketListener(new SocketFabricOptions { NodeId = "server" });
+    await started.StartAsync(new IPEndPoint(IPAddress.Loopback, 0), new DelegateSocketPeerHandler());
+    await started.DisposeAsync();
+    await started.DisposeAsync();
+
+    // So can one that was never bound.
+    var unbound = new SocketListener(new SocketFabricOptions { NodeId = "server" });
+    await unbound.DisposeAsync();
+    await unbound.DisposeAsync();
+  }
+
+  [Test]
   public async Task RequestBatchAsync_AuthorizesEachItemWithoutClosingPeer()
   {
     var handlerCalls = 0;

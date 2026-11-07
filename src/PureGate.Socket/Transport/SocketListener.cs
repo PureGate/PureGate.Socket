@@ -14,13 +14,71 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
   readonly List<SocketPeer> Peers = [];
   readonly List<Task> PeerTasks = [];
   readonly Lock Sync = new();
-  TcpListener Listener;
+  System.Net.Sockets.Socket Listener;
+  IPEndPoint BoundEndPoint;
   CancellationTokenSource Lifetime;
   Task AcceptTask;
   int PendingHandshakes;
+  bool Disposed;
 
-  public IPEndPoint EndPoint => (IPEndPoint)Listener?.LocalEndpoint;
+  // The bound endpoint, with the port the system chose when port 0 was asked for. Null before Bind; still
+  // reported after DisposeAsync.
+  public IPEndPoint EndPoint => BoundEndPoint;
 
+  // Reserves the endpoint without accepting anything: until StartAsync, connection attempts are refused at
+  // once, so a caller learns the port (and can tell others about it) before it serves.
+  public void Bind(IPEndPoint endpoint)
+  {
+    ArgumentNullException.ThrowIfNull(endpoint);
+    lock (Sync)
+    {
+      if (Disposed)
+        throw new ObjectDisposedException(nameof(SocketListener));
+      if (Listener is not null)
+        throw new InvalidOperationException("Socket listener is already bound.");
+
+      var listener = new System.Net.Sockets.Socket(endpoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+      try
+      {
+        // Accepted connections inherit these, from before they are established.
+        SocketPeer.ApplySocketBuffers(listener, Options.SocketBufferBytes);
+        listener.Bind(endpoint);
+        BoundEndPoint = (IPEndPoint)listener.LocalEndPoint;
+      }
+      catch
+      {
+        listener.Dispose();
+        throw;
+      }
+
+      Listener = listener;
+    }
+  }
+
+  // Starts accepting connections on the endpoint given to Bind.
+  public ValueTask StartAsync(
+      ISocketPeerHandler handler,
+      CancellationToken cancellationToken = default)
+  {
+    cancellationToken.ThrowIfCancellationRequested();
+    lock (Sync)
+    {
+      if (Disposed)
+        throw new ObjectDisposedException(nameof(SocketListener));
+      if (Listener is null)
+        throw new InvalidOperationException("Socket listener is not bound; call Bind first.");
+      if (Lifetime is not null)
+        throw new InvalidOperationException("Socket listener is already started.");
+
+      Listener.Listen((int)SocketOptionName.MaxConnections); // the system's largest backlog, as TcpListener uses
+      Lifetime = new CancellationTokenSource();
+      AcceptTask = Task.Run(() => AcceptLoopAsync(handler ?? EmptySocketPeerHandler.Shared));
+    }
+
+    return ValueTask.CompletedTask;
+  }
+
+  // Binds and starts accepting in one step.
   public ValueTask StartAsync(
       IPEndPoint endpoint,
       ISocketPeerHandler handler,
@@ -28,20 +86,8 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
   {
     ArgumentNullException.ThrowIfNull(endpoint);
     cancellationToken.ThrowIfCancellationRequested();
-    lock (Sync)
-    {
-      if (Listener is not null)
-        throw new InvalidOperationException("Socket listener is already started.");
-
-      Lifetime = new CancellationTokenSource();
-      Listener = new TcpListener(endpoint);
-      // Accepted connections inherit these, from before they are established.
-      SocketPeer.ApplySocketBuffers(Listener.Server, Options.SocketBufferBytes);
-      Listener.Start();
-      AcceptTask = Task.Run(() => AcceptLoopAsync(handler ?? EmptySocketPeerHandler.Shared));
-    }
-
-    return ValueTask.CompletedTask;
+    Bind(endpoint);
+    return StartAsync(handler, cancellationToken);
   }
 
   // Started by StartAsync once Listener and Lifetime are set.
@@ -51,10 +97,10 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     var lifetime = Lifetime;
     while (!lifetime.IsCancellationRequested)
     {
-      TcpClient client = null;
+      System.Net.Sockets.Socket client = null;
       try
       {
-        client = await listener.AcceptTcpClientAsync(lifetime.Token);
+        client = await listener.AcceptAsync(lifetime.Token);
         client.NoDelay = true;
         if (!TryAdmit(client))
         {
@@ -89,7 +135,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
 
   // Closes a new connection at once when the listener is at its limits, so unauthenticated peers
   // cannot hold an unbounded number of handshakes (or connections) open.
-  bool TryAdmit(TcpClient client)
+  bool TryAdmit(System.Net.Sockets.Socket client)
   {
     int established;
     lock (Sync)
@@ -113,7 +159,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     return false;
   }
 
-  async Task AcceptPeerAsync(TcpClient client, ISocketPeerHandler handler)
+  async Task AcceptPeerAsync(System.Net.Sockets.Socket client, ISocketPeerHandler handler)
   {
     Stream stream = null;
     var admitted = true;
@@ -122,7 +168,7 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
       using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Lifetime.Token);
       timeout.CancelAfter(Options.HandshakeTimeout);
       stream = await Options.StreamFilter.WrapServerAsync(
-          client.GetStream(),
+          new NetworkStream(client, ownsSocket: true),
           Options.NodeId,
           timeout.Token);
       var reader = SocketPeer.CreateReader(stream, Options);
@@ -163,13 +209,13 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     }
   }
 
-  void ObservePeerAcceptFailed(TcpClient client, Exception exception)
+  void ObservePeerAcceptFailed(System.Net.Sockets.Socket client, Exception exception)
   {
     SocketMetrics.HandshakeFailed("server", exception);
     IPEndPoint remoteEndPoint = null;
     try
     {
-      remoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
+      remoteEndPoint = client.RemoteEndPoint as IPEndPoint;
     }
     catch
     {
@@ -266,15 +312,30 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
     }
   }
 
+  // Works in every state (never bound, bound, started) and releases the port. Only the first call does the
+  // work; later calls, including concurrent ones, return at once.
   public async ValueTask DisposeAsync()
   {
-    Lifetime?.Cancel();
-    Listener?.Stop();
-    if (AcceptTask is not null)
+    System.Net.Sockets.Socket listener;
+    CancellationTokenSource lifetime;
+    Task acceptTask;
+    lock (Sync)
+    {
+      if (Disposed)
+        return;
+      Disposed = true;
+      listener = Listener;
+      lifetime = Lifetime;
+      acceptTask = AcceptTask;
+    }
+
+    lifetime?.Cancel();
+    listener?.Dispose();
+    if (acceptTask is not null)
     {
       try
       {
-        await AcceptTask;
+        await acceptTask;
       }
       catch
       {
@@ -302,6 +363,6 @@ public sealed class SocketListener(SocketFabricOptions options = null) : IAsyncD
       }
     }
 
-    Lifetime?.Dispose();
+    lifetime?.Dispose();
   }
 }

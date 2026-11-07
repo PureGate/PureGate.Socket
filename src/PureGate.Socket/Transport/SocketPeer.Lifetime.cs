@@ -50,7 +50,7 @@ public sealed partial class SocketPeer
     {
     }
     Stream.Dispose();
-    Client.Dispose();
+    Connection.Dispose();
     Closed.TrySetResult();
   }
 
