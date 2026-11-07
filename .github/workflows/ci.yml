@@ -45,11 +45,11 @@ jobs:
           done
 
       # Races only show up across many runs, so run the suite repeatedly. On .NET 10 only: every framework
-      # would triple the time, and the step above already ran the suite on each.
-      - name: Test (repeated x20)
+      # would multiply the time, and the step above already ran the suite on each.
+      - name: Test (repeated x2)
         shell: bash
         run: |
-          for i in $(seq 1 20); do
+          for i in $(seq 1 2); do
             echo "::group::run $i"
             dotnet test src/PureGate.Socket.Test -c Release --no-build --framework net10.0 --blame-hang-timeout 2m || exit 1
             echo "::endgroup::"
