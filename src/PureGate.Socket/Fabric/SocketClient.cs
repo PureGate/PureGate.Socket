@@ -14,10 +14,12 @@ public sealed class SocketClient : IAsyncDisposable
   readonly SocketConnector Connector;
   readonly EndPoint EndPoint;
   readonly ISocketPeerHandler Handler;
-  readonly SemaphoreSlim ConnectLock = new(1, 1);
+  readonly Lock Sync = new();
   readonly CancellationTokenSource Lifetime = new();
   readonly Task KeepConnectedTask;
   SocketPeer Peer;
+  // The connect in progress, shared by every caller that needs a connection meanwhile. Null when none runs.
+  Task<SocketPeer> Connecting;
   int Disposed;
 
   // Connects to host:port, resolving the name again on every reconnect.
@@ -47,42 +49,95 @@ public sealed class SocketClient : IAsyncDisposable
       KeepConnectedTask = Task.Run(KeepConnectedLoopAsync);
   }
 
+  // Returns the open connection, or connects. Callers that need a connection while a connect is running
+  // wait for that same attempt and all get its result, so a dead endpoint costs one attempt (bounded by
+  // HandshakeTimeout) however many callers there are. The next call after a failure starts a new attempt.
+  // cancellationToken stops only this caller's wait; the attempt goes on for the others, and is cancelled
+  // only by DisposeAsync.
   public async ValueTask<SocketPeer> GetPeerAsync(CancellationToken cancellationToken = default)
   {
     ThrowIfDisposed();
-    var peer = Peer;
+    var peer = Volatile.Read(ref Peer);
     if (peer?.State == SocketPeerState.Connected)
       return peer;
 
-    using var connectCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Lifetime.Token);
-    await ConnectLock.WaitAsync(connectCancellation.Token);
-    try
+    return await WaitForConnectAsync(cancellationToken);
+  }
+
+  async ValueTask<SocketPeer> WaitForConnectAsync(CancellationToken cancellationToken)
+  {
+    Task<SocketPeer> attempt;
+    SocketPeer stale = null;
+    var start = false;
+    lock (Sync)
     {
-      peer = Peer;
+      ThrowIfDisposed();
+      var peer = Peer;
       if (peer?.State == SocketPeerState.Connected)
         return peer;
 
-      if (peer is not null)
-        await peer.DisposeAsync();
-
-      ObserveClientConnectStarted();
-      try
+      attempt = Connecting;
+      if (attempt is null)
       {
-        Peer = await Connector.ConnectAsync(EndPoint, Handler, connectCancellation.Token);
+        stale = peer;
+        Peer = null;
+        var source = new TaskCompletionSource<SocketPeer>(TaskCreationOptions.RunContinuationsAsynchronously);
+        attempt = Connecting = source.Task;
+        start = true;
+        _ = ConnectAsync(source);
       }
-      catch (Exception ex)
-      {
-        if (ex is not OperationCanceledException || !connectCancellation.IsCancellationRequested)
-          ObserveClientConnectFailed(ex);
-        throw;
-      }
-
-      return Peer;
     }
-    finally
+
+    if (start && stale is not null)
     {
-      ConnectLock.Release();
+      // Closed already. Disposed in the background: disposing waits for its handlers, and one of them may
+      // be the caller waiting here for the new connection.
+      _ = stale.DisposeAsync().AsTask();
     }
+
+    return await attempt.WaitAsync(cancellationToken);
+  }
+
+  // Runs one connect attempt and hands its result to every caller waiting for it.
+  async Task ConnectAsync(TaskCompletionSource<SocketPeer> attempt)
+  {
+    // Out of the lock the caller holds, and off the caller's stack.
+    await Task.Yield();
+    SocketPeer peer;
+    try
+    {
+      ObserveClientConnectStarted();
+      peer = await Connector.ConnectAsync(EndPoint, Handler, Lifetime.Token);
+    }
+    catch (Exception ex)
+    {
+      if (ex is not OperationCanceledException || !Lifetime.IsCancellationRequested)
+        ObserveClientConnectFailed(ex);
+      lock (Sync)
+        Connecting = null;
+      attempt.TrySetException(ex);
+      return;
+    }
+
+    bool disposed;
+    lock (Sync)
+    {
+      // CloseAsync, run by DisposeAsync, may already have taken the previous peer; keeping this one would
+      // leave it open.
+      disposed = Volatile.Read(ref Disposed) != 0;
+      if (!disposed)
+        Peer = peer;
+      Connecting = null;
+    }
+
+    if (disposed)
+    {
+      await peer.DisposeAsync();
+      attempt.TrySetException(new ObjectDisposedException(nameof(SocketClient)));
+      return;
+    }
+
+    attempt.TrySetResult(peer);
   }
 
   public async ValueTask<SocketRequestResult> RequestAsync<TRequest>(
@@ -189,25 +244,11 @@ public sealed class SocketClient : IAsyncDisposable
     if (peer is null || Volatile.Read(ref Disposed) != 0)
       return;
 
-    try
-    {
-      await ConnectLock.WaitAsync();
-    }
-    catch (ObjectDisposedException)
-    {
-      // The client was disposed concurrently; it closes its peer itself.
-      return;
-    }
-
-    try
+    lock (Sync)
     {
       if (!ReferenceEquals(Peer, peer))
         return;
       Peer = null;
-    }
-    finally
-    {
-      ConnectLock.Release();
     }
 
     await peer.DisposeAsync();
@@ -296,19 +337,33 @@ public sealed class SocketClient : IAsyncDisposable
     return await peer.SendEventBatchWithResultsAsync(items, timeout, cancellationToken);
   }
 
+  // Closes the connection. A connect in progress finishes first, so the connection it opens is closed too.
   public async ValueTask CloseAsync()
   {
-    await ConnectLock.WaitAsync();
-    try
+    Task<SocketPeer> attempt;
+    lock (Sync)
+      attempt = Connecting;
+    if (attempt is not null)
     {
-      var peer = Interlocked.Exchange(ref Peer, null);
-      if (peer is not null)
-        await peer.DisposeAsync();
+      try
+      {
+        await attempt;
+      }
+      catch
+      {
+        // Its callers get the failure; there is nothing to close.
+      }
     }
-    finally
+
+    SocketPeer peer;
+    lock (Sync)
     {
-      ConnectLock.Release();
+      peer = Peer;
+      Peer = null;
     }
+
+    if (peer is not null)
+      await peer.DisposeAsync();
   }
 
   public async ValueTask DisposeAsync()
@@ -330,7 +385,6 @@ public sealed class SocketClient : IAsyncDisposable
 
     await CloseAsync();
     Lifetime.Dispose();
-    ConnectLock.Dispose();
   }
 
   async Task KeepConnectedLoopAsync()

@@ -7,7 +7,7 @@
   <!-- Package metadata. The Publish Nuget Package workflow publishes VersionPrefix. Source Link comes with
        the SDK, so the symbols map back to this repository. -->
   <PropertyGroup>
-    <VersionPrefix>1.0.6</VersionPrefix>
+    <VersionPrefix>1.0.7</VersionPrefix>
     <Authors>Ahmed Yasin Koculu</Authors>
     <Copyright>Copyright (c) 2026 Ahmed Yasin Koculu</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
