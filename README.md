@@ -190,6 +190,17 @@ var options = new SocketFabricOptions
 
 Requests and stream requests for a lane's operation, or for every operation of its service when `Operation` is null, run on the lane's own workers. They never wait behind the general handlers, and the general handlers never wait behind them. The sending side also keeps part of its message credit for lane requests, so general messages piling up at a busy node cannot stop a lane request from being sent. Events always run on the general handlers.
 
+### Shutting down
+
+`DisposeAsync` closes a connection without waiting for the handlers still running on it: they see their cancellation tokens cancelled and finish on their own, so a handler can even dispose its own connection. When you are about to release something the handlers use, wait for them first:
+
+```csharp
+await peer.DisposeAsync();
+await peer.WaitForHandlersAsync(); // every handler callback has returned, OnDisconnectedAsync included
+```
+
+Don't await `WaitForHandlersAsync` from one of the connection's own handlers: it would wait for that handler.
+
 ### Timeouts, retries and idempotency
 
 Every call has a timeout (`RequestTimeout`, 10 seconds by default), and the deadline travels with the request: the remote handler's cancellation token fires when it passes. Cancelling a call cancels the remote handler too.
