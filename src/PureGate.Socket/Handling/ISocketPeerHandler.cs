@@ -16,10 +16,6 @@ namespace PureGate.Socket.Handling;
 // OnConnectedAsync and OnDisconnectedAsync may close or dispose the peer. DisposeAsync then returns without
 // waiting for the callback it was called from, which finishes after it.
 //
-// HandleRequestAsync, HandleStreamAsync and HandleEventAsync must close the peer with CloseGracefullyAsync,
-// not DisposeAsync. DisposeAsync waits for every running handler to finish, including the one that called
-// it, so it never returns.
-//
 // OnConnectedAsync can send requests, streams and events on the peer and wait for their results. It must not
 // wait for something only a handler of this connection can bring about: handlers start after it returns. In
 // particular, when both sides wait in OnConnectedAsync for a response from the other, each side's request

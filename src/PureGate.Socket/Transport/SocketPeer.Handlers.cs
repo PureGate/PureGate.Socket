@@ -11,6 +11,8 @@ namespace PureGate.Socket.Transport;
 // Workers are started on demand and each drains the queue before it exits, so one incoming frame wakes
 // at most one worker. (The previous design kept MaxConcurrentHandlers workers parked on a channel; every
 // frame woke all of them and the losers allocated a new wait operation each time they re-parked.)
+//
+// Requests and stream requests of a handler lane run on the lane's own pool instead (SocketPeer.Lanes.cs).
 public sealed partial class SocketPeer
 {
   readonly ConcurrentQueue<SocketFrame> HandlerQueue = new();
@@ -35,8 +37,15 @@ public sealed partial class SocketPeer
       return false;
     }
 
-    if (frame.Kind == SocketMessageKind.Event && HoldInLane(frame))
+    if (frame.Kind == SocketMessageKind.Event)
+    {
+      if (HoldInLane(frame))
+        return true;
+    }
+    else if (LanePools is not null && TryPushLaneFrame(frame))
+    {
       return true;
+    }
 
     PushHandlerFrame(frame);
     return true;
@@ -171,7 +180,7 @@ public sealed partial class SocketPeer
       // A frame enqueued while this worker was exiting may have seen every worker busy; pick it up.
       if (!HandlerQueue.IsEmpty)
         TryStartHandlerWorker();
-      if (remaining == 0 && Volatile.Read(ref ClosedFlag) != 0)
+      if (remaining == 0 && Volatile.Read(ref ClosedFlag) != 0 && Volatile.Read(ref ActiveLaneWorkers) == 0)
         HandlersDrained.TrySetResult();
     }
   }
@@ -223,13 +232,26 @@ public sealed partial class SocketPeer
       ReleaseFrame(frame);
     }
 
+    if (LanePools is not null)
+    {
+      foreach (var pool in LanePools)
+      {
+        while (pool.Queue.TryDequeue(out var frame))
+        {
+          Interlocked.Decrement(ref QueuedHandlerFrames);
+          ReleaseFrame(frame);
+        }
+      }
+    }
+
     DrainEventLanes();
   }
 
-  // Completes once every running handler has finished. Only meaningful after the peer has closed.
-  Task WaitForHandlersAsync()
+  // Completes once every running handler, general and lane, has finished. Only meaningful after the peer
+  // has closed.
+  internal Task WaitForHandlersAsync()
   {
-    if (Volatile.Read(ref ActiveHandlerWorkers) == 0)
+    if (Volatile.Read(ref ActiveHandlerWorkers) == 0 && Volatile.Read(ref ActiveLaneWorkers) == 0)
       HandlersDrained.TrySetResult();
     return HandlersDrained.Task;
   }

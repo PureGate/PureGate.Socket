@@ -58,8 +58,10 @@ public sealed partial class SocketPeer : IAsyncDisposable
     Stream = stream;
     LocalNodeId = localNodeId ?? string.Empty;
     RemoteNodeId = remoteNodeId ?? string.Empty;
-    MessageCredits = new MessageCredits(remoteMessageWindow);
     Options = options.Normalize();
+    LaneMap = Options.LaneMap;
+    MessageCredits = new MessageCredits(remoteMessageWindow, LaneMap?.CreditReserve(remoteMessageWindow) ?? 0);
+    LanePools = CreateLanePools(LaneMap);
     MemoryBudget = new SocketMemoryBudget(Options.MaxConnectionMemoryBytes);
     Handler = handler ?? EmptySocketPeerHandler.Shared;
     Reader = reader ?? throw new ArgumentNullException(nameof(reader));

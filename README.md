@@ -175,6 +175,21 @@ await using var hub = new SocketListener(new SocketFabricOptions { NodeId = "hub
 var status = await registry.RequestAsync<StatusQuery, Status>("web-1", "health", "status", new StatusQuery());
 ```
 
+### Handlers that call back the peer they serve
+
+Each connection runs at most `MaxConcurrentHandlers` handlers at once, and a handler holds its slot until it returns. That allows a deadlock: node A's handler for a request from B calls B and waits for the answer, while B's handlers do the same to A. Once every handler on both sides is waiting, each callback is queued behind the handlers waiting for it, and every call runs into its timeout. A higher limit only moves the point where this happens.
+
+Give the callback operations a handler lane, a pool of their own, on both nodes:
+
+```csharp
+var options = new SocketFabricOptions
+{
+    HandlerLanes = [new SocketHandlerLane("domain", "sync_columns", MaxConcurrentHandlers: 8)]
+};
+```
+
+Requests and stream requests for a lane's operation, or for every operation of its service when `Operation` is null, run on the lane's own workers. They never wait behind the general handlers, and the general handlers never wait behind them. The sending side also keeps part of its message credit for lane requests, so general messages piling up at a busy node cannot stop a lane request from being sent. Events always run on the general handlers.
+
 ### Timeouts, retries and idempotency
 
 Every call has a timeout (`RequestTimeout`, 10 seconds by default), and the deadline travels with the request: the remote handler's cancellation token fires when it passes. Cancelling a call cancels the remote handler too.
@@ -265,6 +280,7 @@ Every limit is an option on `SocketFabricOptions`.
 | `MaxConnectionMemoryBytes` | 256 MB | Everything a connection holds for its remote |
 | `MaxInFlightRequests` | 1,024 | This side's outstanding calls and streams on a connection |
 | `MaxConcurrentHandlers` | 100 | Handlers running at once on a connection |
+| `HandlerLanes` | none | Operations with a handler pool of their own, each with its own limit (16 by default) |
 | `MaxQueuedHandlers` | 4,096 | Messages waiting for a handler, which is also how many the remote may send ahead |
 | `StreamWindowBytes` | 1 MB | Unread data per stream, growing up to `MaxStreamWindowBytes` (64 MB) |
 | `HeartbeatInterval` / `IdleTimeout` | 15 s / 45 s | Detection of dead connections |

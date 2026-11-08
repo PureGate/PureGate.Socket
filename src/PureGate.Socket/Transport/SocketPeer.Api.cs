@@ -175,7 +175,7 @@ public sealed partial class SocketPeer
       frame.DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout);
 
       // Waits while the remote's handler queue is full; the request's own timeout still applies.
-      await MessageCredits.AcquireAsync(writeToken);
+      await AcquireMessageCreditAsync(frame, writeToken);
       try
       {
         await WriteFrameAsync(frame, writeToken);
@@ -326,7 +326,7 @@ public sealed partial class SocketPeer
         DeadlineMs = ToDeadlineMilliseconds(effectiveTimeout)
       };
       request.SetPayload(payload);
-      await MessageCredits.AcquireAsync(timeoutSource.Token);
+      await AcquireMessageCreditAsync(request, timeoutSource.Token);
       try
       {
         await WriteFrameAsync(request, timeoutSource.Token);

@@ -114,7 +114,7 @@ public sealed partial class SocketPeer
       // Its sender spent a message credit that no handler will return (it gave up part way, typically
       // because its call was cancelled), so it is returned here.
       if (item.Key.Kind is SocketMessageKind.Request or SocketMessageKind.Event or SocketMessageKind.StreamRequest)
-        ReturnMessageCredit();
+        ReturnDroppedMessageCredit();
     }
   }
 

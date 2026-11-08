@@ -26,6 +26,12 @@ public sealed class SocketFabricOptions
   // Handlers running at once on one connection. High enough that handlers waiting on I/O (a database, another
   // service) do not cap a connection's throughput; CPU-bound handlers are still limited by the thread pool.
   public int MaxConcurrentHandlers { get; init; } = 100;
+  // Handler pools of their own for chosen services or operations, on top of MaxConcurrentHandlers (see
+  // SocketHandlerLane). For handlers that call back the peer they serve: put the callback operations in a
+  // lane, on both ends, and the callbacks never queue behind the handlers waiting for them. None by default.
+  // A lane without a service, with an empty operation, or listed twice is rejected with ArgumentException.
+  public IReadOnlyList<SocketHandlerLane> HandlerLanes { get; init; } = [];
+  // Messages waiting for a handler, in the general queue and the lanes' queues together.
   public int MaxQueuedHandlers { get; init; } = 4096;
   public int MaxIdempotencyEntries { get; init; } = 100_000;
   // Bytes a stream consumer lets its producer send ahead of what the application has read. The window
@@ -84,9 +90,15 @@ public sealed class SocketFabricOptions
   public ISocketStreamFilter StreamFilter { get; init; } = NoSocketStreamFilter.Shared;
   public ISocketObserver Observer { get; init; } = NoSocketObserver.Shared;
   internal SocketIdempotencyCache IdempotencyCache { get; init; } = new();
+  // Built from HandlerLanes by Normalize; null when there are none.
+  internal SocketHandlerLaneMap LaneMap { get; init; }
 
   internal SocketFabricOptions Normalize()
   {
+    // Options that are already normalized keep their map: peers normalize again for every connection.
+    var laneMap = LaneMap is not null && ReferenceEquals(HandlerLanes, LaneMap.Lanes)
+        ? LaneMap
+        : SocketHandlerLaneMap.Create(HandlerLanes);
     var heartbeatInterval = HeartbeatInterval <= TimeSpan.Zero ? TimeSpan.FromSeconds(15) : HeartbeatInterval;
     var minimumIdleTimeout = heartbeatInterval.Ticks > TimeSpan.MaxValue.Ticks / 3
         ? TimeSpan.MaxValue
@@ -106,6 +118,8 @@ public sealed class SocketFabricOptions
       MaxConnectionMemoryBytes = Math.Clamp(MaxConnectionMemoryBytes, 64 * 1024, 64L * 1024 * 1024 * 1024),
       MaxInFlightRequests = Math.Clamp(MaxInFlightRequests, 1, 100_000),
       MaxConcurrentHandlers = Math.Clamp(MaxConcurrentHandlers, 1, 1024),
+      HandlerLanes = laneMap?.Lanes ?? [],
+      LaneMap = laneMap,
       MaxQueuedHandlers = Math.Clamp(MaxQueuedHandlers, 1, 100_000),
       MaxIdempotencyEntries = Math.Clamp(MaxIdempotencyEntries, 1, 1_000_000),
       StreamWindowBytes = Math.Clamp(StreamWindowBytes, 64 * 1024, MaxWindowLimit),

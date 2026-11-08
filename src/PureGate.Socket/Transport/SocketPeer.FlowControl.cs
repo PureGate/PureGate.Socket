@@ -10,7 +10,9 @@ namespace PureGate.Socket.Transport;
 // (requests, fast requests, events, stream requests) the other can queue: its MaxQueuedHandlers. A sender
 // spends one credit per message and waits when it has none; the receiver returns credits as its handlers
 // pick messages up. The receiver's queue therefore never overflows, so a busy receiver slows its senders
-// down instead of rejecting requests or closing the connection on an event burst.
+// down instead of rejecting requests or closing the connection on an event burst. With handler lanes, the
+// sender keeps part of its credit for lane messages (MessageCredits), and the receiver returns a lane
+// message's credit at once (ReturnMessageCreditNow).
 //
 // Stream credits (per stream, in bytes). See SocketPullStream (consumer) and StreamSendWindow (producer).
 //
@@ -42,6 +44,36 @@ public sealed partial class SocketPeer
     var amount = Interlocked.Exchange(ref UnreturnedMessageCredits, 0);
     if (amount > 0)
       SendCreditInBackground(0, amount);
+  }
+
+  // A lane's handler picked a message up. Its credit, and any batched with it, goes back at once: while the
+  // general handlers are all waiting, nothing else would complete the batch, and the sender's reserve for
+  // lane messages would not come back.
+  void ReturnMessageCreditNow()
+  {
+    Interlocked.Increment(ref UnreturnedMessageCredits);
+    var amount = Interlocked.Exchange(ref UnreturnedMessageCredits, 0);
+    if (amount > 0)
+      SendCreditInBackground(0, amount);
+  }
+
+  // A message was dropped before reaching a handler (refused over budget, or its chunks expired). With lanes
+  // its credit may have come from the sender's lane reserve, so it goes back at once; these paths are rare.
+  void ReturnDroppedMessageCredit()
+  {
+    if (LaneMap is not null)
+      ReturnMessageCreditNow();
+    else
+      ReturnMessageCredit();
+  }
+
+  // Takes a credit for a request or stream request; one that runs in a handler lane at the remote may use
+  // the credit kept for lanes. Without lanes this is AcquireAsync.
+  ValueTask AcquireMessageCreditAsync(SocketFrame frame, CancellationToken cancellationToken)
+  {
+    return LaneMap is not null && LaneMap.Find(frame.Service, frame.Operation) >= 0
+        ? MessageCredits.AcquireReservedAsync(cancellationToken)
+        : MessageCredits.AcquireAsync(cancellationToken);
   }
 
   // Read loop: a Credit frame from the remote.

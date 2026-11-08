@@ -194,4 +194,48 @@ public sealed partial class SocketFabricTests
 
     await disposed.Task.WaitAsync(OrderTimeout);
   }
+
+  // The peer's handler wait completes only after the handlers still running when it closed have finished.
+  [Test]
+  public async Task WaitForHandlers_WaitsForRunningHandlers()
+  {
+    var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var finished = 0;
+    var serverPeer = new TaskCompletionSource<SocketPeer>(TaskCreationOptions.RunContinuationsAsynchronously);
+    await using var listener = new SocketListener(new SocketFabricOptions { NodeId = "server" });
+    await listener.StartAsync(new IPEndPoint(IPAddress.Loopback, 0), new DelegateSocketPeerHandler
+    {
+      OnConnect = (peer, _) =>
+      {
+        serverPeer.TrySetResult(peer);
+        return ValueTask.CompletedTask;
+      },
+      OnRequest = async (_, _, cancellationToken) =>
+      {
+        entered.TrySetResult();
+        try
+        {
+          await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        await Task.Delay(200);
+        Volatile.Write(ref finished, 1);
+        return new SocketResponse { Succeeded = true };
+      }
+    });
+
+    var connector = new SocketConnector(new SocketFabricOptions { NodeId = "client" });
+    await using var client = await connector.ConnectAsync(listener.EndPoint, new DelegateSocketPeerHandler());
+    var request = client.RequestAsync("test", "slow", [1], OrderTimeout).AsTask();
+    await entered.Task.WaitAsync(OrderTimeout);
+
+    var closing = await serverPeer.Task;
+    await closing.CloseGracefullyAsync();
+    await closing.WaitForHandlersAsync().WaitAsync(OrderTimeout);
+    Assert.That(Volatile.Read(ref finished), Is.EqualTo(1));
+    await request.WaitAsync(OrderTimeout);
+  }
 }
