@@ -200,9 +200,9 @@ public sealed partial class SocketFabricTests
     var request = client.RequestAsync("lane", "slow", [1], OrderTimeout).AsTask();
     await entered.Task.WaitAsync(OrderTimeout);
 
-    // The peer's handler wait, which covers lane workers too, completes only once the lane handler is done.
+    // WaitForHandlersAsync covers lane workers too: it completes only once the lane handler is done.
     var closing = await serverPeer.Task;
-    await closing.CloseGracefullyAsync();
+    await closing.DisposeAsync();
     await closing.WaitForHandlersAsync().WaitAsync(OrderTimeout);
     Assert.That(Volatile.Read(ref finished), Is.EqualTo(1));
     await request.WaitAsync(OrderTimeout);

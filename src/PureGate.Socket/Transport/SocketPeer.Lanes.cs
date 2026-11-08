@@ -18,7 +18,7 @@ public sealed partial class SocketPeer
 {
   readonly SocketHandlerLaneMap LaneMap;
   readonly LanePool[] LanePools;
-  // Workers running across every lane, for WaitForHandlersAsync.
+  // Workers running across every lane; HandlersDrained waits for them too.
   int ActiveLaneWorkers;
 
   LanePool[] CreateLanePools(SocketHandlerLaneMap map)

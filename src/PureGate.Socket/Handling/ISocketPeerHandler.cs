@@ -13,8 +13,10 @@ namespace PureGate.Socket.Handling;
 //    while OnConnectedAsync is running, its cancellation token is cancelled and OnDisconnectedAsync follows
 //    when it returns. Handlers still running at that point see their tokens cancelled.
 //
-// OnConnectedAsync and OnDisconnectedAsync may close or dispose the peer. DisposeAsync then returns without
-// waiting for the callback it was called from, which finishes after it.
+// Any callback may close or dispose its peer. DisposeAsync does not wait for callbacks still running,
+// including the one it was called from: they see their cancellation tokens cancelled and finish on their
+// own. Await SocketPeer.Completion to know OnDisconnectedAsync has run, and SocketPeer.WaitForHandlersAsync
+// to know every callback has returned.
 //
 // OnConnectedAsync can send requests, streams and events on the peer and wait for their results. It must not
 // wait for something only a handler of this connection can bring about: handlers start after it returns. In

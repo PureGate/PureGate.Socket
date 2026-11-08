@@ -36,6 +36,7 @@ public sealed partial class SocketPeer
     CloseWrites();
     MessageCredits.Fail(Lifetime.Token);
     DrainHandlerQueue();
+    SignalHandlersDrainedIfIdle();
     ReleaseIncomingChunks();
     foreach (var active in ActiveRequests.Values)
       active.Source.Cancel();
@@ -105,25 +106,22 @@ public sealed partial class SocketPeer
     Connection.Dispose();
   }
 
+  // Closes the peer and waits for its read loop and heartbeat to stop. It does not wait for handler
+  // callbacks still running (OnConnectedAsync, request, stream and event handlers): they see their
+  // cancellation tokens cancelled and finish on their own. That also lets a handler dispose its own peer.
+  // Completion completes once OnDisconnectedAsync has run; WaitForHandlersAsync once every callback has.
   public async ValueTask DisposeAsync()
   {
     await CloseGracefullyAsync();
 
-    // From inside this peer's OnConnectedAsync or OnDisconnectedAsync, one of the tasks below is the one
-    // running that callback (the read loop, the heartbeat or a handler worker closed the peer, or the
-    // connect callback runs it), and it finishes only after this returns, so waiting would never end. The
-    // peer is closed by now, and those tasks finish on their own once the callback returns.
+    // From inside this peer's OnConnectedAsync or OnDisconnectedAsync, the read loop or the heartbeat may be
+    // the task running that callback, and it finishes only after this returns, so waiting would never end.
+    // The peer is closed by now, and both finish on their own once the callback returns.
     if (!InLifecycleCallback)
     {
-      try
-      {
-        await Task.WhenAll(ReadTask, HeartbeatTask);
-        await ConnectedTask;
-        await WaitForHandlersAsync();
-      }
-      catch
-      {
-      }
+      // Each on its own: both usually end cancelled, and that must not skip waiting for the other.
+      await WaitQuietlyAsync(ReadTask);
+      await WaitQuietlyAsync(HeartbeatTask);
     }
 
     // Lifetime is deliberately not disposed: callers that were in flight when the peer closed still touch
@@ -131,6 +129,18 @@ public sealed partial class SocketPeer
     // ObjectDisposedException. It holds no unmanaged resources.
     while (RequestCancellationPool.TryDequeue(out var cancellation))
       cancellation.Dispose();
+  }
+
+  static async Task WaitQuietlyAsync(Task task)
+  {
+    try
+    {
+      await task;
+    }
+    catch
+    {
+      // Only that the task has ended matters here, not how.
+    }
   }
 
   void ThrowIfClosed()

@@ -247,13 +247,23 @@ public sealed partial class SocketPeer
     DrainEventLanes();
   }
 
-  // Completes once every running handler, general and lane, has finished. Only meaningful after the peer
-  // has closed.
-  internal Task WaitForHandlersAsync()
+  // Completes once the peer has closed and every callback of its handler has returned: OnConnectedAsync,
+  // the request, stream and event handlers (in handler lanes too), and OnDisconnectedAsync. DisposeAsync does
+  // not wait for them; await this after it before releasing what the handlers use. Called before the peer
+  // closes, it completes after the close. Do not await it from one of this peer's own callbacks: it would
+  // wait for that callback. cancellationToken stops only the wait.
+  public Task WaitForHandlersAsync(CancellationToken cancellationToken = default)
+  {
+    return Task.WhenAll(ConnectedTask, HandlersDrained.Task, Closed.Task).WaitAsync(cancellationToken);
+  }
+
+  // Called by CloseAsync once the peer is closed and its queues are drained. When no worker is running,
+  // none is left to signal HandlersDrained on its way out. ClosedFlag is set before the counts are read and
+  // a worker lowers its count before reading ClosedFlag, so at least one side sees the other.
+  void SignalHandlersDrainedIfIdle()
   {
     if (Volatile.Read(ref ActiveHandlerWorkers) == 0 && Volatile.Read(ref ActiveLaneWorkers) == 0)
       HandlersDrained.TrySetResult();
-    return HandlersDrained.Task;
   }
 
   sealed class HandlerWorkItem(SocketPeer peer) : IThreadPoolWorkItem

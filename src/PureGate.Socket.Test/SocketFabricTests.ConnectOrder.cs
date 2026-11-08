@@ -195,9 +195,10 @@ public sealed partial class SocketFabricTests
     await disposed.Task.WaitAsync(OrderTimeout);
   }
 
-  // The peer's handler wait completes only after the handlers still running when it closed have finished.
+  // DisposeAsync does not wait for running handlers; WaitForHandlersAsync does, called before or after the
+  // close.
   [Test]
-  public async Task WaitForHandlers_WaitsForRunningHandlers()
+  public async Task WaitForHandlersAsync_WaitsForRunningHandlers()
   {
     var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     var finished = 0;
@@ -233,9 +234,18 @@ public sealed partial class SocketFabricTests
     await entered.Task.WaitAsync(OrderTimeout);
 
     var closing = await serverPeer.Task;
-    await closing.CloseGracefullyAsync();
-    await closing.WaitForHandlersAsync().WaitAsync(OrderTimeout);
+    var drained = closing.WaitForHandlersAsync();
+    await Task.Delay(100);
+    Assert.That(drained.IsCompleted, Is.False, "the peer is still open");
+
+    await closing.DisposeAsync();
+    await drained.WaitAsync(OrderTimeout);
     Assert.That(Volatile.Read(ref finished), Is.EqualTo(1));
+    await closing.WaitForHandlersAsync().WaitAsync(OrderTimeout);
     await request.WaitAsync(OrderTimeout);
+
+    // A peer with no handler running when it closes.
+    await client.DisposeAsync();
+    await client.WaitForHandlersAsync().WaitAsync(OrderTimeout);
   }
 }
