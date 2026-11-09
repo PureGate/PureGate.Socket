@@ -14,7 +14,9 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
 
   // endpoint is an IPEndPoint or a DnsEndPoint. A host name is resolved on every call, so a reconnect
   // follows an address change, and each resolved address is tried in turn. HandshakeTimeout covers
-  // resolution, connecting and the handshake together.
+  // resolution, connecting and the handshake together. A connect that HandshakeTimeout ends throws
+  // SocketException(TimedOut), like any other unreachable node; only the caller's own token throws
+  // OperationCanceledException.
   public async ValueTask<SocketPeer> ConnectAsync(
       EndPoint endpoint,
       ISocketPeerHandler handler,
@@ -29,14 +31,22 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     {
       using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
       timeout.CancelAfter(Options.HandshakeTimeout);
-      client = await ConnectTcpAsync(endpoint, Options.SocketBufferBytes, timeout.Token);
-      stream = await Options.StreamFilter.WrapClientAsync(
-          client.GetStream(),
-          Options.NodeId,
-          timeout.Token);
-      var reader = SocketPeer.CreateReader(stream, Options);
-      var (remoteNodeId, remoteWindow) = await RunClientHandshakeAsync(stream, reader, timeout.Token);
-      return new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, remoteWindow, Options, handler);
+      try
+      {
+        client = await ConnectTcpAsync(endpoint, Options.SocketBufferBytes, timeout.Token);
+        stream = await Options.StreamFilter.WrapClientAsync(
+            client.GetStream(),
+            Options.NodeId,
+            timeout.Token);
+        var reader = SocketPeer.CreateReader(stream, Options);
+        var (remoteNodeId, remoteWindow) = await RunClientHandshakeAsync(stream, reader, timeout.Token);
+        return new SocketPeer(client, stream, reader, Options.NodeId, remoteNodeId, remoteWindow, Options, handler);
+      }
+      // HandshakeTimeout ended it, not the caller: an unreachable node, at any step.
+      catch (OperationCanceledException) when (timeout.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+      {
+        throw new SocketException((int)SocketError.TimedOut);
+      }
     }
     catch (Exception ex)
     {
@@ -47,6 +57,7 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
     }
   }
 
+  // cancellationToken must end: when a connect gets no answer, the addresses are tried again until it does.
   static async ValueTask<TcpClient> ConnectTcpAsync(EndPoint endpoint, int socketBufferBytes, CancellationToken cancellationToken)
   {
     IPAddress[] addresses;
@@ -67,29 +78,67 @@ public sealed class SocketConnector(SocketFabricOptions options = null)
         throw new ArgumentException("Only IPEndPoint and DnsEndPoint are supported.", nameof(endpoint));
     }
 
-    SocketException lastFailure = null;
-    foreach (var address in addresses)
+    while (true)
     {
-      var client = new TcpClient(address.AddressFamily) { NoDelay = true };
-      SocketPeer.ApplySocketBuffers(client.Client, socketBufferBytes);
-      try
+      SocketException lastFailure = null;
+      var unanswered = false;
+      foreach (var address in addresses)
       {
-        await client.ConnectAsync(new IPEndPoint(address, port), cancellationToken);
-        return client;
+        // A socket whose connect failed cannot connect again, so each attempt takes a new one.
+        var client = new TcpClient(address.AddressFamily) { NoDelay = true };
+        SocketPeer.ApplySocketBuffers(client.Client, socketBufferBytes);
+        var retriedHere = DisableSynRetransmissions(client.Client);
+        try
+        {
+          await client.ConnectAsync(new IPEndPoint(address, port), cancellationToken);
+          return client;
+        }
+        catch (SocketException ex)
+        {
+          client.Dispose();
+          lastFailure = ex;
+          unanswered |= retriedHere && ex.SocketErrorCode == SocketError.TimedOut;
+        }
+        catch
+        {
+          client.Dispose();
+          throw;
+        }
       }
-      catch (SocketException ex)
-      {
-        client.Dispose();
-        lastFailure = ex;
-      }
-      catch
-      {
-        client.Dispose();
-        throw;
-      }
-    }
 
-    throw lastFailure ?? new SocketException((int)SocketError.HostNotFound);
+      // Every address refused: no point trying again. One that got no answer may have lost its SYN, which
+      // the OS no longer resends, so the round starts again from the first address.
+      if (!unanswered)
+        throw lastFailure ?? new SocketException((int)SocketError.HostNotFound);
+
+      // An attempt with no answer normally takes the first timeout (about 1 s). Should a network driver report
+      // the timeout sooner, this pause keeps the rounds from opening sockets non-stop.
+      await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+    }
+  }
+
+  // SIO_TCP_INITIAL_RTO: keep the default first timeout (0xFFFF), no SYN retransmissions (0xFE).
+  const int SioTcpInitialRto = unchecked((int)0x98000011);
+  static readonly byte[] NoSynRetransmissions = [0xFF, 0xFF, 0xFE, 0x00];
+
+  // Windows answers a refused connect by sending the SYN again, for about 2 s by default, before it fails.
+  // With SYN retransmissions off, a refused connect fails at once, as on Linux; a connect that gets no
+  // answer fails after the first timeout (about 1 s), and ConnectTcpAsync tries it again. So a silent
+  // address costs about 1 s, not the whole HandshakeTimeout. Returns whether retransmissions are off: a
+  // Windows version that rejects the setting keeps its own retries.
+  static bool DisableSynRetransmissions(System.Net.Sockets.Socket socket)
+  {
+    if (!OperatingSystem.IsWindows())
+      return false;
+    try
+    {
+      socket.IOControl(SioTcpInitialRto, NoSynRetransmissions, null);
+      return true;
+    }
+    catch (SocketException)
+    {
+      return false;
+    }
   }
 
   async ValueTask<(string NodeId, int MessageWindow)> RunClientHandshakeAsync(Stream stream, SocketFrameReader reader, CancellationToken cancellationToken)
