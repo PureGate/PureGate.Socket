@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
@@ -32,7 +33,7 @@ public sealed class JsonSocketMessageCodec : ISocketMessageCodec
     if (options.TypeInfoResolver is null)
     {
       // Copied so the caller's instance is not changed; reflection is the resolver of last resort.
-      options = new JsonSerializerOptions(options) { TypeInfoResolver = new DefaultJsonTypeInfoResolver() };
+      options = new JsonSerializerOptions(options) { TypeInfoResolver = CreateFallbackResolver() };
     }
 
     options.MakeReadOnly();
@@ -86,6 +87,17 @@ public sealed class JsonSocketMessageCodec : ISocketMessageCodec
       MaxDepth = Options.MaxDepth
     });
     return JsonSerializer.Deserialize(ref reader, TypeInfo<T>());
+  }
+
+  // Reflection only when the runtime allows it. Under native AOT or with the System.Text.Json reflection feature switch
+  // off, the resolver is empty, so a type without source-generated metadata fails with System.Text.Json's clear error.
+  [UnconditionalSuppressMessage("Trimming", "IL2026", Justification = "Guarded by JsonSerializer.IsReflectionEnabledByDefault.")]
+  [UnconditionalSuppressMessage("AOT", "IL3050", Justification = "Guarded by JsonSerializer.IsReflectionEnabledByDefault.")]
+  static IJsonTypeInfoResolver CreateFallbackResolver()
+  {
+    return JsonSerializer.IsReflectionEnabledByDefault
+        ? new DefaultJsonTypeInfoResolver()
+        : JsonTypeInfoResolver.Combine();
   }
 
   JsonTypeInfo<T> TypeInfo<T>()

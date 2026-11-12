@@ -1,5 +1,5 @@
 // Stand-ins for newer .NET APIs on the older frameworks the library targets. Each is compiled only where the
-// real API is missing, so .NET 10 builds use the framework's own.
+// real API is missing, so .NET 10+ builds use the framework's own.
 
 #if !NET9_0_OR_GREATER
 // System.Threading.Lock is .NET 9 and later. Before it, lock statements on a plain object use Monitor, with the
