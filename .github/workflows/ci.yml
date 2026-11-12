@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The library targets .NET 6, 7, 8, 9 and 10, and the tests run on each.
+      # The library targets .NET 6, 7, 8, 9, 10 and 11, and the tests run on each.
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
@@ -25,6 +25,7 @@ jobs:
             8.0.x
             9.0.x
             10.0.x
+            11.0.x
 
       - name: Build
         run: dotnet build PureGate.Socket.slnx -c Release
@@ -37,7 +38,7 @@ jobs:
         shell: bash
         run: |
           files=$(find artifacts/coverage -name coverage.cobertura.xml)
-          [ "$(echo "$files" | grep -c .)" = "5" ] || { echo "::error::Expected a coverage report per framework, found: $files"; exit 1; }
+          [ "$(echo "$files" | grep -c .)" = "6" ] || { echo "::error::Expected a coverage report per framework, found: $files"; exit 1; }
           for file in $files; do
             rate=$(grep -oE '<coverage line-rate="[0-9.]+"' "$file" | grep -oE '[0-9]+\.[0-9]+')
             echo "Line coverage: $rate ($file)"
